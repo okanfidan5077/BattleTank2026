@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BattleTank 2026</title>
+  </head>
+  <body>
+    <div id="game"></div>
+
+    <!-- Lobby overlay. Sits above the canvas until a room is joined. -->
+    <div id="lobby" class="overlay">
+      <div class="panel">
+        <h1>BATTLE<span>TANK</span> 2026</h1>
+
+        <label for="player-name">Player Name</label>
+        <input
+          id="player-name"
+          type="text"
+          maxlength="16"
+          placeholder="Commander"
+          autocomplete="off"
+          spellcheck="false"
+        />
+
+        <button id="create-room" type="button" class="primary">Create Room</button>
+
+        <div class="divider"><span>or join a friend</span></div>
+
+        <label for="room-code">Room Code</label>
+        <input
+          id="room-code"
+          type="text"
+          placeholder="paste a code or a link"
+          autocomplete="off"
+          spellcheck="false"
+        />
+
+        <button id="join-room" type="button">Join Room</button>
+
+        <p id="lobby-status" class="status" role="status"></p>
+      </div>
+    </div>
+
+    <!-- Staging lobby: shown after joining, until the host starts the match. -->
+    <div id="staging" class="overlay" hidden>
+      <div class="panel">
+        <h1>STAGING</h1>
+        <p class="muted">Room <strong id="staging-room"></strong></p>
+
+        <label>Players</label>
+        <ul id="staging-players" class="roster"></ul>
+
+        <button id="start-match" type="button" class="primary">Start Match</button>
+        <p id="staging-hint" class="status"></p>
+      </div>
+    </div>
+
+    <!-- Revealed once connected, so the room can be shared. -->
+    <div id="share" class="share" hidden>
+      <span class="share-label">Invite</span>
+      <input id="share-link" type="text" readonly />
+      <button id="copy-link" type="button">Copy</button>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

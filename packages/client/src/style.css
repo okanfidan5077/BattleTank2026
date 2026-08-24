@@ -1,0 +1,249 @@
+:root {
+  color-scheme: dark;
+  --ink: #f7f3e8;
+  --muted: #8fa1b3;
+  --panel: #14181e;
+  --line: #2a3038;
+  --accent: #f2c14e;
+  --danger: #e0483a;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #0b0d10;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--ink);
+}
+
+#game {
+  display: grid;
+  place-items: center;
+  height: 100%;
+}
+
+#game canvas {
+  display: block;
+}
+
+/* ------------------------------------------------------------------ lobby */
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(circle at 50% 35%, #12181f 0%, #06080a 70%);
+  z-index: 10;
+}
+
+.overlay[hidden] {
+  display: none;
+}
+
+.panel {
+  width: min(420px, calc(100vw - 48px));
+  padding: 32px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 24px 60px rgb(0 0 0 / 55%);
+}
+
+.panel h1 {
+  margin: 0 0 24px;
+  font-size: 26px;
+  letter-spacing: 2px;
+  text-align: center;
+}
+
+.panel h1 span {
+  color: var(--accent);
+}
+
+.panel label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.panel input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 16px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0b0d10;
+  color: var(--ink);
+  font: inherit;
+  font-size: 15px;
+}
+
+.panel input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.panel button {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #1c232c;
+  color: var(--ink);
+  font: inherit;
+  font-size: 15px;
+  letter-spacing: 1px;
+  cursor: pointer;
+}
+
+.panel button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.panel button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.panel button.primary {
+  border-color: #3f5a33;
+  background: #23361d;
+}
+
+.divider {
+  margin: 20px 0;
+  border-top: 1px solid var(--line);
+  text-align: center;
+}
+
+.divider span {
+  position: relative;
+  top: -10px;
+  padding: 0 10px;
+  background: var(--panel);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.status {
+  min-height: 18px;
+  margin: 14px 0 0;
+  font-size: 13px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.status.error {
+  color: var(--danger);
+}
+
+/* --------------------------------------------------------- shareable link */
+
+.share {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgb(20 24 30 / 92%);
+  z-index: 9;
+}
+
+.share[hidden] {
+  display: none;
+}
+
+.share-label {
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.share input {
+  width: 300px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #0b0d10;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+}
+
+.share button {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #1c232c;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.share button:hover {
+  border-color: var(--accent);
+}
+
+/* -------------------------------------------------------------- staging */
+
+.muted {
+  margin: -12px 0 20px;
+  font-size: 13px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.muted strong {
+  color: var(--accent);
+  letter-spacing: 1px;
+}
+
+.roster {
+  margin: 0 0 20px;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0b0d10;
+}
+
+.roster li {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+
+.roster li:last-child {
+  border-bottom: none;
+}
+
+.roster .swatch {
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgb(255 255 255 / 25%);
+  border-radius: 2px;
+  flex: none;
+}
+
+.roster .tag {
+  margin-left: auto;
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--accent);
+}

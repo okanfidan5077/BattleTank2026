@@ -1,0 +1,31 @@
+{
+  "name": "battletank2026",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BattleTank2026 monorepo — Colyseus server + Phaser client + shared types.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "build:shared": "npm run build --workspace @battletank/shared",
+    "build:server": "npm run build --workspace @battletank/server",
+    "build:client": "npm run build --workspace @battletank/client",
+    "clean": "tsc -b --clean",
+    "dev:server": "npm run dev --workspace @battletank/server",
+    "dev:client": "npm run dev --workspace @battletank/client",
+    "watch:shared": "npm run dev --workspace @battletank/shared",
+    "typecheck": "tsc -b --force",
+    "start:server": "npm run start --workspace @battletank/server"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  },
+  "overrides": {
+    "@colyseus/core": "0.16.24"
+  }
+}
