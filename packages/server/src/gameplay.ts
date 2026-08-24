@@ -131,17 +131,27 @@ export const HUNTER_FIELD_REBUILD_TICKS = 10;
 /** How far ahead an enemy looks when deciding whether to fire, in tiles. */
 export const ENEMY_SIGHT_RANGE_TILES = 12;
 
-/** Chance an enemy shoots a brick that is blocking its route. */
+/** Chance an enemy shoots a brick further down its line of sight. */
 export const ENEMY_BRICK_FIRE_CHANCE = 0.25;
+
+/**
+ * Chance an enemy ignores the flow field on a fresh decision and instead strikes
+ * out in a random passable direction.
+ *
+ * Injects disorder so the swarm frays out of the tidy single-file lines a purely
+ * optimal field produces — the whole point of the aggressive routing.
+ */
+export const ENEMY_CHAOS_CHANCE = 0.2;
 
 /**
  * Cost of routing a flow field through a brick, relative to open ground (1).
  *
  * Finite on purpose: the eagle is walled in by brick, so an impassable brick
- * would leave it unreachable and the field empty. Set to `Infinity` for strict
- * "brick is a wall" pathing.
+ * would leave it unreachable and the field empty. Kept low so the field is happy
+ * to route straight through walls the enemy can blast away, rather than snaking
+ * the long way round. Set to `Infinity` for strict "brick is a wall" pathing.
  */
-export const FLOW_FIELD_BRICK_COST = 8;
+export const FLOW_FIELD_BRICK_COST = 5;
 
 /** Lives a player starts a match with. */
 export const PLAYER_STARTING_LIVES = 3;

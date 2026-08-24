@@ -1,7 +1,24 @@
-import { TILE_SIZE, TileType, WORLD_HEIGHT, WORLD_WIDTH } from "@battletank/shared";
+import {
+  PLAYER_TOP_BOUNDARY_Y,
+  TILE_SIZE,
+  TileType,
+  WORLD_HEIGHT,
+  WORLD_WIDTH,
+} from "@battletank/shared";
 
 import { DIRECTION_VECTORS } from "../gameplay.js";
 import { type GameState, type Tank, isInsideGrid, tileIndex } from "../schema/index.js";
+
+/**
+ * True when placing `tank` at top `y` would push a *player* hull into the enemy
+ * spawn lane (rows 0–1). Enemies are exempt — they enter along row 0 by design.
+ *
+ * A hard fence rather than a wall tile, so it applies only to player bodies and
+ * leaves their shells, and every enemy, free to cross it.
+ */
+export function crossesPlayerBoundary(tank: Tank, y: number): boolean {
+  return !tank.isEnemy && y < PLAYER_TOP_BOUNDARY_Y;
+}
 
 /**
  * Tiles a tank cannot drive through.
@@ -127,6 +144,11 @@ export function moveTank(state: GameState, tank: Tank): boolean {
   const nextX = stepAxis(tank.x, heading.x * tank.speed);
   const nextY = stepAxis(tank.y, heading.y * tank.speed);
 
+  // Players are fenced out of the top enemy-spawn rows; enemies are not.
+  if (crossesPlayerBoundary(tank, nextY)) {
+    return false;
+  }
+
   if (isBlocked(state, nextX, nextY, tank.width, tank.height)) {
     return false;
   }
@@ -190,6 +212,8 @@ export function separateTanks(state: GameState): number {
       ];
 
       for (const move of candidates) {
+        // A shove must never bury a player in the off-limits top rows either.
+        if (crossesPlayerBoundary(move.tank, move.y)) continue;
         if (isBlocked(state, move.x, move.y, move.tank.width, move.tank.height)) continue;
         if (collidesWithTank(state, move.tank, move.x, move.y)) continue;
 

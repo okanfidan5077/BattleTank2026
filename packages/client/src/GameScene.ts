@@ -11,6 +11,7 @@ import {
   MatchStatus,
   MoveDirection,
   PLAYER_SHOOT_COOLDOWN_MS,
+  PLAYER_TOP_BOUNDARY_Y,
   ServerMessage,
   TICK_MS,
   TILE_SIZE,
@@ -326,6 +327,8 @@ export class GameScene extends Phaser.Scene {
       .setScale(fit);
 
     this.buildTileGrid();
+
+    this.buildBoundaryMarker();
 
     this.buildHud();
 
@@ -685,6 +688,33 @@ export class GameScene extends Phaser.Scene {
 
       this.world.add(image);
       this.tiles[index] = image;
+    }
+  }
+
+  /**
+   * Marks the top rows players may not enter (the enemy spawn lane).
+   *
+   * Drawn into the world container in world units, so it lines up exactly with
+   * the server's `PLAYER_TOP_BOUNDARY_Y` fence and scales with the battlefield.
+   * Added right after the tiles, so tanks and shells still render on top of it —
+   * enemies driving down through the zone stay clearly visible.
+   */
+  private buildBoundaryMarker(): void {
+    // A faint red wash over rows 0–1.
+    const zone = this.add
+      .rectangle(0, 0, WORLD_WIDTH, PLAYER_TOP_BOUNDARY_Y, 0xe0483a, 0.12)
+      .setOrigin(0, 0)
+      .setDepth(1);
+    this.world.add(zone);
+
+    // Alternating hazard dashes right on the boundary line.
+    const dash = TILE_SIZE;
+    for (let x = 0; x < WORLD_WIDTH; x += dash * 2) {
+      const stripe = this.add
+        .rectangle(x, PLAYER_TOP_BOUNDARY_Y - 2, dash, 4, 0xf2c14e, 0.9)
+        .setOrigin(0, 0)
+        .setDepth(1);
+      this.world.add(stripe);
     }
   }
 

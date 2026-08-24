@@ -41,6 +41,18 @@ export const WORLD_WIDTH = GRID_WIDTH * TILE_SIZE;
 export const WORLD_HEIGHT = GRID_HEIGHT * TILE_SIZE;
 
 /**
+ * Top rows reserved for the enemy spawn lane, off-limits to player tanks.
+ *
+ * Enemies still enter along row 0 and drive down; player hulls may not cross
+ * above {@link PLAYER_TOP_BOUNDARY_Y}, which stops them from spawn-camping the
+ * enemy queue. Player *shells* are unaffected — only the tank body is fenced
+ * out. The server enforces this; the client draws a hazard marker at the same
+ * line so both agree on exactly where the wall is.
+ */
+export const PLAYER_TOP_BOUNDARY_ROWS = 2;
+export const PLAYER_TOP_BOUNDARY_Y = PLAYER_TOP_BOUNDARY_ROWS * TILE_SIZE;
+
+/**
  * Contents of a single map cell.
  *
  * Values are encoded as `uint8` in `GameState.grid`, so they must stay within
