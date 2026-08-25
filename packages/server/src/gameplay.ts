@@ -178,9 +178,10 @@ export const ENEMY_BRICK_FIRE_CHANCE = 0.25;
  * out in a random passable direction.
  *
  * Injects disorder so the swarm frays out of the tidy single-file lines a purely
- * optimal field produces — the whole point of the aggressive routing.
+ * optimal field produces — but kept low, so enemies still bear down hard on the
+ * eagle rather than wandering.
  */
-export const ENEMY_CHAOS_CHANCE = 0.2;
+export const ENEMY_CHAOS_CHANCE = 0.1;
 
 /**
  * Cost of routing a flow field through a brick, relative to open ground (1).
@@ -237,6 +238,17 @@ export const ENEMY_TIERS: readonly EnemyTier[] = [
 
 /** Chance a destroyed enemy leaves a power-up behind. */
 export const BOON_DROP_CHANCE = 0.1;
+
+/** How long a dropped boon lingers before it disappears, in milliseconds. */
+export const BOON_LIFESPAN_MS = 15_000;
+
+// ---------------------------------------------------------------- base defense
+
+/** Delay before a destroyed eagle-bunker tile regrows into brick, in ms. */
+export const BUNKER_REPAIR_MS = 60_000;
+
+/** Retry gap when a bunker tile is due to regrow but a tank is sitting on it. */
+export const BUNKER_REPAIR_RETRY_MS = 1_000;
 
 
 /** How long a stopwatch holds the enemies still. */

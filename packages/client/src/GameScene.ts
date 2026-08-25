@@ -65,6 +65,24 @@ const ENEMY_TINT: Record<number, number> = {
   3: 0x2e2e2e,
 };
 
+/**
+ * Player hull tint by star tier, so an upgraded tank reads at a glance.
+ *
+ * Tier 1 is untinted (the neutral white hull); each tier up burns hotter —
+ * yellow, orange, red — with tier 4 and beyond pinned at red.
+ */
+const PLAYER_TIER_TINT: Record<number, number> = {
+  2: 0xffff00,
+  3: 0xff8800,
+  4: 0xff0000,
+};
+
+/** The tint for a player's star tier, or `null` for tier 1 (no tint). */
+function playerTierTint(tier: number): number | null {
+  if (tier <= 1) return null;
+  return PLAYER_TIER_TINT[Math.min(4, tier)] ?? 0xff0000;
+}
+
 const BOON_TEXTURE: Record<BoonType, string> = {
   [BoonType.Bomb]: "boon-bomb",
   [BoonType.Star]: "boon-star",
@@ -1103,7 +1121,11 @@ export class GameScene extends Phaser.Scene {
     for (const [tank, sprite] of this.tankSprites) {
       if (tank.isEnemy || tank.ownerId !== player.sessionId) continue;
 
-      sprite.setTint(player.color);
+      // Hull colour now signals the star tier rather than player identity —
+      // names above the tanks still tell players apart.
+      const tint = playerTierTint(player.tier);
+      if (tint === null) sprite.clearTint();
+      else sprite.setTint(tint);
 
       const label = this.labels.get(tank) ?? this.createLabel(tank);
       const away = player.isConnected ? "" : " (away)";

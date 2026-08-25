@@ -6,6 +6,28 @@ import { isInsideGrid, tileIndex } from "../schema/index.js";
 export const EAGLE_TILE_X = Math.floor(GRID_WIDTH / 2);
 export const EAGLE_TILE_Y = GRID_HEIGHT - 1;
 
+/**
+ * The eagle's bunker: its in-bounds neighbouring tiles.
+ *
+ * These are the brick tiles `createBattlefield` rings the eagle with. Because
+ * the eagle sits on the bottom row, the three cells "below" it fall off the map
+ * and are excluded — so this is the row above plus the two flanks, five tiles in
+ * all. Filtering through {@link isInsideGrid} keeps every entry a real cell.
+ */
+export const EAGLE_BUNKER_TILES: readonly Readonly<{ x: number; y: number }>[] = (() => {
+  const tiles: { x: number; y: number }[] = [];
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dy === 0) continue;
+
+      const x = EAGLE_TILE_X + dx;
+      const y = EAGLE_TILE_Y + dy;
+      if (isInsideGrid(x, y)) tiles.push({ x, y });
+    }
+  }
+  return tiles;
+})();
+
 /** Mirrors a column about the map's vertical axis. */
 const mirrorX = (x: number): number => GRID_WIDTH - 1 - x;
 

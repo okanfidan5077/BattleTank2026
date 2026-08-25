@@ -20,8 +20,8 @@ export const TICK_MS = 1000 / TICK_RATE;
  */
 export const PLAYER_SHOOT_COOLDOWN_MS = 400;
 
-/** Minimum gap between enemy shots, in milliseconds. Deliberately far slower. */
-export const ENEMY_SHOOT_COOLDOWN_MS = 1200;
+/** Minimum gap between enemy shots, in milliseconds. Still slower than players. */
+export const ENEMY_SHOOT_COOLDOWN_MS = 840;
 
 /** A match is won by surviving this long. */
 export const MATCH_DURATION_MS = 10 * 60 * 1000;

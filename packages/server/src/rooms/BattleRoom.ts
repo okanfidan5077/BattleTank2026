@@ -30,6 +30,9 @@ import {
 
 import {
   BOON_DROP_CHANCE,
+  BOON_LIFESPAN_MS,
+  BUNKER_REPAIR_MS,
+  BUNKER_REPAIR_RETRY_MS,
   BULLET_DAMAGE,
   BULLET_SIZE,
   DIRECTION_VECTORS,
@@ -64,12 +67,11 @@ import { Boon, Bullet, GameState, Player, Tank, tileIndex } from "../schema/inde
 import { collectBoons } from "../systems/boons.js";
 import { updateBullets } from "../systems/bullets.js";
 import { updateEnemies } from "../systems/enemies.js";
-import { isBlocked, moveTank, separateTanks } from "../systems/tanks.js";
+import { boxesOverlap, isBlocked, moveTank, separateTanks } from "../systems/tanks.js";
 import { FlowField } from "../world/FlowField.js";
 import { SpawnQueue, type SpawnRequest } from "../world/SpawnQueue.js";
 import {
-  EAGLE_TILE_X,
-  EAGLE_TILE_Y,
+  EAGLE_BUNKER_TILES,
   ENEMY_SPAWN_TILES,
   SPAWN_TILES,
   createBattlefield,
@@ -113,6 +115,22 @@ export class BattleRoom extends Room<GameState> {
 
   /** ownerId -> what that enemy is trying to reach. */
   private objectives = new Map<string, EnemyObjective>();
+
+  /**
+   * elapsedMs at which each dropped boon was spawned, so it can be aged out.
+   *
+   * A WeakMap keyed by the boon itself: an entry vanishes with its boon the
+   * moment it leaves `state.boons` (collected, expired, or wiped on reset), so
+   * there is nothing to clean up by hand.
+   */
+  private readonly boonSpawnedAtMs = new WeakMap<Boon, number>();
+
+  /**
+   * Destroyed eagle-bunker tiles awaiting regrowth: grid index -> elapsedMs at
+   * which to (re)attempt restoring it to brick. A tile parked on the field pushes
+   * its own deadline back a second at a time until the tank clears off it.
+   */
+  private readonly bunkerRepairs = new Map<number, number>();
 
   /** Difficulty steps already queued, so each minute is stocked once. */
   private minutesQueued = 0;
@@ -445,7 +463,9 @@ export class BattleRoom extends Room<GameState> {
     }
 
     collectBoons(this.state, (boon, player) => this.applyBoon(boon, player));
+    this.expireBoons();
     this.expireShovel();
+    this.restoreBunker();
 
     if (outcome.eagleDestroyed) {
       this.endMatch(MatchStatus.GameOver, "the eagle was destroyed");
@@ -545,7 +565,28 @@ export class BattleRoom extends Room<GameState> {
     const kinds = Object.values(BoonType);
     const type = kinds[Math.floor(Math.random() * kinds.length)]!;
 
-    this.state.boons.push(new Boon({ x: wreck.x, y: wreck.y, type }));
+    const boon = new Boon({ x: wreck.x, y: wreck.y, type });
+    this.state.boons.push(boon);
+    this.boonSpawnedAtMs.set(boon, this.elapsedMs);
+  }
+
+  /**
+   * Removes boons that have sat on the field past their lifespan.
+   *
+   * Dropping a boon from `state.boons` is itself the "broadcast" — Colyseus
+   * replicates the removal, and the client's `boons.onRemove` clears the sprite,
+   * exactly as a collected boon does (minus the pickup flash). Collection runs
+   * first each tick, so a boon grabbed on its final frame is never double-removed.
+   */
+  private expireBoons(): void {
+    for (let i = this.state.boons.length - 1; i >= 0; i--) {
+      const boon = this.state.boons.at(i);
+      const spawnedAt = this.boonSpawnedAtMs.get(boon) ?? this.elapsedMs;
+
+      if (this.elapsedMs - spawnedAt >= BOON_LIFESPAN_MS) {
+        this.state.boons.splice(i, 1);
+      }
+    }
   }
 
   // -------------------------------------------------------------------- boons
@@ -625,21 +666,62 @@ export class BattleRoom extends Room<GameState> {
   }
 
   private bunkerRingIndices(): number[] {
-    const indices: number[] = [];
+    return EAGLE_BUNKER_TILES.map((tile) => tileIndex(tile.x, tile.y));
+  }
 
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        if (dx === 0 && dy === 0) continue;
+  /**
+   * Regrows the eagle's bunker: destroyed ring tiles turn back to brick 60s on.
+   *
+   * Each destroyed (Empty) bunker tile is scheduled once, and restored only when
+   * its timer is up *and* no tank is standing on it — a blocked tile just waits
+   * another second and tries again. A tile the shovel has meanwhile turned to
+   * steel is no longer Empty, so its pending repair is simply dropped. Restoring
+   * a tile changes what routes through the bunker, so the flow field is rebuilt.
+   */
+  private restoreBunker(): void {
+    for (const tile of EAGLE_BUNKER_TILES) {
+      const index = tileIndex(tile.x, tile.y);
+      const due = this.bunkerRepairs.get(index);
 
-        const x = EAGLE_TILE_X + dx;
-        const y = EAGLE_TILE_Y + dy;
-        if (x < 0 || y < 0) continue;
+      if (this.state.grid.at(index) !== TileType.Empty) {
+        // Intact, or filled by a shovel's steel: nothing to regrow.
+        if (due !== undefined) this.bunkerRepairs.delete(index);
+        continue;
+      }
 
-        indices.push(tileIndex(x, y));
+      if (due === undefined) {
+        // Freshly destroyed: start its 60-second clock.
+        this.bunkerRepairs.set(index, this.elapsedMs + BUNKER_REPAIR_MS);
+        continue;
+      }
+
+      if (this.elapsedMs < due) continue;
+
+      if (this.isTileOccupied(tile.x, tile.y)) {
+        // A tank is on the tile — do not entomb it; check again in a second.
+        this.bunkerRepairs.set(index, this.elapsedMs + BUNKER_REPAIR_RETRY_MS);
+        continue;
+      }
+
+      this.state.grid[index] = TileType.Brick;
+      this.bunkerRepairs.delete(index);
+      this.flowField.rebuild(this.state.grid);
+    }
+  }
+
+  /** True when any tank's hull overlaps the tile at `(tileX, tileY)`. */
+  private isTileOccupied(tileX: number, tileY: number): boolean {
+    const x = tileX * TILE_SIZE;
+    const y = tileY * TILE_SIZE;
+
+    for (let i = 0; i < this.state.tanks.length; i++) {
+      const tank = this.state.tanks.at(i);
+      if (boxesOverlap(x, y, TILE_SIZE, TILE_SIZE, tank.x, tank.y, tank.width, tank.height)) {
+        return true;
       }
     }
 
-    return indices;
+    return false;
   }
 
   /** Returns players to the field once their delay is up and the pad is free. */
@@ -791,6 +873,7 @@ export class BattleRoom extends Room<GameState> {
     this.elapsedMs = 0;
     this.minutesQueued = 0;
     this.lastDifficultyKey = "";
+    this.bunkerRepairs.clear();
     this.enemiesFrozenUntilTick = 0;
     this.shovelExpiresAtTick = null;
     this.moveIntents.clear();
