@@ -44,6 +44,12 @@ export class Player extends Schema<PlayerInit> {
   /** Seconds until this player returns; 0 when they are already on the field. */
   @type("uint8") respawnInSeconds: number = 0;
 
+  /** Enemy tanks this player landed the killing blow on, for the scoreboard. */
+  @type("uint16") enemiesDestroyed: number = 0;
+
+  /** Times this player has fired, for the scoreboard. */
+  @type("uint16") shotsFired: number = 0;
+
   constructor(init?: PlayerInit) {
     // Field initializers run during super(), so init is applied afterwards.
     super();

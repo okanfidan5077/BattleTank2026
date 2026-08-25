@@ -6,6 +6,10 @@
     <title>BattleTank 2026</title>
   </head>
   <body>
+    <button id="fullscreen-toggle" type="button" title="Toggle fullscreen" aria-label="Toggle fullscreen">
+      ⛶
+    </button>
+
     <div id="game"></div>
 
     <!-- Lobby overlay. Sits above the canvas until a room is joined. -->
@@ -47,6 +51,18 @@
       <div class="panel">
         <h1>STAGING</h1>
         <p class="muted">Room <strong id="staging-room"></strong></p>
+
+        <label>Your Record</label>
+        <div class="meta-stats">
+          <div class="meta-stat">
+            <span class="meta-value" id="stat-best-time">—</span>
+            <span class="meta-label">Best Time</span>
+          </div>
+          <div class="meta-stat">
+            <span class="meta-value" id="stat-total-kills">0</span>
+            <span class="meta-label">Total Kills</span>
+          </div>
+        </div>
 
         <label>Players</label>
         <ul id="staging-players" class="roster"></ul>

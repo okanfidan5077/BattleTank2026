@@ -60,6 +60,10 @@ export interface PlayerView {
   lives: number;
   isSpectator: boolean;
   respawnInSeconds: number;
+  /** Enemy tanks this player landed the killing blow on. */
+  enemiesDestroyed: number;
+  /** Times this player has fired. */
+  shotsFired: number;
 }
 
 export interface BattleStateView {

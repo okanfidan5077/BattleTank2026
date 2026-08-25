@@ -3,6 +3,7 @@ import { getStateCallbacks } from "colyseus.js";
 import { ClientMessage, MatchStatus } from "@battletank/shared";
 
 import type { BattleRoom } from "./network.js";
+import { formatBestTime, loadProgression } from "./progression.js";
 import type { PlayerView } from "./state.js";
 
 function element<T extends HTMLElement>(id: string): T {
@@ -29,6 +30,14 @@ export function runStaging(room: BattleRoom): Promise<void> {
   const roster = element<HTMLUListElement>("staging-players");
   const startButton = element<HTMLButtonElement>("start-match");
   const hint = element("staging-hint");
+  const bestTimeStat = element("stat-best-time");
+  const totalKillsStat = element("stat-total-kills");
+
+  // Read fresh each pass, so returning here after a match shows the totals the
+  // just-finished game folded in.
+  const progression = loadProgression();
+  bestTimeStat.textContent = formatBestTime(progression.bestTime);
+  totalKillsStat.textContent = String(progression.totalKills);
 
   // Note: `room.state` is not decoded yet at this point — this runs as soon as
   // the join resolves. Reading `matchState` here would give `undefined`, so

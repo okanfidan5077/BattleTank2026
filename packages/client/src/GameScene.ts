@@ -20,12 +20,15 @@ import {
   WORLD_WIDTH,
   isMatchOver,
   type BoonCollectedMessage,
+  type MatchStatsMessage,
+  type MatchStatsRow,
   type MoveMessage,
   type SteelHitMessage,
   type TankDestroyedMessage,
 } from "@battletank/shared";
 
 import { forgetSession, type BattleRoom } from "./network.js";
+import { recordMatch } from "./progression.js";
 import type { BattleStateView, BoonView, BulletView, PlayerView, TankView } from "./state.js";
 
 /** Base resolution the scene is authored against; Phaser scales it to fit. */
@@ -97,6 +100,24 @@ const ROTATION: Record<Direction, number> = {
   [Direction.Left]: -Math.PI / 2,
 };
 
+/** Vertical anchor of the result overlay's footer control (button / label). */
+const RESULT_FOOTER_Y = BASE_HEIGHT - 90;
+
+/** Longest player name the scoreboard shows before eliding, in characters. */
+const SCOREBOARD_NAME_WIDTH = 16;
+
+/** Formats one fixed-width scoreboard line; monospace keeps the columns aligned. */
+function scoreboardRow(rank: string, name: string, kills: string, shots: string): string {
+  return rank.padEnd(3) + name.padEnd(SCOREBOARD_NAME_WIDTH + 2) + kills.padStart(6) + shots.padStart(8);
+}
+
+/** Trims a name to the scoreboard's column, marking the cut with an ellipsis. */
+function truncateName(name: string): string {
+  return name.length > SCOREBOARD_NAME_WIDTH
+    ? `${name.slice(0, SCOREBOARD_NAME_WIDTH - 1)}…`
+    : name;
+}
+
 export class GameScene extends Phaser.Scene {
   private room?: BattleRoom;
 
@@ -120,6 +141,15 @@ export class GameScene extends Phaser.Scene {
   private explosionEmitter!: Phaser.GameObjects.Particles.ParticleEmitter;
   private sparkEmitter!: Phaser.GameObjects.Particles.ParticleEmitter;
 
+  /**
+   * A private Web Audio context for the synthesized 8-bit blips.
+   *
+   * Own context rather than Phaser's sound manager (which `main.ts` disables
+   * with `noAudio`): the beeps are generated from oscillators, so no asset files
+   * or loaders are involved, and it is closed with the scene to free the handle.
+   */
+  private audioCtx?: AudioContext;
+
   /** Top HUD bar fields, refreshed from state each frame. */
   private hudTime!: Phaser.GameObjects.Text;
   private hudEnemies!: Phaser.GameObjects.Text;
@@ -142,6 +172,12 @@ export class GameScene extends Phaser.Scene {
 
   /** Whether {@link overlayFooter} is the host's button rather than the label. */
   private overlayFooterIsButton = false;
+
+  /** Post-match tallies, from the `MatchStats` message. */
+  private matchStats?: MatchStatsRow[];
+
+  /** The scoreboard table drawn onto the result overlay. */
+  private scoreboard?: Phaser.GameObjects.Container;
 
   /**
    * Detachers for every room-level callback this scene registered.
@@ -345,6 +381,8 @@ export class GameScene extends Phaser.Scene {
       keyboard.addCapture(["UP", "DOWN", "LEFT", "RIGHT", "SPACE"]);
     }
 
+    this.initAudio();
+
     this.attach();
 
     // The room survives this scene; detach everything we bound to it when the
@@ -358,6 +396,10 @@ export class GameScene extends Phaser.Scene {
   private teardown(): void {
     for (const detach of this.roomCleanups) detach();
     this.roomCleanups = [];
+
+    // Release the audio handle; browsers cap how many contexts can be open.
+    void this.audioCtx?.close().catch(() => {});
+    this.audioCtx = undefined;
   }
 
   // ---------------------------------------------------------------------- HUD
@@ -496,6 +538,7 @@ export class GameScene extends Phaser.Scene {
   private spawnTankExplosion(message: TankDestroyedMessage): void {
     const at = this.worldToScene(message.x, message.y);
     this.explosionEmitter.explode(24, at.x, at.y);
+    this.soundDestroyed();
 
     if (!message.isEnemy) {
       // A player went down: the heavy shake.
@@ -510,6 +553,88 @@ export class GameScene extends Phaser.Scene {
   private spawnSteelSpark(message: SteelHitMessage): void {
     const at = this.worldToScene(message.x, message.y);
     this.sparkEmitter.explode(8, at.x, at.y);
+  }
+
+  // ---------------------------------------------------------------- audio
+
+  /** Opens the Web Audio context, resuming it past the browser's autoplay gate. */
+  private initAudio(): void {
+    const Ctor =
+      window.AudioContext ??
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctor) return;
+
+    try {
+      this.audioCtx = new Ctor();
+      // The match starts on a click, so the gesture requirement is met — but
+      // resume anyway in case the context still came up suspended.
+      if (this.audioCtx.state === "suspended") void this.audioCtx.resume();
+    } catch {
+      // No audio available (blocked, unsupported): the game runs on regardless.
+      this.audioCtx = undefined;
+    }
+  }
+
+  /**
+   * Plays one short oscillator note.
+   *
+   * A tiny attack-then-decay gain envelope keeps notes from clicking, and an
+   * optional `endHz` glides the pitch for effects like the descending explosion.
+   * Silently does nothing when audio is unavailable.
+   */
+  private tone(options: {
+    type: OscillatorType;
+    startHz: number;
+    /** Glides to this pitch across the note when set (e.g. the death wail). */
+    endHz?: number;
+    /** Seconds. */
+    duration: number;
+    /** Seconds from now, for sequencing an arpeggio. */
+    delay?: number;
+    volume?: number;
+  }): void {
+    const ctx = this.audioCtx;
+    if (!ctx || ctx.state === "closed") return;
+    if (ctx.state === "suspended") void ctx.resume();
+
+    const start = ctx.currentTime + (options.delay ?? 0);
+    const end = start + options.duration;
+    const volume = options.volume ?? 0.14;
+
+    const osc = ctx.createOscillator();
+    osc.type = options.type;
+    osc.frequency.setValueAtTime(options.startHz, start);
+    if (options.endHz !== undefined) {
+      // Exponential ramps cannot touch zero, hence the floor.
+      osc.frequency.exponentialRampToValueAtTime(Math.max(1, options.endHz), end);
+    }
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(volume, start + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, end);
+
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(start);
+    osc.stop(end + 0.02);
+  }
+
+  /** Short high square blip when the local player fires. */
+  private soundFire(): void {
+    this.tone({ type: "square", startHz: 400, duration: 0.1, volume: 0.1 });
+  }
+
+  /** Descending sawtooth wail when a tank is destroyed. */
+  private soundDestroyed(): void {
+    this.tone({ type: "sawtooth", startHz: 100, endHz: 50, duration: 0.3, volume: 0.18 });
+  }
+
+  /** Fast three-note ascending arpeggio when a boon is collected. */
+  private soundBoon(): void {
+    const arpeggio = [523, 659, 784]; // C5, E5, G5
+    arpeggio.forEach((hz, index) => {
+      this.tone({ type: "square", startHz: hz, duration: 0.08, delay: index * 0.06, volume: 0.11 });
+    });
   }
 
   // ------------------------------------------------------------ match result
@@ -533,23 +658,23 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(0, 0);
 
     const heading = this.add
-      .text(BASE_WIDTH / 2, BASE_HEIGHT / 2 - 90, won ? "VICTORY" : "GAME OVER", {
+      .text(BASE_WIDTH / 2, 150, won ? "VICTORY" : "GAME OVER", {
         fontFamily: "monospace",
-        fontSize: "96px",
+        fontSize: "88px",
         color: won ? "#8ef2a4" : "#ff6b5a",
       })
-      .setOrigin(0.5);
+      .setOrigin(0.5, 0);
 
     const detail = this.add
       .text(
         BASE_WIDTH / 2,
-        BASE_HEIGHT / 2 + 10,
+        250,
         won
           ? `Victory! Survived for ${seconds} seconds.`
           : `Game Over! Survived for ${seconds} seconds.`,
         { fontFamily: "monospace", fontSize: "28px", color: "#f7f3e8" },
       )
-      .setOrigin(0.5);
+      .setOrigin(0.5, 0);
 
     this.overlayFooterIsButton = this.isHost();
     this.overlayFooter = this.overlayFooterIsButton ? this.buildReturnButton() : this.buildWaitingLabel();
@@ -557,6 +682,71 @@ export class GameScene extends Phaser.Scene {
     this.overlay = this.add
       .container(0, 0, [backdrop, heading, detail, this.overlayFooter])
       .setDepth(100);
+
+    // Draw the scoreboard if the stats have already arrived; otherwise the
+    // MatchStats handler draws it the moment they do.
+    this.renderScoreboard();
+  }
+
+  /**
+   * Draws (or redraws) the post-match scoreboard onto the result overlay.
+   *
+   * Ordered by kills, then by fewest shots, then by name. The local player's row
+   * is picked out in gold. A no-op until both the overlay exists and the stats
+   * have arrived — the two can land in either order.
+   */
+  private renderScoreboard(): void {
+    if (!this.overlay || !this.matchStats) return;
+
+    this.scoreboard?.destroy();
+
+    const rows = [...this.matchStats].sort(
+      (a, b) => b.kills - a.kills || a.shots - b.shots || a.name.localeCompare(b.name),
+    );
+
+    const startY = 340;
+    const rowHeight = 36;
+    const mySession = this.room?.sessionId;
+    const children: Phaser.GameObjects.GameObject[] = [];
+
+    children.push(
+      this.add
+        .text(BASE_WIDTH / 2, startY, scoreboardRow("#", "PLAYER", "KILLS", "SHOTS"), {
+          fontFamily: "monospace",
+          fontSize: "26px",
+          color: "#8fa1b3",
+        })
+        .setOrigin(0.5, 0),
+    );
+
+    if (rows.length === 0) {
+      children.push(
+        this.add
+          .text(BASE_WIDTH / 2, startY + 50, "(no players)", {
+            fontFamily: "monospace",
+            fontSize: "26px",
+            color: "#5c6b7a",
+          })
+          .setOrigin(0.5, 0),
+      );
+    }
+
+    rows.forEach((row, index) => {
+      const mine = row.sessionId === mySession;
+      children.push(
+        this.add
+          .text(
+            BASE_WIDTH / 2,
+            startY + 50 + index * rowHeight,
+            scoreboardRow(`${index + 1}`, truncateName(row.name), `${row.kills}`, `${row.shots}`),
+            { fontFamily: "monospace", fontSize: "26px", color: mine ? "#f2c14e" : "#f7f3e8" },
+          )
+          .setOrigin(0.5, 0),
+      );
+    });
+
+    this.scoreboard = this.add.container(0, 0, children);
+    this.overlay.add(this.scoreboard);
   }
 
   /**
@@ -588,7 +778,7 @@ export class GameScene extends Phaser.Scene {
   /** Host-only control that asks the server to reset the match to the lobby. */
   private buildReturnButton(): Phaser.GameObjects.Text {
     const button = this.add
-      .text(BASE_WIDTH / 2, BASE_HEIGHT / 2 + 110, "[ RETURN TO LOBBY ]", {
+      .text(BASE_WIDTH / 2, RESULT_FOOTER_Y, "[ RETURN TO LOBBY ]", {
         fontFamily: "monospace",
         fontSize: "40px",
         color: "#f2c14e",
@@ -609,7 +799,7 @@ export class GameScene extends Phaser.Scene {
   /** What everyone who is not the host sees while they wait for the reset. */
   private buildWaitingLabel(): Phaser.GameObjects.Text {
     return this.add
-      .text(BASE_WIDTH / 2, BASE_HEIGHT / 2 + 110, "waiting for the host to return to the lobby...", {
+      .text(BASE_WIDTH / 2, RESULT_FOOTER_Y, "waiting for the host to return to the lobby...", {
         fontFamily: "monospace",
         fontSize: "28px",
         color: "#8fa1b3",
@@ -659,6 +849,7 @@ export class GameScene extends Phaser.Scene {
 
     if (this.isShootDown() && time - this.lastShotAt >= SHOOT_INTERVAL_MS) {
       this.room.send(ClientMessage.Shoot);
+      this.soundFire();
       this.lastShotAt = time;
     }
   }
@@ -848,11 +1039,38 @@ export class GameScene extends Phaser.Scene {
         this.spawnSteelSpark(message);
       }),
     );
+
+    this.roomCleanups.push(
+      room.onMessage(ServerMessage.MatchStats, (message: MatchStatsMessage) => {
+        // May arrive before or after the overlay is built — store, then draw if
+        // the overlay is already up.
+        this.matchStats = message.rows;
+        this.renderScoreboard();
+        this.recordProgression(message.rows);
+      }),
+    );
+  }
+
+  /**
+   * Folds this match into the browser's lifetime record.
+   *
+   * `MatchStats` is broadcast exactly once when the match resolves, and the
+   * scene is torn down on return to the lobby, so this runs once per match — no
+   * risk of double-counting the kills. `finalTime` is the match's length, shared
+   * by everyone; the kills are pulled from this client's own row.
+   */
+  private recordProgression(rows: MatchStatsRow[]): void {
+    const mine = rows.find((row) => row.sessionId === this.room?.sessionId);
+    if (!mine) return;
+
+    recordMatch(this.room?.state.finalTime ?? 0, mine.kills);
   }
 
   /** Brief on-screen flash where a power-up was taken. */
   private announceBoon(message: BoonCollectedMessage): void {
     const mine = message.playerId === this.room?.sessionId;
+
+    this.soundBoon();
 
     const label = this.add
       .text(message.x, message.y, message.type.toUpperCase(), {

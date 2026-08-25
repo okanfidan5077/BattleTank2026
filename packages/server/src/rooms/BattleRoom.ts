@@ -22,6 +22,8 @@ import {
   defaultPlayerName,
   type BoonCollectedMessage,
   type JoinOptions,
+  type MatchStatsMessage,
+  type MatchStatsRow,
   type SteelHitMessage,
   type TankDestroyedMessage,
 } from "@battletank/shared";
@@ -35,8 +37,7 @@ import {
   ENEMY_SPAWN_BATCH_MAX,
   ENEMY_SPAWN_BATCH_MIN,
   ENEMY_SPAWN_INTERVAL_TICKS,
-  ENEMY_WAVE_BASE,
-  ENEMY_WAVE_GROWTH,
+  enemySpawnRatePerMinute,
   DIFFICULTY_STEP_MS,
   EnemyObjective,
   rollEnemyObjective,
@@ -115,6 +116,9 @@ export class BattleRoom extends Room<GameState> {
 
   /** Difficulty steps already queued, so each minute is stocked once. */
   private minutesQueued = 0;
+
+  /** `players:minute` at the last difficulty log; empty until the first tick. */
+  private lastDifficultyKey = "";
 
   private readonly spawnQueue = new SpawnQueue();
 
@@ -406,6 +410,7 @@ export class BattleRoom extends Room<GameState> {
     this.tick++;
     this.elapsedMs += deltaMs;
 
+    this.logDifficultyIfChanged();
     this.advanceClock();
     this.releaseEnemies();
     this.respawnPlayers();
@@ -435,8 +440,8 @@ export class BattleRoom extends Room<GameState> {
       this.broadcast(ServerMessage.SteelHit, { x: spark.x, y: spark.y } satisfies SteelHitMessage);
     }
 
-    for (const wreck of outcome.destroyedTanks) {
-      this.onTankDestroyed(wreck);
+    for (const { tank, killerId } of outcome.destroyedTanks) {
+      this.onTankDestroyed(tank, killerId);
     }
 
     collectBoons(this.state, (boon, player) => this.applyBoon(boon, player));
@@ -482,7 +487,7 @@ export class BattleRoom extends Room<GameState> {
    *
    * Enemies are not rescheduled — the wave queue supplies the next one.
    */
-  private onTankDestroyed(tank: Tank): void {
+  private onTankDestroyed(tank: Tank, killerId: string): void {
     // Announce the kill for the client's explosion and camera shake. Reached
     // only for weapons-fire deaths — a leaving player, a bomb boon, or a reset
     // remove tanks by other paths and deliberately stay silent here.
@@ -498,6 +503,11 @@ export class BattleRoom extends Room<GameState> {
     this.moveIntents.delete(tank.ownerId);
 
     if (tank.isEnemy) {
+      // Friendly fire is off, so an enemy's killer is always a player. Credit
+      // the kill; the record is absent only if that player has since left.
+      const killer = this.state.players.get(killerId);
+      if (killer) killer.enemiesDestroyed++;
+
       this.objectives.delete(tank.ownerId);
       this.maybeDropBoon(tank);
       return;
@@ -712,7 +722,31 @@ export class BattleRoom extends Room<GameState> {
     this.state.matchState = status;
     this.lock();
 
+    this.broadcastMatchStats();
+
     console.log(`[room ${this.roomId}] ${status} — ${reason}`);
+  }
+
+  /**
+   * Sends every player's final tally for the game-over scoreboard.
+   *
+   * A snapshot taken here, at the moment the match resolves, rather than left to
+   * replicated state — so the board is stable even if someone leaves the
+   * finished room. Everyone who took part is included, spectators as well.
+   */
+  private broadcastMatchStats(): void {
+    const rows: MatchStatsRow[] = [];
+    for (const [sessionId, player] of this.state.players) {
+      rows.push({
+        sessionId,
+        name: player.name,
+        color: player.color,
+        kills: player.enemiesDestroyed,
+        shots: player.shotsFired,
+      });
+    }
+
+    this.broadcast(ServerMessage.MatchStats, { rows } satisfies MatchStatsMessage);
   }
 
   /**
@@ -756,6 +790,7 @@ export class BattleRoom extends Room<GameState> {
     //    anyone respawns so their invulnerability window is measured from zero.
     this.elapsedMs = 0;
     this.minutesQueued = 0;
+    this.lastDifficultyKey = "";
     this.enemiesFrozenUntilTick = 0;
     this.shovelExpiresAtTick = null;
     this.moveIntents.clear();
@@ -776,6 +811,8 @@ export class BattleRoom extends Room<GameState> {
       player.tier = 1;
       player.isSpectator = false;
       player.respawnInSeconds = 0;
+      player.enemiesDestroyed = 0;
+      player.shotsFired = 0;
 
       this.playerSpawnIndex.set(id, seat % SPAWN_TILES.length);
       this.spawnPlayer(id);
@@ -819,19 +856,57 @@ export class BattleRoom extends Room<GameState> {
 
   // -------------------------------------------------------------- enemy waves
 
+  /**
+   * Players currently driving the difficulty: connected and not spectating.
+   *
+   * A dropped player (seat held for reconnect) has `isConnected === false`, so
+   * they stop counting the instant they drop and count again on reconnect —
+   * which is what makes the scaling respond to comings and goings. Spectators,
+   * out of the fight, never count.
+   */
+  private activePlayers(): number {
+    let count = 0;
+    for (const [, player] of this.state.players) {
+      if (player.isConnected && !player.isSpectator) count++;
+    }
+    return count;
+  }
+
+  /**
+   * Logs the difficulty dials whenever they move.
+   *
+   * They shift on two triggers now — a change in active players, and each new
+   * minute of the time ramp — so the key folds both in.
+   */
+  private logDifficultyIfChanged(): void {
+    const players = this.activePlayers();
+    const minute = this.currentMinute;
+
+    const key = `${players}:${minute}`;
+    if (key === this.lastDifficultyKey) return;
+    this.lastDifficultyKey = key;
+
+    console.log(
+      `[room ${this.roomId}] difficulty → ${players} active player(s), minute ${minute}: ` +
+        `${enemySpawnRatePerMinute(players, minute)} enemies/min, ` +
+        `${maxConcurrentEnemies(players, minute)} concurrent max`,
+    );
+  }
+
   private fillSpawnQueue(): void {
     this.queueWaveForMinute(1);
   }
 
   /**
-   * Stocks the queue for a given minute: 50 for the first, +10 for each after.
+   * Stocks the queue for a given minute, sized by the active player count.
    *
    * Note this lengthens the wave rather than raising moment-to-moment pressure —
-   * `MAX_CONCURRENT_ENEMIES` still caps how many can be on the field at once, so
-   * a deeper queue mostly means the assault keeps coming for longer.
+   * {@link maxConcurrentEnemies} still caps how many can be on the field at once,
+   * so a deeper queue mostly means the assault keeps coming for longer. The size
+   * is read live, so each new minute reflects who is currently in the fight.
    */
   private queueWaveForMinute(minute: number): void {
-    const size = ENEMY_WAVE_BASE + ENEMY_WAVE_GROWTH * (minute - 1);
+    const size = enemySpawnRatePerMinute(this.activePlayers(), minute);
 
     for (let i = 0; i < size; i++) {
       this.spawnQueue.push({ spawnPointIndex: i % ENEMY_SPAWN_TILES.length });
@@ -850,7 +925,11 @@ export class BattleRoom extends Room<GameState> {
     if (this.tick % ENEMY_SPAWN_INTERVAL_TICKS !== 0) return;
     if (this.spawnQueue.isEmpty) return;
 
-    const headroom = maxConcurrentEnemies(this.currentMinute) - this.countEnemies();
+    // Concurrency is read live off the current active-player count and minute,
+    // so it drops the moment a player leaves, climbs when one (re)joins, and
+    // ramps up as the match wears on.
+    const headroom =
+      maxConcurrentEnemies(this.activePlayers(), this.currentMinute) - this.countEnemies();
     if (headroom <= 0) return;
 
     const batch = Math.min(headroom, randomInt(ENEMY_SPAWN_BATCH_MIN, ENEMY_SPAWN_BATCH_MAX));
@@ -1014,6 +1093,13 @@ export class BattleRoom extends Room<GameState> {
    */
   private fire(tank: Tank): void {
     this.lastShotAtMs.set(tank.ownerId, this.elapsedMs);
+
+    // Count the trigger pull once, even for a multi-shell volley — enemies fire
+    // through here too, so only players are tallied.
+    if (!tank.isEnemy) {
+      const player = this.state.players.get(tank.ownerId);
+      if (player) player.shotsFired++;
+    }
 
     const profile = this.profileFor(tank);
     const heading = DIRECTION_VECTORS[tank.direction];

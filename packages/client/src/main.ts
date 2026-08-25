@@ -17,6 +17,34 @@ function gameContainer(): HTMLElement {
 }
 
 /**
+ * Wires the top-right fullscreen button.
+ *
+ * Fullscreens the whole document (not just the canvas) so the DOM overlays go
+ * fullscreen with it, and toggles back out when already fullscreen. Both calls
+ * must be driven by the click gesture, and either can reject (a browser policy,
+ * an iframe without permission), so failures are swallowed rather than thrown.
+ */
+function setupFullscreenToggle(): void {
+  const button = document.getElementById("fullscreen-toggle");
+  if (!button) return;
+
+  const sync = () => {
+    button.title = document.fullscreenElement ? "Exit fullscreen" : "Toggle fullscreen";
+  };
+
+  button.addEventListener("click", () => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => {});
+    } else {
+      void document.documentElement.requestFullscreen().catch(() => {});
+    }
+  });
+
+  document.addEventListener("fullscreenchange", sync);
+  sync();
+}
+
+/**
  * Boots a fresh Phaser instance around an already-connected room.
  *
  * Phaser is deliberately not started up front: the scene is handed an already
@@ -84,6 +112,8 @@ function runMatch(room: BattleRoom): Promise<void> {
 
 async function boot(): Promise<void> {
   console.log(`[client] BattleTank2026 booted (protocol v${PROTOCOL_VERSION})`);
+
+  setupFullscreenToggle();
 
   // A refresh resumes the previous seat and skips the lobby entirely.
   const room = (await tryResume()) ?? (await runLobby());

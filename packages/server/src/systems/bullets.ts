@@ -113,8 +113,11 @@ export interface BulletOutcome {
   bricksDestroyed: number;
   /** Steel tiles cut open by tier 4 shells. */
   steelDestroyed: number;
-  /** Tanks whose health reached zero, already removed from the state. */
-  destroyedTanks: Tank[];
+  /**
+   * Tanks whose health reached zero, already removed from the state, each paired
+   * with the `ownerId` of the shell that finished it — so a kill can be credited.
+   */
+  destroyedTanks: { tank: Tank; killerId: string }[];
   /** Opposing shells that annihilated each other in mid-air. */
   bulletsIntercepted: number;
   /** The eagle was hit this tick — the match is lost. */
@@ -185,7 +188,7 @@ function resolveInterceptions(state: GameState, doomed: Set<number>): number {
  */
 export function updateBullets(state: GameState): BulletOutcome {
   const destroyed = { bricks: 0, steel: 0, eagle: false, steelHits: [] as { x: number; y: number }[] };
-  const destroyedTanks: Tank[] = [];
+  const destroyedTanks: { tank: Tank; killerId: string }[] = [];
 
   // 1. Move everything.
   for (let i = 0; i < state.bullets.length; i++) {
@@ -221,7 +224,7 @@ export function updateBullets(state: GameState): BulletOutcome {
       if (target.currentHealth === 0) {
         const index = state.tanks.indexOf(target);
         if (index >= 0) state.tanks.splice(index, 1);
-        destroyedTanks.push(target);
+        destroyedTanks.push({ tank: target, killerId: bullet.ownerId });
       }
 
       state.bullets.splice(i, 1);

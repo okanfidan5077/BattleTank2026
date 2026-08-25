@@ -72,12 +72,38 @@ export const DIRECTION_VECTORS: Record<Direction, Vector2> = {
 };
 
 // ---------------------------------------------------------------- enemy waves
+//
+// Difficulty is a hybrid of two escalators, added together:
+//   * a player baseline — a fuller room faces a longer, heavier assault, and it
+//     re-scales live as players drop out or reconnect; and
+//   * a time ramp — the pressure keeps climbing minute over minute, so simply
+//     surviving to the ten-minute win stays a real fight rather than a plateau.
 
-/** Enemies queued for the first minute of a match. */
-export const ENEMY_WAVE_BASE = 50;
+/** Enemies queued per minute for a lone player, before the time ramp. */
+export const ENEMY_SPAWN_RATE_BASE = 30;
 
-/** Extra enemies queued for each minute that passes: 50, 60, 70, ... */
-export const ENEMY_WAVE_GROWTH = 10;
+/** Extra enemies queued per minute for each additional active player. */
+export const ENEMY_SPAWN_RATE_PER_PLAYER = 10;
+
+/** Extra enemies added to the per-minute queue for each elapsed minute. */
+export const ENEMY_SPAWN_RATE_PER_MINUTE = 10;
+
+/** The player-count share of a minute's queue depth: 30 solo, +10 per extra. */
+export function enemySpawnBaselineRate(activePlayers: number): number {
+  const players = Math.max(1, activePlayers);
+  return ENEMY_SPAWN_RATE_BASE + ENEMY_SPAWN_RATE_PER_PLAYER * (players - 1);
+}
+
+/**
+ * Enemies queued for a given (1-based) minute: player baseline + time ramp.
+ *
+ * e.g. minute 5 with 3 players → 50 (baseline) + 50 (10 × 5) = 100. This sets
+ * how *long* each minute's wave keeps coming; {@link maxConcurrentEnemies} sets
+ * how hard it hits at once.
+ */
+export function enemySpawnRatePerMinute(activePlayers: number, minute: number): number {
+  return enemySpawnBaselineRate(activePlayers) + ENEMY_SPAWN_RATE_PER_MINUTE * minute;
+}
 
 /** Length of a difficulty step, in milliseconds of real match time. */
 export const DIFFICULTY_STEP_MS = 60_000;
@@ -89,23 +115,36 @@ export const ENEMY_SPAWN_INTERVAL_TICKS = TICK_RATE;
 export const ENEMY_SPAWN_BATCH_MIN = 1;
 export const ENEMY_SPAWN_BATCH_MAX = 2;
 
+/** Enemies alive at once for a lone player, before the time ramp. */
+export const ENEMY_CONCURRENCY_BASE = 4;
+
+/** Extra simultaneous enemies allowed for each additional active player. */
+export const ENEMY_CONCURRENCY_PER_PLAYER = 2;
+
+/** Extra concurrent enemies allowed for each elapsed minute. */
+export const ENEMY_CONCURRENCY_PER_MINUTE = 1;
+
 /**
- * Enemies alive at once, in the first minute.
+ * Hard ceiling on concurrency, as a tick-budget safety net.
  *
- * This is the real difficulty dial: queue depth sets how long a wave lasts,
- * concurrency sets how hard it hits.
+ * Sits above the hybrid's real ceiling (10 players in the closing minute asks
+ * for ~33), so it never clips legitimate scaling — only guards the pathological.
  */
-export const ENEMY_CONCURRENCY_BASE = 6;
+export const ENEMY_CONCURRENCY_MAX = 40;
 
-/** Extra simultaneous enemies allowed for each minute that passes. */
-export const ENEMY_CONCURRENCY_GROWTH = 2;
+/** The player-count share of the concurrency cap: 4 solo, +2 per extra. */
+export function enemyConcurrencyBaseline(activePlayers: number): number {
+  const players = Math.max(1, activePlayers);
+  return ENEMY_CONCURRENCY_BASE + ENEMY_CONCURRENCY_PER_PLAYER * (players - 1);
+}
 
-/** Ceiling, so a long match does not melt the tick budget. */
-export const ENEMY_CONCURRENCY_MAX = 16;
-
-/** How many enemies may be on the field during a given (1-based) minute. */
-export function maxConcurrentEnemies(minute: number): number {
-  const allowed = ENEMY_CONCURRENCY_BASE + ENEMY_CONCURRENCY_GROWTH * (minute - 1);
+/**
+ * How many enemies may be on the field: player baseline + time ramp.
+ *
+ * e.g. minute 5 with 3 players → 8 (baseline) + 5 (1 × 5) = 13.
+ */
+export function maxConcurrentEnemies(activePlayers: number, minute: number): number {
+  const allowed = enemyConcurrencyBaseline(activePlayers) + ENEMY_CONCURRENCY_PER_MINUTE * minute;
   return Math.min(ENEMY_CONCURRENCY_MAX, allowed);
 }
 

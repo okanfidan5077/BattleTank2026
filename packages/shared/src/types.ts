@@ -21,8 +21,34 @@ export const ServerMessage = {
   TankDestroyed: "tank_destroyed",
   /** A shell struck steel — drives the spark effect at the impact point. */
   SteelHit: "steel_hit",
+  /** Final per-player figures, sent once the match resolves. */
+  MatchStats: "match_stats",
 } as const;
 export type ServerMessage = (typeof ServerMessage)[keyof typeof ServerMessage];
+
+/** One player's line on the post-match scoreboard. */
+export interface MatchStatsRow {
+  /** Session id, so the client can pick out its own row. */
+  sessionId: string;
+  name: string;
+  /** Tank colour, for the row swatch. */
+  color: number;
+  /** Enemy tanks this player landed the killing blow on. */
+  kills: number;
+  /** Times this player fired. */
+  shots: number;
+}
+
+/**
+ * Broadcast when the match resolves: a snapshot of every player's tally.
+ *
+ * Sent as a message rather than read off replicated state so the scoreboard is
+ * a fixed post-match record — unaffected by anyone leaving the finished room.
+ * Unsorted; the client orders it.
+ */
+export interface MatchStatsMessage {
+  rows: MatchStatsRow[];
+}
 
 /**
  * Broadcast when a tank is destroyed by weapons fire.
