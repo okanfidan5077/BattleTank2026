@@ -92,6 +92,24 @@ const STEEL_SHARE = 0.28;
 /** Chance a corridor crossing is plugged with a brick gate. */
 const GATE_CHANCE = 0.3;
 
+//
+// Central cover
+// -------------
+// The middle spawn sits directly above the eagle, so without forced cover an
+// enemy can appear and fire straight down an open lane into the base. A few
+// staggered brick walls across the central columns break every such line of
+// fire while leaving gaps to funnel through. Brick is shootable and pathable,
+// so this can never seal the eagle off.
+//
+/** Left edge of the mirror-symmetric central band that gets forced walls. */
+const CENTRAL_COVER_MIN_X = 20;
+/** Innermost / outermost columns of the left half, always kept solid. */
+const CENTRAL_COVER_EDGE_X = CENTRAL_COVER_MIN_X;
+const CENTRAL_COVER_CENTRE_X = GRID_WIDTH / 2 - 1; // 29, mirrors to the eagle's 30
+/** Row band the walls are placed within. */
+const CENTRAL_COVER_MIN_ROW = 8;
+const CENTRAL_COVER_MAX_ROW = 22;
+
 /**
  * 3x3 block shapes. `#` is wall, `.` is open.
  *
@@ -170,6 +188,45 @@ function paintLeftHalf(grid: number[], random: () => number): void {
 }
 
 /**
+ * Forces staggered brick walls across the central columns above the eagle.
+ *
+ * Two or three horizontal walls span the mirror-symmetric band
+ * `[CENTRAL_COVER_MIN_X, mirror]`, one per row-band so they stay spread out.
+ * Each keeps its centre pair (the eagle's own lane) and outer edges solid, and
+ * opens a single 1-to-2-tile gap on each side for the flow field to funnel
+ * through. The result blocks a straight top-to-bottom shot at the base without
+ * sealing anything — brick is both shootable and pathable.
+ *
+ * Placed before the safe-zone clears run, so it never survives over a spawn pad
+ * or the bunker (those rows are far below this band anyway).
+ */
+function addCentralCover(grid: number[], random: () => number): void {
+  const wallCount = 2 + Math.floor(random() * 2); // 2 or 3
+  const band = (CENTRAL_COVER_MAX_ROW - CENTRAL_COVER_MIN_ROW) / wallCount;
+
+  for (let w = 0; w < wallCount; w++) {
+    // One row per band keeps the walls staggered and non-adjacent.
+    const row = CENTRAL_COVER_MIN_ROW + Math.floor((w + random()) * band);
+
+    // A gap strictly inside the left half — never on the centre column or the
+    // outer edge, so the eagle's lane and the band's ends always stay walled.
+    const gapWidth = 1 + Math.floor(random() * 2); // 1 or 2 tiles
+    const firstGapCol = CENTRAL_COVER_EDGE_X + 1; // 21
+    const lastGapCol = CENTRAL_COVER_CENTRE_X - gapWidth; // last start that stays off centre
+    const gapStart = firstGapCol + Math.floor(random() * (lastGapCol - firstGapCol + 1));
+
+    for (let x = CENTRAL_COVER_MIN_X; x < GRID_WIDTH / 2; x++) {
+      const inGap = x >= gapStart && x < gapStart + gapWidth;
+      const tile = inGap ? TileType.Empty : TileType.Brick;
+
+      // Mirror each column across the axis so the wall stays symmetrical.
+      grid[tileIndex(x, row)] = tile;
+      grid[tileIndex(GRID_WIDTH - 1 - x, row)] = tile;
+    }
+  }
+}
+
+/**
  * Builds a fresh battlefield.
  *
  * A left-right symmetrical maze of brick and steel, with the top rows left open
@@ -192,6 +249,11 @@ export function createBattlefield(seed?: number): number[] {
       grid[tileIndex(GRID_WIDTH - 1 - x, y)] = grid[tileIndex(x, y)]!;
     }
   }
+
+  // Guaranteed cover across the middle lane, before any safe zone is carved —
+  // this band sits well above the spawns and bunker, which the clears below fix
+  // regardless.
+  addCentralCover(grid, random);
 
   // Enemy spawn zone across the top.
   for (let y = 0; y < TOP_SAFE_ROWS; y++) {
