@@ -95,6 +95,23 @@ export function forgetSession(): void {
 }
 
 /**
+ * Leaves the room for good and clears the resume token.
+ *
+ * A clean break for "Return to Lobby": the token is dropped first (so nothing
+ * can auto-resume, even if the leave hangs), then the seat is released with a
+ * consented leave. The next visit runs fresh matchmaking rather than trying to
+ * reconnect to a room that may already be gone.
+ */
+export async function leaveRoom(room: BattleRoom): Promise<void> {
+  forgetSession();
+  try {
+    await room.leave(true);
+  } catch {
+    // Already disconnected or disposed — the token is cleared either way.
+  }
+}
+
+/**
  * The link that drops a friend straight into this room.
  *
  * Note colyseus.js exposes `roomId`, not `id`.

@@ -162,68 +162,161 @@ export function moveTank(state: GameState, tank: Tank): boolean {
   return true;
 }
 
-/**
- * Safety net for overlaps that movement blocking cannot prevent — two tanks
- * spawned on the same ground, say.
- *
- * Pushes the pair apart along the axis of least penetration, but only into
- * space that is actually free; a shove that would bury a tank in a wall or in
- * a third tank is abandoned rather than forced.
- *
- * @returns how many overlapping pairs were separated.
- */
-export function separateTanks(state: GameState): number {
-  let separated = 0;
+/** Relaxation passes per tick, so a shoved cluster fully disperses in one tick. */
+const SEPARATION_PASSES = 3;
 
-  for (let i = 0; i < state.tanks.length; i++) {
-    for (let j = i + 1; j < state.tanks.length; j++) {
-      const a = state.tanks.at(i);
+/** The eight neighbouring tile offsets a stuck tank may be nudged into. */
+const NEIGHBOUR_OFFSETS: readonly (readonly [number, number])[] = [
+  [TILE_SIZE, 0],
+  [-TILE_SIZE, 0],
+  [0, TILE_SIZE],
+  [0, -TILE_SIZE],
+  [TILE_SIZE, TILE_SIZE],
+  [TILE_SIZE, -TILE_SIZE],
+  [-TILE_SIZE, TILE_SIZE],
+  [-TILE_SIZE, -TILE_SIZE],
+];
+
+/** Below this, an accumulated push is treated as no push at all. */
+const PUSH_EPSILON = 1e-6;
+
+/** Symmetry-breaking noise: nudges an exactly-balanced push off dead centre. */
+function separationJitter(): number {
+  return Math.random() * 0.1 - 0.05;
+}
+
+/** Nearest tile-grid multiple, keeping tanks aligned for enemy steering. */
+function snapToTile(value: number): number {
+  return Math.round(value / TILE_SIZE) * TILE_SIZE;
+}
+
+/** True when `tank` may sit at `(x, y)`: in bounds, clear of walls and tanks. */
+function canOccupy(state: GameState, tank: Tank, x: number, y: number): boolean {
+  // The anti-camping fence is checked here too, so no shove can push a player
+  // into the top rows.
+  if (crossesPlayerBoundary(tank, y)) return false;
+  if (isBlocked(state, x, y, tank.width, tank.height)) return false;
+  if (collidesWithTank(state, tank, x, y)) return false;
+  return true;
+}
+
+/**
+ * Sums each tank's separation push against every tank it currently overlaps.
+ *
+ * An accumulation model: all pushes are computed from the same snapshot before
+ * anything moves, so a tank wedged between two others feels both and does not
+ * ping-pong the way a sequential pair-by-pair resolver does. Each pair pushes
+ * along its axis of least penetration; a jitter term breaks the tie when two
+ * tanks are perfectly aligned (penetration direction otherwise zero).
+ */
+function accumulateSeparation(state: GameState): { x: number; y: number }[] {
+  const count = state.tanks.length;
+  const push = Array.from({ length: count }, () => ({ x: 0, y: 0 }));
+
+  for (let i = 0; i < count; i++) {
+    const a = state.tanks.at(i);
+
+    for (let j = i + 1; j < count; j++) {
       const b = state.tanks.at(j);
 
       const overlapX = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
       const overlapY = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
       if (overlapX <= 0 || overlapY <= 0) continue;
 
-      // Least penetration: shift along whichever axis needs the smaller nudge.
-      const alongX = overlapX <= overlapY;
-      const push = alongX ? overlapX : overlapY;
-      const sign = alongX ? Math.sign(b.x - a.x) || 1 : Math.sign(b.y - a.y) || 1;
-
-      // Snap the result back onto the tile grid. Pushing by the raw overlap
-      // leaves a tank at a fractional offset, and enemy steering may only turn
-      // a grid-aligned tank — one nudged off the lattice can never turn again
-      // and jams for good the moment something blocks it.
-      const snap = (value: number, away: number) => {
-        const target = value + away;
-        return Math.round(target / TILE_SIZE) * TILE_SIZE;
-      };
-
-      const candidates = [
-        {
-          tank: b,
-          x: alongX ? snap(b.x, push * sign) : snap(b.x, 0),
-          y: alongX ? snap(b.y, 0) : snap(b.y, push * sign),
-        },
-        {
-          tank: a,
-          x: alongX ? snap(a.x, -push * sign) : snap(a.x, 0),
-          y: alongX ? snap(a.y, 0) : snap(a.y, -push * sign),
-        },
-      ];
-
-      for (const move of candidates) {
-        // A shove must never bury a player in the off-limits top rows either.
-        if (crossesPlayerBoundary(move.tank, move.y)) continue;
-        if (isBlocked(state, move.x, move.y, move.tank.width, move.tank.height)) continue;
-        if (collidesWithTank(state, move.tank, move.x, move.y)) continue;
-
-        move.tank.x = move.x;
-        move.tank.y = move.y;
-        separated++;
-        break;
+      // Resolve along whichever axis needs the smaller nudge. When the two are
+      // equal — the fully-coincident case — the jitter tiebreak sends different
+      // pairs different ways, so a stack spreads in 2D rather than piling along
+      // a single row it cannot fit into.
+      const alongX = overlapX + separationJitter() < overlapY;
+      if (alongX) {
+        const dir = Math.sign(a.x - b.x + separationJitter()) || 1;
+        push[i]!.x += dir * overlapX;
+        push[j]!.x -= dir * overlapX;
+      } else {
+        const dir = Math.sign(a.y - b.y + separationJitter()) || 1;
+        push[i]!.y += dir * overlapY;
+        push[j]!.y -= dir * overlapY;
       }
     }
   }
 
-  return separated;
+  return push;
+}
+
+/**
+ * Pulls overlapping tanks apart — a safety net for overlaps that movement
+ * blocking cannot prevent (two tanks spawned on the same ground, a cluster
+ * that formed some other way).
+ *
+ * Runs the accumulate-then-apply pass a few times per tick (relaxation), so a
+ * tank shoved out of one collision and into another still ends the tick clear.
+ * Each tank steps one tile along its net push direction — kept on the grid so
+ * enemy steering can still turn it — into space that is actually free; a step
+ * that would hit a wall, another tank, or the player fence is skipped and left
+ * for a later pass. Positions are only ever grid-aligned, never fractional, so
+ * the jitter breaks symmetry without stranding anyone off the lattice.
+ *
+ * @returns how many tanks were moved across all passes.
+ */
+export function separateTanks(state: GameState): number {
+  const count = state.tanks.length;
+  let moved = 0;
+
+  for (let pass = 0; pass < SEPARATION_PASSES; pass++) {
+    const push = accumulateSeparation(state);
+
+    let movedThisPass = 0;
+    for (let i = 0; i < count; i++) {
+      const tank = state.tanks.at(i);
+      const vector = push[i]!;
+
+      const magX = Math.abs(vector.x);
+      const magY = Math.abs(vector.y);
+      if (magX < PUSH_EPSILON && magY < PUSH_EPSILON) continue;
+
+      const baseX = snapToTile(tank.x);
+      const baseY = snapToTile(tank.y);
+
+      // Every surrounding cell, ordered by how well it matches the push
+      // direction, then re-aligning in place as a last resort. Any free cell
+      // thins the pile; including the diagonals means a tank whose four
+      // orthogonal neighbours are taken can still slip out of a dense cluster
+      // rather than being walled in by the first tanks that escaped.
+      const candidates = NEIGHBOUR_OFFSETS.map(
+        ([dx, dy]) => [baseX + dx, baseY + dy, dx * vector.x + dy * vector.y] as const,
+      ).sort((p, q) => q[2] - p[2]);
+
+      let placed = false;
+      for (const [targetX, targetY] of candidates) {
+        if (!canOccupy(state, tank, targetX, targetY)) continue;
+        tank.x = targetX;
+        tank.y = targetY;
+        movedThisPass++;
+        placed = true;
+        break;
+      }
+
+      // Nowhere better to go: at least re-align onto the grid if that is free,
+      // so a mid-tile tank stays turnable.
+      if (!placed && (baseX !== tank.x || baseY !== tank.y) && canOccupy(state, tank, baseX, baseY)) {
+        tank.x = baseX;
+        tank.y = baseY;
+        movedThisPass++;
+      }
+    }
+
+    moved += movedThisPass;
+    if (movedThisPass === 0) break; // settled — nothing left to disperse
+  }
+
+  // Item 4: whatever the passes did, no player may end up above the fence. This
+  // is the strict last word, applied after all jitter and shoves.
+  for (let i = 0; i < count; i++) {
+    const tank = state.tanks.at(i);
+    if (crossesPlayerBoundary(tank, tank.y)) {
+      tank.y = PLAYER_TOP_BOUNDARY_Y;
+    }
+  }
+
+  return moved;
 }

@@ -27,7 +27,7 @@ import {
   type TankDestroyedMessage,
 } from "@battletank/shared";
 
-import { forgetSession, type BattleRoom } from "./network.js";
+import { forgetSession, leaveRoom, type BattleRoom } from "./network.js";
 import { recordMatch } from "./progression.js";
 import type { BattleStateView, BoonView, BulletView, PlayerView, TankView } from "./state.js";
 
@@ -180,17 +180,6 @@ export class GameScene extends Phaser.Scene {
   /** Full-screen result overlay; built once the match resolves. */
   private overlay?: Phaser.GameObjects.Container;
 
-  /**
-   * The overlay's footer control — the Return to Lobby button for the host, or
-   * the waiting label for everyone else. Held so it can be swapped in place when
-   * the host changes while the overlay is up (e.g. the host disconnects and a
-   * new one is promoted).
-   */
-  private overlayFooter?: Phaser.GameObjects.Text;
-
-  /** Whether {@link overlayFooter} is the host's button rather than the label. */
-  private overlayFooterIsButton = false;
-
   /** Post-match tallies, from the `MatchStats` message. */
   private matchStats?: MatchStatsRow[];
 
@@ -208,6 +197,9 @@ export class GameScene extends Phaser.Scene {
    * leaves the collection, which the reset clears out before the scene dies.
    */
   private roomCleanups: Array<() => void> = [];
+
+  /** Set once the scene is torn down; every room callback checks it and bails. */
+  private destroyed = false;
 
   /** Name labels above player tanks. */
   private labels = new Map<TankView, Phaser.GameObjects.Text>();
@@ -403,21 +395,42 @@ export class GameScene extends Phaser.Scene {
 
     this.attach();
 
-    // The room survives this scene; detach everything we bound to it when the
-    // scene is destroyed, so the next match's scene starts from a clean slate.
-    // `game.destroy()` emits DESTROY on each scene (not SHUTDOWN — the scene is
-    // never merely stopped here), so that is the event to hang teardown on.
+    // The room outlives this scene, so every listener bound to it must come off
+    // the moment the scene stops or is destroyed — otherwise a late network
+    // packet fires a callback that touches freed Phaser objects and crashes.
+    // `game.destroy()` emits DESTROY; a plain stop emits SHUTDOWN. Hook both so
+    // teardown runs whichever way the scene ends; it is idempotent.
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.teardown());
     this.events.once(Phaser.Scenes.Events.DESTROY, () => this.teardown());
   }
 
-  /** Detaches every room callback registered by this scene. */
+  /** Detaches every room callback registered by this scene. Safe to call twice. */
   private teardown(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+
+    // Explicitly unbind every Colyseus state listener this scene registered, so
+    // packets that arrive after teardown find nothing to run.
     for (const detach of this.roomCleanups) detach();
     this.roomCleanups = [];
 
     // Release the audio handle; browsers cap how many contexts can be open.
     void this.audioCtx?.close().catch(() => {});
     this.audioCtx = undefined;
+  }
+
+  /** True once {@link teardown} has run — every callback bails on this. */
+  private get isDead(): boolean {
+    return this.destroyed || !this.sys || !this.sys.isActive();
+  }
+
+  /**
+   * A Phaser object that is still safe to touch: present, active, and still
+   * attached to a scene. A destroyed object has `active === false` and a null
+   * `scene`, so mutating it would throw — callbacks check this first.
+   */
+  private isLive(obj: Phaser.GameObjects.GameObject | undefined | null): boolean {
+    return !!obj && obj.active && !!obj.scene;
   }
 
   // ---------------------------------------------------------------------- HUD
@@ -554,6 +567,8 @@ export class GameScene extends Phaser.Scene {
 
   /** Explodes a tank and shakes the camera to match what was destroyed. */
   private spawnTankExplosion(message: TankDestroyedMessage): void {
+    if (this.isDead || !this.isLive(this.explosionEmitter)) return;
+
     const at = this.worldToScene(message.x, message.y);
     this.explosionEmitter.explode(24, at.x, at.y);
     this.soundDestroyed();
@@ -569,6 +584,8 @@ export class GameScene extends Phaser.Scene {
 
   /** Small spark burst where a shell struck steel. */
   private spawnSteelSpark(message: SteelHitMessage): void {
+    if (this.isDead || !this.isLive(this.sparkEmitter)) return;
+
     const at = this.worldToScene(message.x, message.y);
     this.sparkEmitter.explode(8, at.x, at.y);
   }
@@ -660,13 +677,12 @@ export class GameScene extends Phaser.Scene {
   /**
    * Draws the end-of-match overlay.
    *
-   * The host gets a Return to Lobby control that resets the match server-side;
-   * everyone else is told to wait. When the reset lands, `matchState` flips back
-   * to `LOBBY` and `main.ts` tears this scene down and restores the staging DOM —
-   * so this overlay is torn down with the game rather than dismissed here.
+   * Everyone gets their own Return to Lobby control: clicking it leaves the room
+   * and reloads into fresh matchmaking, so each client tears itself down cleanly
+   * rather than one client's reset dragging the others through a reused room.
    */
   private showResult(status: MatchStatus): void {
-    if (this.overlay) return;
+    if (this.isDead || this.overlay) return;
 
     const won = status === MatchStatus.Victory;
     const seconds = this.room?.state.finalTime ?? 0;
@@ -694,11 +710,10 @@ export class GameScene extends Phaser.Scene {
       )
       .setOrigin(0.5, 0);
 
-    this.overlayFooterIsButton = this.isHost();
-    this.overlayFooter = this.overlayFooterIsButton ? this.buildReturnButton() : this.buildWaitingLabel();
+    const footer = this.buildReturnButton();
 
     this.overlay = this.add
-      .container(0, 0, [backdrop, heading, detail, this.overlayFooter])
+      .container(0, 0, [backdrop, heading, detail, footer])
       .setDepth(100);
 
     // Draw the scoreboard if the stats have already arrived; otherwise the
@@ -714,7 +729,7 @@ export class GameScene extends Phaser.Scene {
    * have arrived — the two can land in either order.
    */
   private renderScoreboard(): void {
-    if (!this.overlay || !this.matchStats) return;
+    if (this.isDead || !this.overlay || !this.matchStats) return;
 
     this.scoreboard?.destroy();
 
@@ -767,33 +782,7 @@ export class GameScene extends Phaser.Scene {
     this.overlay.add(this.scoreboard);
   }
 
-  /**
-   * Rebuilds the overlay footer to match the current host.
-   *
-   * Driven by the `hostId` listener: if the host drops after the match ends, the
-   * server promotes a new one, and that client must gain the Return to Lobby
-   * button on the spot rather than being stranded on a dead overlay. A no-op
-   * while the overlay is not up (`hostId` also changes during normal play), or
-   * when the footer already matches who we are now.
-   */
-  private syncOverlayHostControl(): void {
-    if (!this.overlay || !this.overlayFooter) return;
-    if (this.overlayFooterIsButton === this.isHost()) return;
-
-    this.tweens.killTweensOf(this.overlayFooter);
-    this.overlayFooter.destroy();
-
-    this.overlayFooterIsButton = this.isHost();
-    this.overlayFooter = this.overlayFooterIsButton ? this.buildReturnButton() : this.buildWaitingLabel();
-    this.overlay.add(this.overlayFooter);
-  }
-
-  /** True when this client is the room host — the only one who may reset. */
-  private isHost(): boolean {
-    return this.room?.sessionId === this.room?.state.hostId;
-  }
-
-  /** Host-only control that asks the server to reset the match to the lobby. */
+  /** The Return to Lobby control shown on the result overlay. */
   private buildReturnButton(): Phaser.GameObjects.Text {
     const button = this.add
       .text(BASE_WIDTH / 2, RESULT_FOOTER_Y, "[ RETURN TO LOBBY ]", {
@@ -814,31 +803,26 @@ export class GameScene extends Phaser.Scene {
     return button;
   }
 
-  /** What everyone who is not the host sees while they wait for the reset. */
-  private buildWaitingLabel(): Phaser.GameObjects.Text {
-    return this.add
-      .text(BASE_WIDTH / 2, RESULT_FOOTER_Y, "waiting for the host to return to the lobby...", {
-        fontFamily: "monospace",
-        fontSize: "28px",
-        color: "#8fa1b3",
-      })
-      .setOrigin(0.5);
-  }
-
   /**
-   * Sends the reset request and locks the control so it cannot fire twice.
+   * Leaves the room cleanly and returns to a fresh lobby.
    *
-   * The scene is not torn down here — the server flips `matchState` back to
-   * `LOBBY`, and `main.ts` (which owns the Phaser instance) destroys the game
-   * and restores the staging DOM in response.
+   * A hard break, not an in-place reset: the seat is released with an explicit
+   * `room.leave()`, the resume token is dropped, and the page reloads into fresh
+   * matchmaking. This is what keeps the client from clinging to — or getting
+   * stuck reconnecting to — a room that is finished or gone.
    */
   private returnToLobby(button: Phaser.GameObjects.Text): void {
-    if (!this.isHost()) return;
-
     this.tweens.killTweensOf(button);
     button.disableInteractive().setAlpha(1).setColor("#8fa1b3").setText("returning to lobby...");
 
-    this.room?.send(ClientMessage.ResetMatch);
+    const room = this.room;
+    if (!room) {
+      window.location.reload();
+      return;
+    }
+
+    // `leaveRoom` clears the token first, so even a hung leave cannot auto-resume.
+    void leaveRoom(room).finally(() => window.location.reload());
   }
 
   // -------------------------------------------------------------------- input
@@ -850,7 +834,7 @@ export class GameScene extends Phaser.Scene {
    * server stays the single authority on where anything is.
    */
   override update(time: number): void {
-    if (!this.room) return;
+    if (this.isDead || !this.room) return;
 
     this.refreshHud();
     this.followLabels();
@@ -956,14 +940,6 @@ export class GameScene extends Phaser.Scene {
         if (!isMatchOver(status)) return;
         this.showResult(status);
       }),
-    );
-
-    // The host can change mid-overlay: if the original host drops after the
-    // match ends, the server promotes someone else, who then needs the reset
-    // control. Fires immediately with the current host too — harmless, since the
-    // overlay does not exist yet at bind time.
-    this.roomCleanups.push(
-      $(room.state).listen("hostId", () => this.syncOverlayHostControl()),
     );
 
     // Repaint the whole map once the first snapshot lands, then keep it in
@@ -1086,6 +1062,7 @@ export class GameScene extends Phaser.Scene {
 
   /** Brief on-screen flash where a power-up was taken. */
   private announceBoon(message: BoonCollectedMessage): void {
+    if (this.isDead) return;
     const mine = message.playerId === this.room?.sessionId;
 
     this.soundBoon();
@@ -1118,8 +1095,13 @@ export class GameScene extends Phaser.Scene {
    * outlives the tank and is what carries the name and colour.
    */
   private syncPlayerVisuals(player: PlayerView): void {
+    // A late `players.onChange` can land after the scene is gone; bail before
+    // touching `this.add` or any sprite.
+    if (this.isDead) return;
+
     for (const [tank, sprite] of this.tankSprites) {
       if (tank.isEnemy || tank.ownerId !== player.sessionId) continue;
+      if (!this.isLive(sprite)) continue;
 
       // Hull colour now signals the star tier rather than player identity —
       // names above the tanks still tell players apart.
@@ -1128,8 +1110,9 @@ export class GameScene extends Phaser.Scene {
       else sprite.setTint(tint);
 
       const label = this.labels.get(tank) ?? this.createLabel(tank);
-      const away = player.isConnected ? "" : " (away)";
+      if (!this.isLive(label)) continue;
 
+      const away = player.isConnected ? "" : " (away)";
       label.setText(`${player.name}${away}`);
       label.setColor(player.isConnected ? "#f7f3e8" : "#8fa1b3");
       label.setPosition(sprite.x, sprite.y - TILE_SIZE);
@@ -1171,7 +1154,7 @@ export class GameScene extends Phaser.Scene {
   private followLabels(): void {
     for (const [tank, label] of this.labels) {
       const sprite = this.tankSprites.get(tank);
-      if (!sprite) continue;
+      if (!sprite || !this.isLive(sprite) || !this.isLive(label)) continue;
 
       label.setPosition(sprite.x, sprite.y - TILE_SIZE);
     }
@@ -1179,6 +1162,8 @@ export class GameScene extends Phaser.Scene {
 
   /** Adds or removes the flashing shield that marks respawn invulnerability. */
   private syncShield(tank: TankView, sprite: Phaser.GameObjects.Image): void {
+    if (this.isDead || !this.isLive(sprite)) return;
+
     const existing = this.shields.get(tank);
 
     if (!tank.isInvulnerable) {
@@ -1214,12 +1199,18 @@ export class GameScene extends Phaser.Scene {
     sprite: Phaser.GameObjects.Image,
     entity: { x: number; y: number; width: number; height: number; direction: Direction },
   ): void {
+    // Reached from per-entity `onChange`, which can fire after the sprite (or the
+    // whole scene) is gone — guard before touching it.
+    if (this.isDead || !this.isLive(sprite)) return;
+
     sprite.setPosition(entity.x + entity.width / 2, entity.y + entity.height / 2);
     sprite.setRotation(ROTATION[entity.direction]);
   }
 
   private paintTile(index: number, tile: number): void {
-    this.tiles[index]?.setTexture(this.textureForTile(tile));
+    if (this.isDead) return;
+    const tile$ = this.tiles[index];
+    if (this.isLive(tile$)) tile$!.setTexture(this.textureForTile(tile));
   }
 
   private textureForTile(tile: number): string {
