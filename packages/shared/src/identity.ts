@@ -38,6 +38,10 @@ export const PLAYER_COLORS: readonly number[] = [
   0xffa500, // orange
   0xffc0cb, // pink
   0x00ff00, // lime
+  0xffffff, // white
+  0x00ff88, // mint
+  0x88aaff, // periwinkle
+  0xff88cc, // rose
 ];
 
 /** Picks one of the allowed colours at random. */
