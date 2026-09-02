@@ -5,3 +5,4 @@ export { Bullet, type BulletInit } from "./Bullet.js";
 export { Boon, type BoonInit } from "./Boon.js";
 export { Player, type PlayerInit } from "./Player.js";
 export { GameState, tileIndex, isInsideGrid } from "./GameState.js";
+export { CampaignState } from "./CampaignState.js";

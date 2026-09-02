@@ -142,6 +142,16 @@ body {
   background: #23361d;
 }
 
+/* Create Room and Play Campaign sit side by side. */
+.button-row {
+  display: flex;
+  gap: 10px;
+}
+
+.button-row button {
+  flex: 1;
+}
+
 .divider {
   margin: 20px 0;
   border-top: 1px solid var(--line);
@@ -303,4 +313,134 @@ body {
   letter-spacing: 1px;
   text-transform: uppercase;
   color: var(--accent);
+}
+
+/* ----------------------------------------------------- campaign briefings */
+
+/* Full-screen black overlay for the campaign intro/outro narration. Sits above
+   the game canvas but below the fullscreen toggle (z-index 20). */
+.campaign-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 40px;
+  padding: 8vh 10vw;
+  box-sizing: border-box;
+  background: #000;
+  text-align: center;
+}
+
+.campaign-overlay[hidden] {
+  display: none;
+}
+
+.campaign-text {
+  max-width: 60ch;
+  min-height: 4.5em;
+  font-size: clamp(18px, 2.4vw, 30px);
+  line-height: 1.6;
+  letter-spacing: 0.5px;
+  white-space: pre-wrap;
+  color: #a7e0b0;
+  text-shadow: 0 0 12px rgb(120 230 140 / 45%);
+}
+
+.campaign-prompt {
+  font-size: clamp(13px, 1.4vw, 18px);
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--accent);
+  animation: campaign-blink 1s steps(2, start) infinite;
+}
+
+@keyframes campaign-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* ------------------------------------------------- upgrade notifications */
+
+.upgrade-notification {
+  position: fixed;
+  top: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 18;
+  padding: 14px 32px;
+  border: 1px solid #3f5a33;
+  border-radius: 6px;
+  background: rgb(20 50 20 / 92%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: clamp(14px, 1.6vw, 20px);
+  letter-spacing: 1.5px;
+  text-align: center;
+  color: #a7e0b0;
+  text-shadow: 0 0 10px rgb(120 230 140 / 50%);
+  white-space: nowrap;
+  transition: opacity 0.6s ease-out;
+  pointer-events: none;
+}
+
+.upgrade-notification[hidden] {
+  display: none;
+}
+
+/* -------------------------------------------------------- bestiary panel */
+
+.bestiary-panel {
+  position: fixed;
+  top: 70px;
+  right: 8px;
+  z-index: 12;
+  width: 200px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgb(11 13 16 / 88%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.bestiary-title {
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--muted);
+}
+
+.bestiary-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 0;
+  flex-wrap: wrap;
+}
+
+.bestiary-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex: none;
+  position: relative;
+  top: -1px;
+}
+
+.bestiary-name {
+  font-weight: 600;
+  font-size: 11px;
+}
+
+.bestiary-desc {
+  width: 100%;
+  padding-left: 14px;
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.3;
 }

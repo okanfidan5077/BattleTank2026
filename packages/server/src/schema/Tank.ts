@@ -18,6 +18,14 @@ export interface TankInit extends EntityInit {
   isEnemy: boolean;
   /** Respawn grace; defaults to false. */
   isInvulnerable?: boolean;
+  /** Enemy behaviour flavour, e.g. "kamikaze"; defaults to "standard". */
+  variant?: string;
+  /** True for a campaign boss unit; defaults to false. */
+  isBoss?: boolean;
+  /** True for a Mimic still disguised as an item drop; defaults to false. */
+  isDisguised?: boolean;
+  /** True for a Ghost that is currently cloaked (near-invisible); defaults to false. */
+  isCloaked?: boolean;
 }
 
 /** A player- or AI-controlled tank. */
@@ -36,6 +44,28 @@ export class Tank extends Entity<TankInit> {
 
   /** Respawn grace period: shells pass harmlessly through while true. */
   @type("boolean") isInvulnerable: boolean = false;
+
+  /**
+   * Enemy behaviour flavour. "standard" for players and ordinary enemies;
+   * "kamikaze" for the fast rushers; "sweeper" for the Level 5 boss.
+   */
+  @type("string") variant: string = "standard";
+
+  /** True for a campaign boss unit — the client scales and tints it up. */
+  @type("boolean") isBoss: boolean = false;
+
+  /**
+   * A Level 13 Mimic that is still masquerading as an item drop: it holds
+   * still, never fires and ignores the flow field until it springs. The client
+   * tints a disguised Mimic gold and freezes its facing to sell the disguise.
+   */
+  @type("boolean") isDisguised: boolean = false;
+
+  /**
+   * A Ghost miniboss that is cloaked — the client renders it nearly invisible.
+   * When the Ghost fires, the server uncloaks it for a brief window.
+   */
+  @type("boolean") isCloaked: boolean = false;
 
   constructor(init?: TankInit) {
     super();

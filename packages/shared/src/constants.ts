@@ -6,6 +6,9 @@ export const PROTOCOL_VERSION = 1;
 /** Room identifier registered on the server and joined by the client. */
 export const BATTLE_ROOM = "battle_room";
 
+/** Room identifier for the single-player campaign. */
+export const CAMPAIGN_ROOM = "campaign_room";
+
 /** Authoritative simulation rate, in ticks per second. */
 export const TICK_RATE = 20;
 
@@ -64,6 +67,47 @@ export enum TileType {
   Steel = 2,
   Water = 3,
   EagleBase = 4,
+  /**
+   * Campaign jamming tower. Behaves like {@link TileType.Brick}: solid to tanks
+   * and destructible by any shell. Given a fresh value rather than reusing 4 so
+   * the existing {@link EagleBase} encoding — and {@link PROTOCOL_VERSION} — is
+   * left untouched. Only the campaign generates these; battle maps never do.
+   */
+  Radar = 5,
+  /**
+   * Campaign extraction pad. Passable ground with no physics — tanks drive over
+   * it and shells fly across it — but the server watches for the player's hull
+   * overlapping one to resolve a `reach_extraction` objective.
+   */
+  ExtractionZone = 6,
+  /**
+   * Campaign uplink zone. Passable like {@link ExtractionZone}, but the server
+   * counts how long the player's hull holds inside it for a `zone_control`
+   * objective rather than resolving on first touch.
+   */
+  UplinkZone = 7,
+  /**
+   * Campaign factory structure. Behaves like {@link TileType.Brick} — solid to
+   * tanks and destructible by any shell — but is the objective of a
+   * `destroy_factories` level and the anchor enemies spawn around.
+   */
+  Factory = 8,
+  /**
+   * Campaign dirty bomb. Passable ground with no physics, like
+   * {@link ExtractionZone} — the server defuses it (turns it Empty) when the
+   * player's hull touches it, for a `defuse_bombs` level.
+   */
+  Bomb = 9,
+  /**
+   * Campaign intel package. Passable; the server collects it (turns it Empty)
+   * when the player's hull touches it, for a `retrieve_intel` level.
+   */
+  Intel = 10,
+  /**
+   * Campaign mine, dropped by Trapper enemies. Passable, but touching it kills
+   * the player and clears the tile.
+   */
+  Mine = 11,
 }
 
 /**

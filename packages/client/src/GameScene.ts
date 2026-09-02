@@ -3,6 +3,10 @@ import { getStateCallbacks, type Room } from "colyseus.js";
 
 import {
   BoonType,
+  CAMPAIGN_LEVELS,
+  CAMPAIGN_ROOM,
+  CampaignMessage,
+  CampaignPhase,
   ClientMessage,
   Direction,
   GRID_HEIGHT,
@@ -20,16 +24,25 @@ import {
   WORLD_WIDTH,
   isMatchOver,
   type BoonCollectedMessage,
+  type BossBounceMessage,
   type MatchStatsMessage,
+  type MortarWarningMessage,
   type MatchStatsRow,
   type MoveMessage,
   type SteelHitMessage,
   type TankDestroyedMessage,
 } from "@battletank/shared";
 
-import { forgetSession, leaveRoom, type BattleRoom } from "./network.js";
+import { forgetSession, leaveRoom, type BattleRoom, type CampaignRoom, type GameRoom } from "./network.js";
 import { recordMatch } from "./progression.js";
-import type { BattleStateView, BoonView, BulletView, PlayerView, TankView } from "./state.js";
+import type {
+  BattleStateView,
+  BoonView,
+  BulletView,
+  PlayerView,
+  TankView,
+  WorldStateView,
+} from "./state.js";
 
 /** Base resolution the scene is authored against; Phaser scales it to fit. */
 export const BASE_WIDTH = 1920;
@@ -42,6 +55,13 @@ const TextureKey = {
   Steel: "tile-steel",
   Water: "tile-water",
   Eagle: "tile-eagle",
+  Radar: "tile-radar",
+  Extraction: "tile-extraction",
+  Uplink: "tile-uplink",
+  Factory: "tile-factory",
+  Bomb: "tile-bomb",
+  Intel: "tile-intel",
+  Mine: "tile-mine",
   TankPlayer: "tank-player",
   TankEnemy: "tank-enemy",
   Bullet: "bullet",
@@ -136,11 +156,37 @@ function truncateName(name: string): string {
     : name;
 }
 
+/** Milliseconds between revealed characters in the campaign typewriter. */
+const CAMPAIGN_TYPE_SPEED_MS = 28;
+
 export class GameScene extends Phaser.Scene {
   private room?: BattleRoom;
 
+  /** Set instead of {@link room} when this scene is driving a campaign. */
+  private campaignRoom?: CampaignRoom;
+
+  /** Full-screen DOM briefing overlay, built lazily for campaign runs. */
+  private campaignOverlay?: HTMLDivElement;
+  private campaignTextEl?: HTMLDivElement;
+  private campaignPromptEl?: HTMLDivElement;
+
+  /** Pending typewriter tick, so a phase change can cancel a half-typed line. */
+  private typewriterTimer?: number;
+
+  /** The armed one-shot Spacebar handler for the current briefing, if any. */
+  private campaignAdvance?: () => void;
+
+  /** DOM bestiary sidebar, built once for campaign runs. */
+  private bestiaryEl?: HTMLDivElement;
+
+  /** Timer for the upgrade-notification fade-out. */
+  private upgradeNotifyTimer?: number;
+
   /** One image per grid cell, indexed exactly like the server's 1D grid. */
   private tiles: Phaser.GameObjects.Image[] = [];
+
+  /** Looping alpha tweens on pulsing objective tiles (extraction, bomb), by index. */
+  private pulseTiles = new Map<number, Phaser.Tweens.Tween>();
 
   /** Entity sprites, keyed by the replicated schema instance itself. */
   private tankSprites = new Map<TankView, Phaser.GameObjects.Image>();
@@ -207,6 +253,9 @@ export class GameScene extends Phaser.Scene {
   /** Shield overlays for tanks currently in their respawn grace period. */
   private shields = new Map<TankView, Phaser.GameObjects.Image>();
 
+  /** Cyan aura circles drawn around Aegis miniboss tanks. */
+  private aegisAuras = new Map<TankView, Phaser.GameObjects.Graphics>();
+
   private cursors?: Phaser.Types.Input.Keyboard.CursorKeys;
   private wasd?: Record<"W" | "A" | "S" | "D", Phaser.Input.Keyboard.Key>;
 
@@ -217,8 +266,13 @@ export class GameScene extends Phaser.Scene {
    * @param joinedRoom - an already-connected room, handed over by the lobby.
    *   The scene never joins on its own, so it always has state to render.
    */
-  constructor(private readonly joinedRoom: BattleRoom) {
+  constructor(private readonly joinedRoom: GameRoom) {
     super("GameScene");
+  }
+
+  /** True when the lobby handed this scene a campaign room rather than a battle. */
+  private get isCampaign(): boolean {
+    return this.joinedRoom.name === CAMPAIGN_ROOM;
   }
 
   // ------------------------------------------------------------------ preload
@@ -279,6 +333,89 @@ export class GameScene extends Phaser.Scene {
       g.fillTriangle(size / 2, 4, 6, 20, size - 6, 20);
       g.fillRect(size / 2 - 3, 16, 6, 12);
       g.fillTriangle(size / 2 - 8, 28, size / 2 + 8, 28, size / 2, 20);
+    });
+
+    // Radar / jamming tower: the campaign objective. Distinct cyan so it reads as
+    // "shoot this" at a glance — a dish on a mast over a dark plinth.
+    this.bakeTexture(TextureKey.Radar, size, size, (g) => {
+      g.fillStyle(0x0a2230, 1).fillRect(0, 0, size, size);
+      g.lineStyle(2, 0x00ffff, 1).strokeRect(1, 1, size - 2, size - 2);
+      // Mast.
+      g.fillStyle(0x00ffff, 1).fillRect(size / 2 - 1, 10, 2, size - 14);
+      // Dish.
+      g.fillCircle(size / 2, 10, 6);
+      g.fillStyle(0x0a2230, 1).fillCircle(size / 2, 11, 3);
+      // Base.
+      g.fillStyle(0x00ffff, 1).fillRect(size / 2 - 6, size - 6, 12, 3);
+    });
+
+    // Extraction pad: the campaign objective for `reach_extraction`. Bright green
+    // with an upward chevron; the tiles also pulse (see `paintTile`).
+    this.bakeTexture(TextureKey.Extraction, size, size, (g) => {
+      g.fillStyle(0x0a3010, 1).fillRect(0, 0, size, size);
+      g.fillStyle(0x00ff00, 1).fillRect(0, 0, size, size);
+      g.fillStyle(0x0a3010, 1).fillRect(3, 3, size - 6, size - 6);
+      // Upward chevron pointing "this way out".
+      g.fillStyle(0x00ff00, 1);
+      g.fillTriangle(size / 2, 8, size / 2 - 8, 18, size / 2 + 8, 18);
+      g.fillTriangle(size / 2, 16, size / 2 - 8, 26, size / 2 + 8, 26);
+    });
+
+    // Uplink zone: translucent blue wash over the dark ground, so the hold area
+    // reads as a marked zone the player stands inside rather than solid terrain.
+    this.bakeTexture(TextureKey.Uplink, size, size, (g) => {
+      g.fillStyle(0x14161a, 1).fillRect(0, 0, size, size);
+      g.fillStyle(0x0000ff, 0.3).fillRect(0, 0, size, size);
+      g.lineStyle(1, 0x3355ff, 0.6).strokeRect(1, 1, size - 2, size - 2);
+    });
+
+    // Factory: a vivid orange industrial block (the Level 6 objective), with a
+    // dark bolted frame and vents so it stands out as a "shoot me" structure.
+    this.bakeTexture(TextureKey.Factory, size, size, (g) => {
+      g.fillStyle(0xffa500, 1).fillRect(0, 0, size, size);
+      g.lineStyle(2, 0x5a3a00, 1).strokeRect(1, 1, size - 2, size - 2);
+      g.fillStyle(0x5a3a00, 1);
+      // Two dark vents / hazard stripes.
+      g.fillRect(6, 8, size - 12, 4);
+      g.fillRect(6, size - 12, size - 12, 4);
+      // Corner bolts.
+      g.fillCircle(5, 5, 2).fillCircle(size - 5, 5, 2).fillCircle(5, size - 5, 2).fillCircle(size - 5, size - 5, 2);
+    });
+
+    // Dirty bomb: bright magenta pad with a dark bomb-and-fuse glyph (it also
+    // pulses via the tile-pulse tween, so it reads as an active countdown).
+    this.bakeTexture(TextureKey.Bomb, size, size, (g) => {
+      g.fillStyle(0xff00ff, 1).fillRect(0, 0, size, size);
+      g.lineStyle(2, 0x3a0033, 1).strokeRect(1, 1, size - 2, size - 2);
+      g.fillStyle(0x1a0018, 1).fillCircle(size / 2, size / 2 + 3, 8);
+      // Fuse.
+      g.fillRect(size / 2 - 1, 5, 3, 6);
+      g.fillStyle(0xffe08a, 1).fillCircle(size / 2 + 2, 5, 2);
+    });
+
+    // Intel package: a gold pad with a document glyph (pulses like the bomb).
+    this.bakeTexture(TextureKey.Intel, size, size, (g) => {
+      g.fillStyle(0x2a2410, 1).fillRect(0, 0, size, size);
+      g.fillStyle(0xffd700, 1).fillRect(6, 5, size - 12, size - 10);
+      g.fillStyle(0x2a2410, 1);
+      g.fillRect(9, 9, size - 18, 2).fillRect(9, 14, size - 18, 2).fillRect(9, 19, size - 18, 2);
+    });
+
+    // Mine: a vivid red hazard square with a skull-and-crossbones glyph, filling
+    // the whole tile — and it pulses (see `paintTile`) — so it reads instantly
+    // as a lethal trap rather than scenery.
+    this.bakeTexture(TextureKey.Mine, size, size, (g) => {
+      g.fillStyle(0xff1a1a, 1).fillRect(0, 0, size, size);
+      g.lineStyle(2, 0x300000, 1).strokeRect(1, 1, size - 2, size - 2);
+      // Crossed bones behind the skull.
+      g.lineStyle(4, 0x1a0000, 1);
+      g.lineBetween(7, 7, size - 7, size - 7);
+      g.lineBetween(size - 7, 7, 7, size - 7);
+      // Skull: dark head with red eye sockets and a small jaw.
+      g.fillStyle(0x1a0000, 1).fillCircle(size / 2, size / 2 - 1, 7);
+      g.fillStyle(0xff1a1a, 1).fillCircle(size / 2 - 3, size / 2 - 2, 2);
+      g.fillCircle(size / 2 + 3, size / 2 - 2, 2);
+      g.fillStyle(0x1a0000, 1).fillRect(size / 2 - 3, size / 2 + 5, 6, 3);
     });
   }
 
@@ -374,7 +511,11 @@ export class GameScene extends Phaser.Scene {
 
     this.buildTileGrid();
 
-    this.buildBoundaryMarker();
+    // The anti-camp "red zone" is a multiplayer-only concept — no place in the
+    // single-player campaign, which disables the fence server-side too.
+    if (this.joinedRoom.name !== CAMPAIGN_ROOM) {
+      this.buildBoundaryMarker();
+    }
 
     this.buildHud();
 
@@ -393,7 +534,11 @@ export class GameScene extends Phaser.Scene {
 
     this.initAudio();
 
-    this.attach();
+    if (this.isCampaign) {
+      this.attachCampaign(this.joinedRoom as CampaignRoom);
+    } else {
+      this.attach();
+    }
 
     // The room outlives this scene, so every listener bound to it must come off
     // the moment the scene stops or is destroyed — otherwise a late network
@@ -413,6 +558,23 @@ export class GameScene extends Phaser.Scene {
     // packets that arrive after teardown find nothing to run.
     for (const detach of this.roomCleanups) detach();
     this.roomCleanups = [];
+
+    // Tear down the campaign briefing: stop the typewriter, drop the armed
+    // keypress, and remove the DOM overlay (it lives on document.body, outside
+    // Phaser, so the scene's own teardown will not reclaim it).
+    window.clearTimeout(this.typewriterTimer);
+    this.typewriterTimer = undefined;
+    this.disarmCampaignAdvance();
+    this.campaignOverlay?.remove();
+    this.campaignOverlay = undefined;
+    this.campaignTextEl = undefined;
+    this.campaignPromptEl = undefined;
+
+    window.clearTimeout(this.upgradeNotifyTimer);
+    this.upgradeNotifyTimer = undefined;
+    document.querySelector(".upgrade-notification")?.remove();
+    this.bestiaryEl?.remove();
+    this.bestiaryEl = undefined;
 
     // Release the audio handle; browsers cap how many contexts can be open.
     void this.audioCtx?.close().catch(() => {});
@@ -834,7 +996,14 @@ export class GameScene extends Phaser.Scene {
    * server stays the single authority on where anything is.
    */
   override update(time: number): void {
-    if (this.isDead || !this.room) return;
+    if (this.isDead) return;
+
+    if (this.isCampaign) {
+      this.updateCampaign(time);
+      return;
+    }
+
+    if (!this.room) return;
 
     this.refreshHud();
     this.followLabels();
@@ -913,7 +1082,7 @@ export class GameScene extends Phaser.Scene {
 
   /** Attaches to the room the lobby already joined. */
   private attach(): void {
-    const room = this.joinedRoom;
+    const room = this.joinedRoom as BattleRoom;
     this.room = room;
 
     this.bindState(room);
@@ -927,10 +1096,361 @@ export class GameScene extends Phaser.Scene {
     this.roomCleanups.push(() => room.onError.remove(onError));
   }
 
+  // ------------------------------------------------------------------ campaign
+
+  /**
+   * Wires the single-player campaign: a DOM briefing overlay driven entirely by
+   * the replicated `phase`. No battlefield binding — the campaign has no tanks,
+   * grid or bullets in state yet, so only the narrative flow is set up here.
+   */
+  private attachCampaign(room: CampaignRoom): void {
+    this.campaignRoom = room;
+    this.buildCampaignOverlay();
+    this.status.setText(`CAMPAIGN  ·  ${room.roomId}`);
+
+    // Same battlefield renderer and combat effects as the battle room (cast
+    // bridges Colyseus' contravariant Room type; CampaignStateView extends it).
+    this.bindWorld(room as unknown as Room<WorldStateView>);
+    this.bindEffects(room as unknown as Room<WorldStateView>);
+
+    const $ = getStateCallbacks(room);
+
+    // `listen` fires immediately with the current phase, then on every change —
+    // so the opening intro renders without waiting for a transition.
+    this.roomCleanups.push(
+      $(room.state).listen("phase", (phase: CampaignPhase) => this.onCampaignPhase(phase)),
+    );
+
+    this.roomCleanups.push(
+      $(room.state).listen("currentLevel", (level: number) => this.onCampaignLevelChange(level)),
+    );
+
+    this.buildBestiary();
+
+    const cheatWin = () => room.send(CampaignMessage.CheatWin);
+    this.input.keyboard?.on("keydown-G", cheatWin);
+    this.roomCleanups.push(() => this.input.keyboard?.off("keydown-G", cheatWin));
+
+    const onError = (code: number, message?: string) => {
+      this.status.setText(`connection error ${code}: ${message ?? ""}`).setColor("#e0483a");
+      console.error("[client] campaign room error", code, message);
+    };
+    room.onError(onError);
+    this.roomCleanups.push(() => room.onError.remove(onError));
+  }
+
+  /** Reacts to a phase change: which briefing to show, and what SPACE does. */
+  private onCampaignPhase(phase: CampaignPhase): void {
+    if (this.isDead) return;
+
+    // Levels are 1-based; the array is 0-based. Guard the lookup so a level
+    // beyond the authored set never dereferences undefined.
+    const level = CAMPAIGN_LEVELS[(this.campaignRoom?.state.currentLevel ?? 1) - 1];
+
+    switch (phase) {
+      case CampaignPhase.Intro:
+        this.showBriefing(level?.introText ?? "", "Press SPACE to Start");
+        this.armCampaignAdvance(CampaignMessage.StartLevel);
+        break;
+
+      case CampaignPhase.Playing:
+        this.hideCampaignOverlay();
+        break;
+
+      case CampaignPhase.Outro:
+        this.showBriefing(level?.outroText ?? "", "Press SPACE to Continue");
+        this.armCampaignAdvance(CampaignMessage.NextLevel);
+        break;
+
+      case CampaignPhase.GameOver:
+        this.showBriefing("MISSION FAILED", "Press SPACE to Return");
+        this.armCampaignReturn();
+        break;
+
+      case CampaignPhase.CampaignComplete:
+        this.showBriefing("CAMPAIGN DEMO COMPLETED", "Press SPACE to Return");
+        this.armCampaignReturn();
+        break;
+    }
+  }
+
+  /**
+   * Arms a one-shot Spacebar that leaves the room and returns to the lobby.
+   *
+   * Used on `game_over`: unlike {@link armCampaignAdvance}, this does not message
+   * the server — it cleanly drops the seat and reloads back to the start screen.
+   */
+  private armCampaignReturn(): void {
+    this.disarmCampaignAdvance();
+
+    const handler = () => {
+      this.disarmCampaignAdvance();
+      const room = this.campaignRoom;
+      if (!room) return;
+      // Clear the token first (there is none for campaign, but stay consistent
+      // with the battle path), then leave and reload into a fresh lobby.
+      void leaveRoom(room).finally(() => window.location.reload());
+    };
+
+    this.campaignAdvance = handler;
+    this.input.keyboard?.once("keydown-SPACE", handler);
+  }
+
+  /** Builds the full-screen black briefing overlay once, hidden to start. */
+  private buildCampaignOverlay(): void {
+    if (this.campaignOverlay) return;
+
+    const overlay = document.createElement("div");
+    overlay.className = "campaign-overlay";
+    overlay.hidden = true;
+
+    const text = document.createElement("div");
+    text.className = "campaign-text";
+
+    const prompt = document.createElement("div");
+    prompt.className = "campaign-prompt";
+
+    overlay.append(text, prompt);
+    document.body.appendChild(overlay);
+
+    this.campaignOverlay = overlay;
+    this.campaignTextEl = text;
+    this.campaignPromptEl = prompt;
+  }
+
+  /**
+   * Shows the overlay and types `body` out character by character, revealing the
+   * blinking `prompt` only once the line has finished — an empty prompt hides it.
+   */
+  private showBriefing(body: string, prompt: string): void {
+    this.buildCampaignOverlay();
+    if (this.campaignOverlay) this.campaignOverlay.hidden = false;
+
+    const promptEl = this.campaignPromptEl;
+    if (promptEl) {
+      promptEl.textContent = prompt;
+      // Held out of sight until the typewriter lands, so it doesn't blink over
+      // a still-typing line.
+      promptEl.style.visibility = "hidden";
+    }
+
+    this.typeBriefing(body, () => {
+      if (!this.isDead && promptEl && prompt) promptEl.style.visibility = "visible";
+    });
+  }
+
+  /** Reveals `full` one character at a time, then calls `onDone`. */
+  private typeBriefing(full: string, onDone: () => void): void {
+    window.clearTimeout(this.typewriterTimer);
+
+    const el = this.campaignTextEl;
+    if (!el) return;
+
+    if (full.length === 0) {
+      el.textContent = "";
+      onDone();
+      return;
+    }
+
+    let revealed = 1;
+    const step = () => {
+      if (this.isDead || !this.campaignTextEl) return;
+
+      this.campaignTextEl.textContent = full.slice(0, revealed);
+      if (revealed >= full.length) {
+        onDone();
+        return;
+      }
+
+      revealed++;
+      this.typewriterTimer = window.setTimeout(step, CAMPAIGN_TYPE_SPEED_MS);
+    };
+    step();
+  }
+
+  /** Hides the overlay and stops any in-flight typing or armed keypress. */
+  private hideCampaignOverlay(): void {
+    window.clearTimeout(this.typewriterTimer);
+    this.typewriterTimer = undefined;
+    this.disarmCampaignAdvance();
+    if (this.campaignOverlay) this.campaignOverlay.hidden = true;
+  }
+
+  private onCampaignLevelChange(level: number): void {
+    if (this.isDead) return;
+    const UPGRADE_MESSAGES: Record<number, string> = {
+      6: "UPGRADE ACQUIRED: UPGRADED TRACKS (+15% Speed)",
+      11: "UPGRADE ACQUIRED: HIGH-VELOCITY BARRELS (+Fire Rate & Bullet Speed)",
+      16: "UPGRADE ACQUIRED: REACTIVE ARMOR (+2 Max Lives, +Invulnerability Time)",
+    };
+    const message = UPGRADE_MESSAGES[level];
+    if (message) this.showUpgradeNotification(message);
+  }
+
+  private showUpgradeNotification(message: string): void {
+    window.clearTimeout(this.upgradeNotifyTimer);
+
+    let el = document.querySelector<HTMLDivElement>(".upgrade-notification");
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "upgrade-notification";
+      document.body.appendChild(el);
+    }
+
+    el.textContent = message;
+    el.hidden = false;
+    el.style.opacity = "1";
+
+    this.upgradeNotifyTimer = window.setTimeout(() => {
+      if (el) {
+        el.style.opacity = "0";
+        window.setTimeout(() => { if (el) el.hidden = true; }, 600);
+      }
+    }, 4000);
+  }
+
+  private buildBestiary(): void {
+    if (this.bestiaryEl) return;
+
+    const entries: Array<{ name: string; color: string; desc: string }> = [
+      { name: "Standard", color: "#808080", desc: "" },
+      { name: "Kamikaze", color: "#ff0000", desc: "Explodes on contact" },
+      { name: "Constructor", color: "#ffff00", desc: "Drops brick walls" },
+      { name: "Trapper", color: "#800080", desc: "Lays hidden mines" },
+      { name: "Aegis", color: "#00ffff", desc: "Shields nearby enemies" },
+      { name: "Jammer", color: "#00008b", desc: "Halves your fire rate" },
+      { name: "Mimic", color: "#ffd700", desc: "Disguises as Intel" },
+      { name: "Ghost", color: "#cccccc", desc: "Cloaked until firing" },
+    ];
+
+    const panel = document.createElement("div");
+    panel.className = "bestiary-panel";
+
+    const title = document.createElement("div");
+    title.className = "bestiary-title";
+    title.textContent = "BESTIARY";
+    panel.appendChild(title);
+
+    for (const entry of entries) {
+      const row = document.createElement("div");
+      row.className = "bestiary-row";
+
+      const swatch = document.createElement("span");
+      swatch.className = "bestiary-swatch";
+      swatch.style.backgroundColor = entry.color;
+
+      const name = document.createElement("span");
+      name.className = "bestiary-name";
+      name.style.color = entry.color;
+      name.textContent = entry.name;
+
+      row.append(swatch, name);
+
+      if (entry.desc) {
+        const desc = document.createElement("span");
+        desc.className = "bestiary-desc";
+        desc.textContent = entry.desc;
+        row.appendChild(desc);
+      }
+
+      panel.appendChild(row);
+    }
+
+    document.body.appendChild(panel);
+    this.bestiaryEl = panel;
+  }
+
+  /**
+   * Arms a one-shot Spacebar press that sends `message` to advance the phase.
+   *
+   * Any previously armed press is cleared first, so exactly one is ever live —
+   * pressing SPACE during the intro sends `start_level`, during the outro
+   * `next_level`, and the server decides what that does.
+   */
+  private armCampaignAdvance(message: CampaignMessage): void {
+    this.disarmCampaignAdvance();
+
+    const handler = () => {
+      this.disarmCampaignAdvance();
+      this.campaignRoom?.send(message);
+    };
+
+    this.campaignAdvance = handler;
+    this.input.keyboard?.once("keydown-SPACE", handler);
+  }
+
+  /** Removes the armed Spacebar handler, if one is still waiting. */
+  private disarmCampaignAdvance(): void {
+    if (!this.campaignAdvance) return;
+    this.input?.keyboard?.off("keydown-SPACE", this.campaignAdvance);
+    this.campaignAdvance = undefined;
+  }
+
+  /** Per-frame campaign work: HUD, name labels, and (while playing) input. */
+  private updateCampaign(time: number): void {
+    const room = this.campaignRoom;
+    if (!room) return;
+
+    this.followLabels();
+    this.refreshCampaignHud();
+
+    // Only the live level accepts input; intro/outro/game-over are frozen.
+    if (room.state.phase !== CampaignPhase.Playing) return;
+
+    const direction = this.readDirection();
+    if (direction !== null && time - this.lastMoveSentAt >= MOVE_SEND_INTERVAL_MS) {
+      room.send(ClientMessage.Move, { dir: direction } satisfies MoveMessage);
+      this.lastMoveSentAt = time;
+    }
+
+    if (this.isShootDown() && time - this.lastShotAt >= SHOOT_INTERVAL_MS) {
+      room.send(ClientMessage.Shoot);
+      this.soundFire();
+      this.lastShotAt = time;
+    }
+  }
+
+  /** Pulls the campaign HUD — level, enemies, the dynamic objective, and lives. */
+  private refreshCampaignHud(): void {
+    const state = this.campaignRoom?.state;
+    if (!state?.tanks) return;
+
+    this.setField(this.hudTime, `LEVEL ${state.currentLevel}`);
+
+    const enemies = state.tanks.filter((tank) => tank.isEnemy).length;
+    this.setField(this.hudEnemies, `ENEMIES ${enemies}`);
+
+    // The server keeps `objectiveText` current for whatever this level's win
+    // condition is — radars remaining, extraction, or the survival countdown.
+    this.setField(this.hudEagle, state.objectiveText, "#00ff88");
+
+    this.setField(
+      this.hudPlayer,
+      `LIVES ${state.lives}`,
+      state.lives > 0 ? "#4caf50" : "#e0483a",
+    );
+
+    // A Jammer on the field throttles the player's weapons — flash a warning so
+    // the sluggish fire rate reads as an effect, not a bug.
+    const jammed = state.tanks.some((tank) => tank.isEnemy && tank.variant === "jammer");
+    if (jammed) {
+      const on = Math.floor(this.time.now / 400) % 2 === 0;
+      this.status.setText(on ? "WARNING: WEAPONS JAMMED" : "").setColor("#ff3030");
+    } else {
+      this.status.setText(`CAMPAIGN  ·  ${this.campaignRoom?.roomId ?? ""}`).setColor("#5c6b7a");
+    }
+  }
+
   // -------------------------------------------------------------- state binding
 
   private bindState(room: BattleRoom): void {
     const $ = getStateCallbacks(room);
+
+    // The battlefield itself — map and entities — plus the combat effect
+    // messages, are shared with the campaign renderer. Both concrete states
+    // extend WorldStateView; the cast bridges Colyseus' contravariant Room type.
+    this.bindWorld(room as unknown as Room<WorldStateView>);
+    this.bindEffects(room as unknown as Room<WorldStateView>);
 
     // The match result drives the overlay. The token is deliberately kept: the
     // room lives on to be reset back to the lobby, so a refresh should resume
@@ -942,6 +1462,31 @@ export class GameScene extends Phaser.Scene {
       }),
     );
 
+    this.roomCleanups.push(
+      room.onMessage(ServerMessage.BoonCollected, (message: BoonCollectedMessage) => {
+        this.announceBoon(message);
+      }),
+    );
+
+    this.roomCleanups.push(
+      room.onMessage(ServerMessage.MatchStats, (message: MatchStatsMessage) => {
+        // May arrive before or after the overlay is built — store, then draw if
+        // the overlay is already up.
+        this.matchStats = message.rows;
+        this.renderScoreboard();
+        this.recordProgression(message.rows);
+      }),
+    );
+  }
+
+  /**
+   * Renders the battlefield from replicated state: the tile grid and every tank,
+   * bullet and boon on it. Shared by both room modes — battle and campaign carry
+   * the same collections, so the same bindings draw both.
+   */
+  private bindWorld(room: Room<WorldStateView>): void {
+    const $ = getStateCallbacks(room);
+
     // Repaint the whole map once the first snapshot lands, then keep it in
     // sync cell by cell — a destroyed brick only ever touches one index.
     room.onStateChange.once(() => {
@@ -952,8 +1497,78 @@ export class GameScene extends Phaser.Scene {
     this.roomCleanups.push($(room.state).tanks.onAdd((tank) => {
       const sprite = this.spawnSprite(tank.isEnemy ? TextureKey.TankEnemy : TextureKey.TankPlayer);
 
-      // Tier colour: red normal, purple armoured, near-black heavy.
-      if (tank.isEnemy) sprite.setTint(ENEMY_TINT[tank.maxHealth] ?? ENEMY_TINT[1]!);
+      // Enemy tint: the boss is scaled up to its massive hitbox and painted dark
+      // and menacing; kamikaze rushers burn bright red; otherwise tier colour —
+      // red normal, purple armoured, near-black heavy.
+      if (tank.variant === "convoy") {
+        // The friendly escort carrier: bright green and stretched into a truck.
+        sprite.setTint(0x00ff00);
+        sprite.setScale(1, 1.2);
+      } else if (tank.isEnemy) {
+        if (tank.variant === "sweeper") {
+          // Match the server hitbox (width is 3x a tile) and darken it.
+          sprite.setScale(tank.width / TILE_SIZE);
+          sprite.setTint(0x333333);
+        } else if (tank.variant === "artillery") {
+          // Scaled up to its hitbox (1.5x a tile) and painted siege-orange.
+          sprite.setScale(tank.width / TILE_SIZE);
+          sprite.setTint(0xffa500);
+        } else if (tank.variant === "juggernaut") {
+          // Massive crimson siege boss — scaled up to fill its 2-tile hull.
+          sprite.setScale(2.0);
+          sprite.setTint(0x8b0000);
+        } else if (tank.variant === "mimic") {
+          // Gold while disguised as an item drop, magenta once it springs.
+          this.syncMimicAppearance(tank, sprite);
+        } else if (tank.variant === "kamikaze") {
+          sprite.setTint(0xff0000);
+        } else if (tank.variant === "constructor") {
+          // Yellow trench-layer — distinct from red kamikazes and tier enemies.
+          sprite.setTint(0xffff00);
+        } else if (tank.variant === "trapper") {
+          // Purple mine-layer.
+          sprite.setTint(0x800080);
+        } else if (tank.variant === "aegis") {
+          // Cyan shield unit; its protective aura is drawn separately.
+          sprite.setTint(0x00ffff);
+          this.createAegisAura(tank);
+        } else if (tank.variant === "jammer") {
+          // Dark-blue electronic-warfare unit.
+          sprite.setTint(0x00008b);
+        } else if (tank.variant === "ghost") {
+          this.syncGhostAppearance(tank, sprite);
+        } else if (tank.variant === "warden") {
+          sprite.setScale(2.0);
+          sprite.setTint(0x006400);
+        } else if (tank.variant === "core") {
+          sprite.setScale(3.0);
+          sprite.setTint(0xff0066);
+          let corePhase = 0;
+          this.time.addEvent({
+            delay: 50,
+            loop: true,
+            callback: () => {
+              if (!this.isLive(sprite)) return;
+              const hp = tank.currentHealth;
+              if (hp <= 15) {
+                const flash = Math.floor(Date.now() / 100) % 2 === 0;
+                sprite.setTint(flash ? 0xff0000 : 0xffffff);
+              } else if (hp <= 35) {
+                sprite.setTint(0xff8800);
+              } else {
+                corePhase = (corePhase + 1) % 32;
+                const progress = corePhase / 32;
+                const r = Math.round(0xff - progress * 0x64);
+                const g = Math.round(progress * 0x59);
+                const b = Math.round(0x66 + progress * 0x6a);
+                sprite.setTint((r << 16) | (g << 8) | b);
+              }
+            },
+          });
+        } else {
+          sprite.setTint(ENEMY_TINT[tank.maxHealth] ?? ENEMY_TINT[1]!);
+        }
+      }
 
       this.tankSprites.set(tank, sprite);
       this.placeEntity(sprite, tank);
@@ -967,6 +1582,10 @@ export class GameScene extends Phaser.Scene {
       $(tank).onChange(() => {
         this.placeEntity(sprite, tank);
         this.syncShield(tank, sprite);
+        // A Mimic flips gold→magenta and unfreezes its facing when it springs.
+        this.syncMimicAppearance(tank, sprite);
+        // A Ghost fades in and out as it cloaks/uncloaks after firing.
+        this.syncGhostAppearance(tank, sprite);
       });
     }));
 
@@ -977,6 +1596,8 @@ export class GameScene extends Phaser.Scene {
       this.shields.delete(tank);
       this.labels.get(tank)?.destroy();
       this.labels.delete(tank);
+      this.aegisAuras.get(tank)?.destroy();
+      this.aegisAuras.delete(tank);
     }));
 
     // Identity lives on the player record, so watch that for name/colour.
@@ -1015,13 +1636,10 @@ export class GameScene extends Phaser.Scene {
       this.boonSprites.get(boon)?.destroy();
       this.boonSprites.delete(boon);
     }));
+  }
 
-    this.roomCleanups.push(
-      room.onMessage(ServerMessage.BoonCollected, (message: BoonCollectedMessage) => {
-        this.announceBoon(message);
-      }),
-    );
-
+  /** Binds the combat effect messages (explosions, sparks) shared by both modes. */
+  private bindEffects(room: Room<WorldStateView>): void {
     this.roomCleanups.push(
       room.onMessage(ServerMessage.TankDestroyed, (message: TankDestroyedMessage) => {
         this.spawnTankExplosion(message);
@@ -1034,15 +1652,73 @@ export class GameScene extends Phaser.Scene {
       }),
     );
 
+    // The campaign boss rebounding off a wall throws a heavy jolt through the
+    // camera, to sell its weight. The Juggernaut's frequent block-crushes send
+    // `subtle` — a barely-there rumble instead, so grinding the maze open does
+    // not shake the screen apart.
     this.roomCleanups.push(
-      room.onMessage(ServerMessage.MatchStats, (message: MatchStatsMessage) => {
-        // May arrive before or after the overlay is built — store, then draw if
-        // the overlay is already up.
-        this.matchStats = message.rows;
-        this.renderScoreboard();
-        this.recordProgression(message.rows);
+      room.onMessage(ServerMessage.BossBounce, (message: BossBounceMessage) => {
+        if (this.isDead) return;
+        if (message.subtle) this.cameras.main.shake(100, 0.002);
+        else this.cameras.main.shake(180, 0.008);
       }),
     );
+
+    // An inbound artillery mortar: draw a red telegraph circle that pulses until
+    // it detonates.
+    this.roomCleanups.push(
+      room.onMessage(ServerMessage.MortarWarning, (message: MortarWarningMessage) => {
+        this.showMortarWarning(message);
+      }),
+    );
+  }
+
+  /** Draws a pulsing red mortar telegraph that clears itself when it detonates. */
+  private showMortarWarning(message: MortarWarningMessage): void {
+    if (this.isDead) return;
+
+    const radius = 1.5 * TILE_SIZE;
+    const circle = this.add.graphics().setDepth(3);
+    circle.fillStyle(0xff0000, 0.25).fillCircle(message.x, message.y, radius);
+    circle.lineStyle(2, 0xff2020, 0.9).strokeCircle(message.x, message.y, radius);
+    this.world.add(circle);
+
+    // Pulse the alpha so it reads as an active, incoming threat.
+    this.tweens.add({ targets: circle, alpha: 0.35, duration: 250, yoyo: true, repeat: -1 });
+
+    // Clear it at the moment of detonation and set off the blast. delayedCall is
+    // scoped to the scene, so it never fires after teardown.
+    this.time.delayedCall(message.delay, () => {
+      if (this.isLive(circle)) {
+        this.tweens.killTweensOf(circle);
+        circle.destroy();
+      }
+      this.spawnMortarBlast(message.x, message.y);
+    });
+  }
+
+  /**
+   * A violent mortar blast at the impact point: a bright orange/yellow disc that
+   * snaps outward and fades over ~300ms, so the hit lands hard visually.
+   */
+  private spawnMortarBlast(x: number, y: number): void {
+    if (this.isDead) return;
+
+    const blast = this.add.graphics().setDepth(6);
+    // Layered fireball — a yellow-hot core inside an orange shell.
+    blast.fillStyle(0xff8a00, 0.85).fillCircle(0, 0, TILE_SIZE * 1.5);
+    blast.fillStyle(0xffe14a, 0.95).fillCircle(0, 0, TILE_SIZE * 0.9);
+    blast.setPosition(x, y).setScale(0.3);
+    this.world.add(blast);
+
+    this.tweens.add({
+      targets: blast,
+      scale: 1.6,
+      alpha: 0,
+      duration: 300,
+      ease: "Cubic.Out",
+      onComplete: () => blast.destroy(),
+    });
   }
 
   /**
@@ -1158,6 +1834,67 @@ export class GameScene extends Phaser.Scene {
 
       label.setPosition(sprite.x, sprite.y - TILE_SIZE);
     }
+
+    // Aegis auras follow their unit.
+    for (const [tank, aura] of this.aegisAuras) {
+      const sprite = this.tankSprites.get(tank);
+      if (!sprite || !this.isLive(sprite) || !this.isLive(aura)) continue;
+
+      aura.setPosition(sprite.x, sprite.y);
+    }
+  }
+
+  /**
+   * Keeps a Mimic's look in step with its disguise.
+   *
+   * Disguised, it is tinted gold and its facing is frozen upright so it reads as
+   * an intel drive rather than a tank (the server holds it still, but its spawn
+   * facing would otherwise rotate the hull). Once it springs it turns bright
+   * magenta and rotates with its heading like any other enemy. A no-op for every
+   * non-Mimic sprite, so it is cheap to call from the shared onChange handler.
+   */
+  private syncMimicAppearance(tank: TankView, sprite: Phaser.GameObjects.Image): void {
+    if (tank.variant !== "mimic") return;
+    if (!this.isLive(sprite)) return;
+
+    if (tank.isDisguised) {
+      sprite.setTint(0xffd700);
+      sprite.setRotation(0);
+    } else {
+      sprite.setTint(0xff00ff);
+    }
+  }
+
+  /**
+   * Keeps a Ghost's visibility in step with its cloak state.
+   *
+   * Cloaked: nearly invisible (alpha 0.08) with a white tint, so it reads as a
+   * faint shimmer. Uncloaked (after firing): fully opaque with a light-grey tint,
+   * clearly marking it as exposed and vulnerable. A no-op for every non-Ghost
+   * sprite, so it is cheap to call from the shared onChange handler.
+   */
+  private syncGhostAppearance(tank: TankView, sprite: Phaser.GameObjects.Image): void {
+    if (tank.variant !== "ghost") return;
+    if (!this.isLive(sprite)) return;
+
+    if (tank.isCloaked) {
+      sprite.setAlpha(0.08);
+      sprite.setTint(0xffffff);
+    } else {
+      sprite.setAlpha(1.0);
+      sprite.setTint(0xdddddd);
+    }
+  }
+
+  /** Draws a faint cyan aura circle (3-tile radius) around an Aegis unit. */
+  private createAegisAura(tank: TankView): void {
+    const radius = 3 * TILE_SIZE;
+    const aura = this.add.graphics().setDepth(2);
+    aura.fillStyle(0x00ffff, 0.08).fillCircle(0, 0, radius);
+    aura.lineStyle(2, 0x00ffff, 0.4).strokeCircle(0, 0, radius);
+    aura.setPosition(tank.x + tank.width / 2, tank.y + tank.height / 2);
+    this.world.add(aura);
+    this.aegisAuras.set(tank, aura);
   }
 
   /** Adds or removes the flashing shield that marks respawn invulnerability. */
@@ -1210,7 +1947,45 @@ export class GameScene extends Phaser.Scene {
   private paintTile(index: number, tile: number): void {
     if (this.isDead) return;
     const tile$ = this.tiles[index];
-    if (this.isLive(tile$)) tile$!.setTexture(this.textureForTile(tile));
+    if (!this.isLive(tile$)) return;
+
+    tile$!.setTexture(this.textureForTile(tile));
+    // Objective tiles blink so they read as "interact with me"; a mine pulses
+    // too, as a lethal-trap warning.
+    const shouldPulse =
+      tile === TileType.ExtractionZone ||
+      tile === TileType.Bomb ||
+      tile === TileType.Intel ||
+      tile === TileType.Mine;
+    this.syncTilePulse(index, tile$!, shouldPulse);
+  }
+
+  /** Starts or stops a looping alpha pulse on an objective tile. */
+  private syncTilePulse(
+    index: number,
+    image: Phaser.GameObjects.Image,
+    shouldPulse: boolean,
+  ): void {
+    const existing = this.pulseTiles.get(index);
+
+    if (shouldPulse) {
+      if (existing) return;
+      const tween = this.tweens.add({
+        targets: image,
+        alpha: 0.4,
+        duration: 700,
+        yoyo: true,
+        repeat: -1,
+      });
+      this.pulseTiles.set(index, tween);
+      return;
+    }
+
+    if (existing) {
+      existing.stop();
+      image.setAlpha(1);
+      this.pulseTiles.delete(index);
+    }
   }
 
   private textureForTile(tile: number): string {
@@ -1223,6 +1998,20 @@ export class GameScene extends Phaser.Scene {
         return TextureKey.Water;
       case TileType.EagleBase:
         return TextureKey.Eagle;
+      case TileType.Radar:
+        return TextureKey.Radar;
+      case TileType.ExtractionZone:
+        return TextureKey.Extraction;
+      case TileType.UplinkZone:
+        return TextureKey.Uplink;
+      case TileType.Factory:
+        return TextureKey.Factory;
+      case TileType.Bomb:
+        return TextureKey.Bomb;
+      case TileType.Intel:
+        return TextureKey.Intel;
+      case TileType.Mine:
+        return TextureKey.Mine;
       default:
         return TextureKey.Empty;
     }

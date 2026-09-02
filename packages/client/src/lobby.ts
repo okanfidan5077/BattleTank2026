@@ -1,5 +1,12 @@
 import { joinOptionsFor, parseRoomCode, rememberedName, roomCodeFromUrl } from "./identity.js";
-import { createRoom, joinRoomById, shareableLink, type BattleRoom } from "./network.js";
+import {
+  createRoom,
+  joinCampaign,
+  joinRoomById,
+  shareableLink,
+  type BattleRoom,
+  type GameRoom,
+} from "./network.js";
 
 function element<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -13,11 +20,12 @@ function element<T extends HTMLElement>(id: string): T {
  * Phaser is not booted until this settles, so nothing renders behind the lobby
  * and the game scene can be handed an already-connected room.
  */
-export function runLobby(): Promise<BattleRoom> {
+export function runLobby(): Promise<GameRoom> {
   const lobby = element("lobby");
   const nameInput = element<HTMLInputElement>("player-name");
   const codeInput = element<HTMLInputElement>("room-code");
   const createButton = element<HTMLButtonElement>("create-room");
+  const campaignButton = element<HTMLButtonElement>("play-campaign");
   const joinButton = element<HTMLButtonElement>("join-room");
   const status = element("lobby-status");
 
@@ -34,9 +42,10 @@ export function runLobby(): Promise<BattleRoom> {
     nameInput.select();
   }
 
-  return new Promise<BattleRoom>((resolve) => {
+  return new Promise<GameRoom>((resolve) => {
     const setBusy = (busy: boolean) => {
       createButton.disabled = busy;
+      campaignButton.disabled = busy;
       joinButton.disabled = busy;
     };
 
@@ -46,7 +55,7 @@ export function runLobby(): Promise<BattleRoom> {
       setBusy(false);
     };
 
-    const attempt = async (what: string, connect: () => Promise<BattleRoom>) => {
+    const attempt = async (what: string, connect: () => Promise<GameRoom>) => {
       setBusy(true);
       status.classList.remove("error");
       status.textContent = what;
@@ -62,6 +71,10 @@ export function runLobby(): Promise<BattleRoom> {
 
     createButton.addEventListener("click", () => {
       void attempt("Creating room...", () => createRoom(joinOptionsFor(nameInput.value)));
+    });
+
+    campaignButton.addEventListener("click", () => {
+      void attempt("Starting campaign...", () => joinCampaign(joinOptionsFor(nameInput.value)));
     });
 
     joinButton.addEventListener("click", () => {

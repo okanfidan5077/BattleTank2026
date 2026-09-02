@@ -168,7 +168,7 @@ export const ENEMY_PLAYER_HUNTER_SHARE = 0.4;
 export const HUNTER_FIELD_REBUILD_TICKS = 10;
 
 /** How far ahead an enemy looks when deciding whether to fire, in tiles. */
-export const ENEMY_SIGHT_RANGE_TILES = 12;
+export const ENEMY_SIGHT_RANGE_TILES = 15;
 
 /** Chance an enemy shoots a brick further down its line of sight. */
 export const ENEMY_BRICK_FIRE_CHANCE = 0.25;

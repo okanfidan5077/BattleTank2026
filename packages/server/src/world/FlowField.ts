@@ -33,8 +33,13 @@ function entryCost(tile: number): number {
   switch (tile) {
     case TileType.Steel:
     case TileType.Water:
+    // A radar tower is a solid obstacle enemies must route around, not shoot
+    // through — only the player's shells clear it.
+    case TileType.Radar:
       return Infinity;
     case TileType.Brick:
+    // A factory is a solid, shootable structure like brick — routable but dear.
+    case TileType.Factory:
       return FLOW_FIELD_BRICK_COST;
     default:
       return 1;

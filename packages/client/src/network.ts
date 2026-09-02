@@ -1,8 +1,8 @@
 import { Client, type Room } from "colyseus.js";
 
-import { BATTLE_ROOM, type JoinOptions } from "@battletank/shared";
+import { BATTLE_ROOM, CAMPAIGN_ROOM, type JoinOptions } from "@battletank/shared";
 
-import type { BattleStateView } from "./state.js";
+import type { BattleStateView, CampaignStateView } from "./state.js";
 
 /**
  * The Colyseus endpoint to connect to.
@@ -34,6 +34,10 @@ export const SERVER_URL = resolveEndpoint();
 export const colyseus = new Client(SERVER_URL);
 
 export type BattleRoom = Room<BattleStateView>;
+export type CampaignRoom = Room<CampaignStateView>;
+
+/** Either room the game scene can be handed. Branch on `room.name`. */
+export type GameRoom = BattleRoom | CampaignRoom;
 
 /**
  * Where the reconnection token lives.
@@ -52,6 +56,17 @@ export async function createRoom(options: JoinOptions): Promise<BattleRoom> {
 /** Joins an existing room by its id. */
 export async function joinRoomById(roomId: string, options: JoinOptions): Promise<BattleRoom> {
   return remember(await colyseus.joinById<BattleStateView>(roomId, options));
+}
+
+/**
+ * Joins the single-player campaign, opening a room if none is waiting.
+ *
+ * Deliberately not passed through {@link remember}: a campaign seat is
+ * single-player and short-lived, so there is nothing to hold open for a
+ * reconnect — a refresh simply returns to the lobby.
+ */
+export async function joinCampaign(options: JoinOptions): Promise<CampaignRoom> {
+  return colyseus.joinOrCreate<CampaignStateView>(CAMPAIGN_ROOM, options);
 }
 
 /**
@@ -102,7 +117,7 @@ export function forgetSession(): void {
  * consented leave. The next visit runs fresh matchmaking rather than trying to
  * reconnect to a room that may already be gone.
  */
-export async function leaveRoom(room: BattleRoom): Promise<void> {
+export async function leaveRoom(room: GameRoom): Promise<void> {
   forgetSession();
   try {
     await room.leave(true);

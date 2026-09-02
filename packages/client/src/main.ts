@@ -1,11 +1,11 @@
 import Phaser from "phaser";
 import { getStateCallbacks } from "colyseus.js";
 
-import { MatchStatus, PROTOCOL_VERSION } from "@battletank/shared";
+import { CAMPAIGN_ROOM, MatchStatus, PROTOCOL_VERSION } from "@battletank/shared";
 
 import { BASE_HEIGHT, BASE_WIDTH, GameScene } from "./GameScene.js";
 import { hideLobby, reflectRoomInUrl, runLobby, showShareLink } from "./lobby.js";
-import { tryResume, type BattleRoom } from "./network.js";
+import { tryResume, type BattleRoom, type CampaignRoom, type GameRoom } from "./network.js";
 import { runStaging } from "./staging.js";
 import "./style.css";
 
@@ -51,7 +51,7 @@ function setupFullscreenToggle(): void {
  * joined room, so it never has to render an empty world while it waits, and the
  * lobby is plain DOM sitting above the empty canvas container.
  */
-function createGame(room: BattleRoom): Phaser.Game {
+function createGame(room: GameRoom): Phaser.Game {
   const game = new Phaser.Game({
     type: Phaser.AUTO,
     parent: "game",
@@ -110,25 +110,55 @@ function runMatch(room: BattleRoom): Promise<void> {
   });
 }
 
+/**
+ * Runs a campaign playthrough: boots Phaser once and holds until the room ends.
+ *
+ * The single-player campaign has no staging lobby and no reset-to-lobby cycle —
+ * the scene drives the whole thing off the replicated `phase`, so this just
+ * keeps Phaser alive until the room is left.
+ */
+function runCampaign(room: CampaignRoom): Promise<void> {
+  const container = gameContainer();
+  container.hidden = false;
+
+  const game = createGame(room);
+
+  return new Promise<void>((resolve) => {
+    room.onLeave(() => {
+      game.destroy(true, false);
+      container.hidden = true;
+      resolve();
+    });
+  });
+}
+
 async function boot(): Promise<void> {
   console.log(`[client] BattleTank2026 booted (protocol v${PROTOCOL_VERSION})`);
 
   setupFullscreenToggle();
 
   // A refresh resumes the previous seat and skips the lobby entirely.
-  const room = (await tryResume()) ?? (await runLobby());
+  const room: GameRoom = (await tryResume()) ?? (await runLobby());
 
   hideLobby();
-  reflectRoomInUrl(room);
-  showShareLink(room);
+
+  // The campaign is its own flow — no staging, no share link, no match loop.
+  if (room.name === CAMPAIGN_ROOM) {
+    await runCampaign(room as CampaignRoom);
+    return;
+  }
+
+  const battle = room as BattleRoom;
+  reflectRoomInUrl(battle);
+  showShareLink(battle);
 
   // Staging <-> match cycle. `runStaging` holds in the DOM lobby until the host
   // starts (Phaser is not booted until then); `runMatch` boots Phaser and only
   // resolves once the host resets the room back to the lobby, at which point the
   // loop shows staging again. Both sides clean up their own listeners each pass.
   for (;;) {
-    await runStaging(room);
-    await runMatch(room);
+    await runStaging(battle);
+    await runMatch(battle);
   }
 }
 

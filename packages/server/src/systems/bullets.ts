@@ -27,7 +27,14 @@ function isOutsideWorld(bullet: Bullet): boolean {
 function resolveTileCollision(
   state: GameState,
   bullet: Bullet,
-  destroyed: { bricks: number; steel: number; eagle: boolean; steelHits: { x: number; y: number }[] },
+  destroyed: {
+    bricks: number;
+    steel: number;
+    radars: number;
+    factories: number;
+    eagle: boolean;
+    steelHits: { x: number; y: number }[];
+  },
 ): boolean {
   const minTileX = Math.floor(bullet.x / TILE_SIZE);
   const maxTileX = Math.floor((bullet.x + bullet.width - 1) / TILE_SIZE);
@@ -64,6 +71,20 @@ function resolveTileCollision(
           // Any shell finishes the eagle — including one of your own.
           state.grid[index] = TileType.Empty;
           destroyed.eagle = true;
+          consumed = true;
+          break;
+
+        case TileType.Radar:
+          // A campaign jamming tower: one shell levels it, like brick.
+          state.grid[index] = TileType.Empty;
+          destroyed.radars++;
+          consumed = true;
+          break;
+
+        case TileType.Factory:
+          // A campaign factory: one shell levels it, like brick.
+          state.grid[index] = TileType.Empty;
+          destroyed.factories++;
           consumed = true;
           break;
 
@@ -113,6 +134,10 @@ export interface BulletOutcome {
   bricksDestroyed: number;
   /** Steel tiles cut open by tier 4 shells. */
   steelDestroyed: number;
+  /** Radar towers destroyed this tick (campaign objective tiles). */
+  radarsDestroyed: number;
+  /** Factory structures destroyed this tick (campaign objective tiles). */
+  factoriesDestroyed: number;
   /**
    * Tanks whose health reached zero, already removed from the state, each paired
    * with the `ownerId` of the shell that finished it — so a kill can be credited.
@@ -186,8 +211,24 @@ function resolveInterceptions(state: GameState, doomed: Set<number>): number {
  * be processed first. Only then does each survivor resolve against tanks (before
  * terrain, so a tank flush to a wall still takes the hit).
  */
-export function updateBullets(state: GameState): BulletOutcome {
-  const destroyed = { bricks: 0, steel: 0, eagle: false, steelHits: [] as { x: number; y: number }[] };
+/** Optional hooks the room can inject into bullet resolution. */
+export interface BulletOptions {
+  /**
+   * Returns true if `target` is shielded from this `bullet` — the bullet is then
+   * consumed but deals no damage. Used by the campaign's Aegis aura.
+   */
+  shieldsTarget?: (target: Tank, bullet: Bullet) => boolean;
+}
+
+export function updateBullets(state: GameState, options?: BulletOptions): BulletOutcome {
+  const destroyed = {
+    bricks: 0,
+    steel: 0,
+    radars: 0,
+    factories: 0,
+    eagle: false,
+    steelHits: [] as { x: number; y: number }[],
+  };
   const destroyedTanks: { tank: Tank; killerId: string }[] = [];
 
   // 1. Move everything.
@@ -219,6 +260,12 @@ export function updateBullets(state: GameState): BulletOutcome {
 
     const target = findTarget(state, bullet);
     if (target) {
+      // An Aegis-shielded target soaks the shell for no damage.
+      if (options?.shieldsTarget?.(target, bullet)) {
+        state.bullets.splice(i, 1);
+        continue;
+      }
+
       target.currentHealth = Math.max(0, target.currentHealth - bullet.damage);
 
       if (target.currentHealth === 0) {
@@ -239,6 +286,8 @@ export function updateBullets(state: GameState): BulletOutcome {
   return {
     bricksDestroyed: destroyed.bricks,
     steelDestroyed: destroyed.steel,
+    radarsDestroyed: destroyed.radars,
+    factoriesDestroyed: destroyed.factories,
     destroyedTanks,
     bulletsIntercepted,
     eagleDestroyed: destroyed.eagle,

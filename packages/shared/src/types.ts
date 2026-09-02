@@ -23,6 +23,10 @@ export const ServerMessage = {
   SteelHit: "steel_hit",
   /** Final per-player figures, sent once the match resolves. */
   MatchStats: "match_stats",
+  /** The campaign boss rebounded off a wall — drives a heavy camera shake. */
+  BossBounce: "boss_bounce",
+  /** An artillery mortar is inbound — drives the telegraph circle before impact. */
+  MortarWarning: "mortar_warning",
 } as const;
 export type ServerMessage = (typeof ServerMessage)[keyof typeof ServerMessage];
 
@@ -72,6 +76,28 @@ export interface SteelHitMessage {
   /** Impact point, in world units. */
   x: number;
   y: number;
+}
+
+/** Broadcast when the campaign boss bounces off a wall — for a camera shake. */
+export interface BossBounceMessage {
+  /** The boss's centre at the moment of impact, in world units. */
+  x: number;
+  y: number;
+  /**
+   * A much gentler shake than a wall bounce. Set when the Juggernaut crushes a
+   * block — that happens often as it grinds through the maze, so it must barely
+   * register rather than jolt the camera the way the Sweeper's rebounds do.
+   */
+  subtle?: boolean;
+}
+
+/** Broadcast when an artillery mortar is launched at a target, before it lands. */
+export interface MortarWarningMessage {
+  /** Impact centre, in world units. */
+  x: number;
+  y: number;
+  /** Milliseconds until detonation — how long to show the telegraph. */
+  delay: number;
 }
 
 /** Lifecycle of a match, replicated on GameState.matchState. */
