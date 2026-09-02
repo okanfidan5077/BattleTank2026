@@ -427,7 +427,7 @@ export class CampaignRoom extends Room<CampaignState> {
   private wardenMineTimerMs = 0;
 
   /** Anti-stuck: per-enemy timers tracking positional stalls. */
-  private readonly stuckTimers = new Map<string, { prevX: number; prevY: number; stuckMs: number; forcedMs: number; forceAngle: number }>();
+  private readonly stuckTimers = new Map<string, { prevX: number; prevY: number; stuckMs: number }>();
 
   /** ms accumulated toward the next Logic Core mortar launch. */
   private coreMortarTimerMs = 0;
@@ -851,12 +851,9 @@ export class CampaignRoom extends Room<CampaignState> {
       // Bosses, Trappers and Jammers ignore flow-field steering (bosses move on
       // their own; Trappers and Jammers wander). Everyone else — Aegis units and
       // Mimics (disguised ones creep, revealed ones hunt) included — routes
-      // toward the player. Enemies in forced anti-stuck movement skip the field.
-      fieldFor: (tank) => {
-        const stuck = this.stuckTimers.get(tank.ownerId);
-        if (stuck && stuck.forcedMs > 0) return null;
-        return this.usesHunterField(tank) && this.hunterField.isPopulated ? this.hunterField : null;
-      },
+      // toward the player.
+      fieldFor: (tank) =>
+        this.usesHunterField(tank) && this.hunterField.isPopulated ? this.hunterField : null,
       // Rushers, every boss, Trappers, Jammers and disguised Mimics never fire.
       canShoot: (tank) =>
         tank.variant !== KAMIKAZE &&
@@ -2639,13 +2636,12 @@ export class CampaignRoom extends Room<CampaignState> {
   }
 
   /**
-   * Detects enemies stalled for over 1 second and nudges them perpendicular to
-   * the player direction — a brief sidestep that slips them around the cluster
-   * without sending them wandering away from their target.
+   * Detects enemies stalled for over 1.5 seconds due to other tanks blocking
+   * them, and applies a one-time half-tile nudge perpendicular to their current
+   * facing to slip them past the jam. Only triggers when another hull is
+   * directly ahead — wall stalls are left to the flow field.
    */
   private tickAntiStuck(deltaMs: number): void {
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-
     for (let i = 0; i < this.state.tanks.length; i++) {
       const tank = this.state.tanks.at(i);
       if (!tank.isEnemy || tank.isBoss) continue;
@@ -2653,24 +2649,8 @@ export class CampaignRoom extends Room<CampaignState> {
 
       let entry = this.stuckTimers.get(tank.ownerId);
       if (!entry) {
-        entry = { prevX: tank.x, prevY: tank.y, stuckMs: 0, forcedMs: 0, forceAngle: 0 };
+        entry = { prevX: tank.x, prevY: tank.y, stuckMs: 0 };
         this.stuckTimers.set(tank.ownerId, entry);
-      }
-
-      if (entry.forcedMs > 0) {
-        entry.forcedMs -= deltaMs;
-        const dt = deltaMs / 1000;
-        const speed = tank.speed * (1000 / TICK_MS);
-        const vx = Math.cos(entry.forceAngle) * speed;
-        const vy = Math.sin(entry.forceAngle) * speed;
-        const nextX = tank.x + vx * dt;
-        const nextY = tank.y + vy * dt;
-        if (!isBlocked(this.state, nextX, tank.y, tank.width, tank.height)) tank.x = nextX;
-        if (!isBlocked(this.state, tank.x, nextY, tank.width, tank.height)) tank.y = nextY;
-        entry.prevX = tank.x;
-        entry.prevY = tank.y;
-        if (entry.forcedMs <= 0) entry.stuckMs = 0;
-        continue;
       }
 
       const dx = Math.abs(tank.x - entry.prevX);
@@ -2683,20 +2663,34 @@ export class CampaignRoom extends Room<CampaignState> {
       entry.prevX = tank.x;
       entry.prevY = tank.y;
 
-      if (entry.stuckMs > 1000) {
-        entry.forcedMs = 500;
-        if (player) {
-          const toPlayerAngle = Math.atan2(
-            player.y + player.height / 2 - (tank.y + tank.height / 2),
-            player.x + player.width / 2 - (tank.x + tank.width / 2),
-          );
-          // Perpendicular sidestep: ±90° from the player direction, randomly left or right.
-          const side = Math.random() < 0.5 ? Math.PI / 2 : -Math.PI / 2;
-          entry.forceAngle = toPlayerAngle + side;
+      if (entry.stuckMs > 1500 && this.tankBlockingAhead(tank)) {
+        const heading = DIRECTION_VECTORS[tank.direction];
+        // Perpendicular to current facing: try both sides, pick whichever is clear.
+        const perpX = -heading.y;
+        const perpY = heading.x;
+        const nudge = TILE_SIZE * 0.6;
+
+        const tryNudge = (sx: number, sy: number): boolean => {
+          const nx = tank.x + sx * nudge;
+          const ny = tank.y + sy * nudge;
+          if (!isBlocked(this.state, nx, ny, tank.width, tank.height)) {
+            tank.x = nx;
+            tank.y = ny;
+            return true;
+          }
+          return false;
+        };
+
+        // Pick a random side first, fall back to the other.
+        if (Math.random() < 0.5) {
+          if (!tryNudge(perpX, perpY)) tryNudge(-perpX, -perpY);
         } else {
-          entry.forceAngle = Math.random() * Math.PI * 2;
+          if (!tryNudge(-perpX, -perpY)) tryNudge(perpX, perpY);
         }
+
         entry.stuckMs = 0;
+        entry.prevX = tank.x;
+        entry.prevY = tank.y;
       }
     }
   }
