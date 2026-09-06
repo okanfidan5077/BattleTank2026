@@ -16,6 +16,13 @@ import {
   MoveDirection,
   PLAYER_SHOOT_COOLDOWN_MS,
   PLAYER_TOP_BOUNDARY_Y,
+  BLAST_UNLOCK_LEVEL,
+  DECOY_UNLOCK_LEVEL,
+  NULLIFIER_RADIUS_TILES,
+  RAM_UNLOCK_LEVEL,
+  SHIELD_UNLOCK_LEVEL,
+  TELEPORT_MAX_CHARGES,
+  TELEPORT_UNLOCK_LEVEL,
   ServerMessage,
   TICK_MS,
   TILE_SIZE,
@@ -26,7 +33,14 @@ import {
   type BoonCollectedMessage,
   type BossBounceMessage,
   type MatchStatsMessage,
+  type BlastChangedMessage,
+  type DecoyChangedMessage,
+  type GrappleHitMessage,
+  type RamChangedMessage,
+  type MineDetonatedMessage,
   type MortarWarningMessage,
+  type ShieldChangedMessage,
+  type TeleportChangedMessage,
   type MatchStatsRow,
   type MoveMessage,
   type SteelHitMessage,
@@ -179,6 +193,44 @@ export class GameScene extends Phaser.Scene {
   /** DOM bestiary sidebar, built once for campaign runs. */
   private bestiaryEl?: HTMLDivElement;
 
+  /** Toggle button for the bestiary sidebar. */
+  private bestiaryToggleEl?: HTMLDivElement;
+
+  /** In-game menu button to return to lobby. */
+  private menuBtnEl?: HTMLButtonElement;
+
+  /** Deflector-shield status readout, shown from SHIELD_UNLOCK_LEVEL on. */
+  private shieldHudEl?: HTMLDivElement;
+
+  /** Interval driving the shield HUD's countdown text. */
+  private shieldHudTimer?: number;
+
+  /** Ring drawn around the player's tank while the shield is up. */
+  private shieldAura?: Phaser.GameObjects.Arc;
+
+  /** Blink-charge readout, shown from TELEPORT_UNLOCK_LEVEL on. */
+  private teleportHudEl?: HTMLDivElement;
+
+  /** Blink charges banked, mirrored from the server for the readout. */
+  private teleportCharges = TELEPORT_MAX_CHARGES;
+
+  /** Wall-clock ms at which the next blink charge returns; 0 when full. */
+  private teleportReadyAt = 0;
+
+  /** Blast readout, shown from BLAST_UNLOCK_LEVEL on. */
+  private blastHudEl?: HTMLDivElement;
+
+  /** Wall-clock ms at which the blast comes off cooldown; 0 when ready. */
+  private blastReadyAt = 0;
+
+  /** Ram and decoy readouts, shown from their unlock levels on. */
+  private ramHudEl?: HTMLDivElement;
+  private decoyHudEl?: HTMLDivElement;
+
+  /** Wall-clock ms at which each comes off cooldown; 0 when ready. */
+  private ramReadyAt = 0;
+  private decoyReadyAt = 0;
+
   /** Timer for the upgrade-notification fade-out. */
   private upgradeNotifyTimer?: number;
 
@@ -255,6 +307,9 @@ export class GameScene extends Phaser.Scene {
 
   /** Cyan aura circles drawn around Aegis miniboss tanks. */
   private aegisAuras = new Map<TankView, Phaser.GameObjects.Graphics>();
+
+  /** Armour/weak-point markers drawn over each Bastion. */
+  private bastionPlates = new Map<TankView, Phaser.GameObjects.Graphics>();
 
   private cursors?: Phaser.Types.Input.Keyboard.CursorKeys;
   private wasd?: Record<"W" | "A" | "S" | "D", Phaser.Input.Keyboard.Key>;
@@ -540,6 +595,8 @@ export class GameScene extends Phaser.Scene {
       this.attach();
     }
 
+    this.buildMenuButton();
+
     // The room outlives this scene, so every listener bound to it must come off
     // the moment the scene stops or is destroyed — otherwise a late network
     // packet fires a callback that touches freed Phaser objects and crashes.
@@ -575,6 +632,22 @@ export class GameScene extends Phaser.Scene {
     document.querySelector(".upgrade-notification")?.remove();
     this.bestiaryEl?.remove();
     this.bestiaryEl = undefined;
+    this.bestiaryToggleEl?.remove();
+    this.bestiaryToggleEl = undefined;
+    this.menuBtnEl?.remove();
+    this.menuBtnEl = undefined;
+    window.clearInterval(this.shieldHudTimer);
+    this.shieldHudTimer = undefined;
+    this.shieldHudEl?.remove();
+    this.shieldHudEl = undefined;
+    this.teleportHudEl?.remove();
+    this.teleportHudEl = undefined;
+    this.blastHudEl?.remove();
+    this.blastHudEl = undefined;
+    this.ramHudEl?.remove();
+    this.ramHudEl = undefined;
+    this.decoyHudEl?.remove();
+    this.decoyHudEl = undefined;
 
     // Release the audio handle; browsers cap how many contexts can be open.
     void this.audioCtx?.close().catch(() => {});
@@ -1131,6 +1204,65 @@ export class GameScene extends Phaser.Scene {
     this.input.keyboard?.on("keydown-G", cheatWin);
     this.roomCleanups.push(() => this.input.keyboard?.off("keydown-G", cheatWin));
 
+    // SHIFT raises the deflector shield (unlocked from SHIELD_UNLOCK_LEVEL).
+    const raiseShield = () => room.send(CampaignMessage.ActivateShield);
+    this.input.keyboard?.on("keydown-SHIFT", raiseShield);
+    this.roomCleanups.push(() => this.input.keyboard?.off("keydown-SHIFT", raiseShield));
+
+    // Q blinks forward (unlocked from TELEPORT_UNLOCK_LEVEL).
+    const blink = () => room.send(CampaignMessage.Teleport);
+    this.input.keyboard?.on("keydown-Q", blink);
+    this.roomCleanups.push(() => this.input.keyboard?.off("keydown-Q", blink));
+
+    this.buildShieldHud();
+
+    const onShield = (msg: ShieldChangedMessage) => this.onShieldChanged(msg);
+    room.onMessage(ServerMessage.ShieldChanged, onShield);
+
+    const onTeleport = (msg: TeleportChangedMessage) => this.onTeleportChanged(msg);
+    room.onMessage(ServerMessage.TeleportChanged, onTeleport);
+
+    // E detonates the close-in blast (unlocked from BLAST_UNLOCK_LEVEL).
+    const blast = () => room.send(CampaignMessage.Blast);
+    this.input.keyboard?.on("keydown-E", blast);
+    this.roomCleanups.push(() => this.input.keyboard?.off("keydown-E", blast));
+
+    const onBlast = (msg: BlastChangedMessage) => this.onBlastChanged(msg);
+    room.onMessage(ServerMessage.BlastChanged, onBlast);
+
+    // R surges forward; F drops a decoy beacon.
+    const ram = () => room.send(CampaignMessage.Ram);
+    this.input.keyboard?.on("keydown-R", ram);
+    this.roomCleanups.push(() => this.input.keyboard?.off("keydown-R", ram));
+
+    const decoy = () => room.send(CampaignMessage.Decoy);
+    this.input.keyboard?.on("keydown-F", decoy);
+    this.roomCleanups.push(() => this.input.keyboard?.off("keydown-F", decoy));
+
+    room.onMessage(ServerMessage.RamChanged, (msg: RamChangedMessage) => {
+      if (this.isDead) return;
+      this.ramReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+      if (msg.active) {
+        this.cameras.main.shake(160, 0.006);
+        this.tone({ type: "sawtooth", startHz: 140, endHz: 420, duration: 0.28, volume: 0.15 });
+      }
+      this.refreshRamHud();
+    });
+
+    room.onMessage(ServerMessage.DecoyChanged, (msg: DecoyChangedMessage) => {
+      if (this.isDead) return;
+      this.decoyReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+      if (msg.x !== undefined && msg.y !== undefined) {
+        this.spawnDecoyBeacon(msg.x, msg.y, msg.durationMs ?? 6000);
+        this.tone({ type: "triangle", startHz: 600, endHz: 900, duration: 0.2, volume: 0.1 });
+      }
+      this.refreshDecoyHud();
+    });
+
+    room.onMessage(ServerMessage.GrappleHit, (msg: GrappleHitMessage) => {
+      this.spawnGrappleTether(msg);
+    });
+
     const onError = (code: number, message?: string) => {
       this.status.setText(`connection error ${code}: ${message ?? ""}`).setColor("#e0483a");
       console.error("[client] campaign room error", code, message);
@@ -1309,6 +1441,395 @@ export class GameScene extends Phaser.Scene {
     }, 4000);
   }
 
+  /**
+   * Builds the deflector-shield readout and starts its countdown ticker.
+   *
+   * The element is only shown once the campaign reaches the unlock level, so
+   * earlier levels are not cluttered with a control the player does not have.
+   */
+  private buildShieldHud(): void {
+    if (this.shieldHudEl) return;
+
+    const el = document.createElement("div");
+    el.className = "shield-hud";
+    el.hidden = true;
+    document.body.appendChild(el);
+    this.shieldHudEl = el;
+
+    const tp = document.createElement("div");
+    tp.className = "teleport-hud";
+    tp.hidden = true;
+    document.body.appendChild(tp);
+    this.teleportHudEl = tp;
+
+    const bl = document.createElement("div");
+    bl.className = "blast-hud";
+    bl.hidden = true;
+    document.body.appendChild(bl);
+    this.blastHudEl = bl;
+
+    const rm = document.createElement("div");
+    rm.className = "ram-hud";
+    rm.hidden = true;
+    document.body.appendChild(rm);
+    this.ramHudEl = rm;
+
+    const dc = document.createElement("div");
+    dc.className = "decoy-hud";
+    dc.hidden = true;
+    document.body.appendChild(dc);
+    this.decoyHudEl = dc;
+
+    // Driven on a timer rather than per-frame: the text only changes by whole
+    // tenths, and this keeps it off the render path.
+    this.shieldHudTimer = window.setInterval(() => {
+      this.refreshShieldHud();
+      this.refreshTeleportHud();
+      this.refreshBlastHud();
+      this.refreshRamHud();
+      this.refreshDecoyHud();
+    }, 100);
+    this.roomCleanups.push(() => window.clearInterval(this.shieldHudTimer));
+
+    this.refreshShieldHud();
+    this.refreshTeleportHud();
+    this.refreshBlastHud();
+    this.refreshRamHud();
+    this.refreshDecoyHud();
+  }
+
+  /**
+   * True when a live Nullifier is close enough to have switched the kit off.
+   *
+   * Computed here from the replicated tank positions rather than published by
+   * the server — the radius is a shared constant, so both ends agree without an
+   * extra field on the wire.
+   */
+  private abilitiesSuppressed(): boolean {
+    const player = this.findLocalTank();
+    if (!player) return false;
+
+    const room = this.room ?? this.campaignRoom;
+    if (!room) return false;
+
+    const px = player.x + player.width / 2;
+    const py = player.y + player.height / 2;
+    const radius = NULLIFIER_RADIUS_TILES * TILE_SIZE;
+
+    return room.state.tanks.some((tank: TankView) => {
+      if (tank.variant !== "nullifier") return false;
+      const dx = tank.x + tank.width / 2 - px;
+      const dy = tank.y + tank.height / 2 - py;
+      return Math.hypot(dx, dy) <= radius;
+    });
+  }
+
+  /** Repaints the ram readout. */
+  private refreshRamHud(): void {
+    const el = this.ramHudEl;
+    if (!el || this.isDead) return;
+
+    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    if (level < RAM_UNLOCK_LEVEL) {
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+
+    if (this.abilitiesSuppressed()) {
+      el.className = "ram-hud ability-suppressed";
+      el.textContent = "RAM JAMMED";
+      return;
+    }
+
+    const now = Date.now();
+    if (this.ramReadyAt > now) {
+      el.className = "ram-hud ram-cooling";
+      el.textContent = `RAM ${Math.ceil((this.ramReadyAt - now) / 1000)}s`;
+    } else {
+      el.className = "ram-hud ram-ready";
+      el.textContent = "RAM READY [R]";
+    }
+  }
+
+  /** Repaints the decoy readout. */
+  private refreshDecoyHud(): void {
+    const el = this.decoyHudEl;
+    if (!el || this.isDead) return;
+
+    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    if (level < DECOY_UNLOCK_LEVEL) {
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+
+    if (this.abilitiesSuppressed()) {
+      el.className = "decoy-hud ability-suppressed";
+      el.textContent = "DECOY JAMMED";
+      return;
+    }
+
+    const now = Date.now();
+    if (this.decoyReadyAt > now) {
+      el.className = "decoy-hud decoy-cooling";
+      el.textContent = `DECOY ${Math.ceil((this.decoyReadyAt - now) / 1000)}s`;
+    } else {
+      el.className = "decoy-hud decoy-ready";
+      el.textContent = "DECOY READY [F]";
+    }
+  }
+
+  /** A pulsing beacon marking where enemy attention has been pulled to. */
+  private spawnDecoyBeacon(x: number, y: number, durationMs: number): void {
+    if (this.isDead) return;
+
+    const beacon = this.add.graphics().setDepth(5);
+    beacon.fillStyle(0x35e0a1, 0.30).fillCircle(0, 0, TILE_SIZE * 1.4);
+    beacon.lineStyle(3, 0x7dffcf, 0.95).strokeCircle(0, 0, TILE_SIZE * 1.4);
+    beacon.fillStyle(0xbfffe8, 0.95).fillCircle(0, 0, TILE_SIZE * 0.3);
+    beacon.setPosition(x, y);
+    this.world.add(beacon);
+
+    this.tweens.add({ targets: beacon, alpha: 0.45, duration: 320, yoyo: true, repeat: -1 });
+    this.time.delayedCall(durationMs, () => {
+      if (!this.isLive(beacon)) return;
+      this.tweens.killTweensOf(beacon);
+      beacon.destroy();
+    });
+  }
+
+  /** The Lurcher's grapple line, snapping taut as it reels the player in. */
+  private spawnGrappleTether(msg: GrappleHitMessage): void {
+    if (this.isDead) return;
+
+    const line = this.add.graphics().setDepth(5);
+    line.lineStyle(3, 0xff5c8a, 0.95);
+    line.lineBetween(msg.fromX, msg.fromY, msg.toX, msg.toY);
+    this.world.add(line);
+
+    this.tweens.add({
+      targets: line,
+      alpha: 0,
+      duration: 380,
+      onComplete: () => line.destroy(),
+    });
+
+    this.cameras.main.shake(140, 0.005);
+    this.tone({ type: "sawtooth", startHz: 420, endHz: 140, duration: 0.22, volume: 0.13 });
+  }
+
+  /** Repaints the blast readout: ready, or counting down. */
+  private refreshBlastHud(): void {
+    const el = this.blastHudEl;
+    if (!el || this.isDead) return;
+
+    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    if (level < BLAST_UNLOCK_LEVEL) {
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+
+    const now = Date.now();
+    if (this.blastReadyAt > now) {
+      el.className = "blast-hud blast-cooling";
+      el.textContent = `BLAST ${Math.ceil((this.blastReadyAt - now) / 1000)}s`;
+    } else {
+      el.className = "blast-hud blast-ready";
+      el.textContent = "BLAST READY [E]";
+    }
+  }
+
+  /** Applies a blast state change, firing the shockwave on an actual blast. */
+  private onBlastChanged(msg: BlastChangedMessage): void {
+    if (this.isDead) return;
+
+    this.blastReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+
+    if (msg.x !== undefined && msg.y !== undefined) {
+      this.spawnBlastWave(msg.x, msg.y, msg.radius ?? TILE_SIZE * 6, msg.brickRadius);
+      this.cameras.main.shake(220, 0.010);
+      this.tone({ type: "square", startHz: 320, endHz: 40, duration: 0.42, volume: 0.18 });
+    }
+
+    this.refreshBlastHud();
+  }
+
+  /**
+   * An expanding shockwave marking exactly what the blast reached.
+   *
+   * Two rings, because the blast now has two radii: the outer one is everything
+   * it killed, the inner, hotter one is the smaller area where terrain actually
+   * broke. Drawing only the outer would imply the whole circle was demolished.
+   */
+  private spawnBlastWave(x: number, y: number, radius: number, brickRadius?: number): void {
+    if (this.isDead) return;
+
+    // Drawn at full radius and scaled up from nothing, so the ring the player
+    // sees at its peak is precisely the area the server cleared.
+    const wave = this.add.graphics().setDepth(7);
+    wave.fillStyle(0xffd23f, 0.18).fillCircle(0, 0, radius);
+    wave.lineStyle(4, 0xfff3b0, 0.95).strokeCircle(0, 0, radius);
+    if (brickRadius !== undefined && brickRadius < radius) {
+      wave.fillStyle(0xff8a00, 0.28).fillCircle(0, 0, brickRadius);
+      wave.lineStyle(3, 0xffb347, 0.9).strokeCircle(0, 0, brickRadius);
+    }
+    wave.setPosition(x, y).setScale(0.1);
+    this.world.add(wave);
+
+    this.tweens.add({
+      targets: wave,
+      scale: 1,
+      alpha: 0,
+      duration: 420,
+      ease: "Cubic.Out",
+      onComplete: () => wave.destroy(),
+    });
+  }
+
+  /** Repaints the blink readout: charges banked, and the recharge countdown. */
+  private refreshTeleportHud(): void {
+    const el = this.teleportHudEl;
+    if (!el || this.isDead) return;
+
+    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    if (level < TELEPORT_UNLOCK_LEVEL) {
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+
+    const pips = "●".repeat(this.teleportCharges) + "○".repeat(
+      Math.max(0, TELEPORT_MAX_CHARGES - this.teleportCharges),
+    );
+
+    const now = Date.now();
+    if (this.teleportCharges > 0) {
+      el.className = "teleport-hud teleport-ready";
+      el.textContent = `BLINK ${pips} [Q]`;
+    } else {
+      el.className = "teleport-hud teleport-empty";
+      const left = this.teleportReadyAt > now ? Math.ceil((this.teleportReadyAt - now) / 1000) : 0;
+      el.textContent = `BLINK ${pips} ${left}s`;
+    }
+  }
+
+  /** Applies a blink state change from the server, animating an actual jump. */
+  private onTeleportChanged(msg: TeleportChangedMessage): void {
+    if (this.isDead) return;
+
+    this.teleportCharges = msg.charges;
+    this.teleportReadyAt = msg.rechargeMs > 0 ? Date.now() + msg.rechargeMs : 0;
+
+    if (msg.fromX !== undefined && msg.toX !== undefined) {
+      this.spawnBlinkEffect(msg.fromX, msg.fromY ?? 0, msg.toX, msg.toY ?? 0);
+      this.tone({ type: "square", startHz: 900, endHz: 300, duration: 0.16, volume: 0.1 });
+    }
+
+    this.refreshTeleportHud();
+  }
+
+  /**
+   * Draws the blink: a fading ghost at the departure point and a streak along
+   * the path, so the jump reads as movement rather than a snap.
+   */
+  private spawnBlinkEffect(fromX: number, fromY: number, toX: number, toY: number): void {
+    if (this.isDead) return;
+
+    const half = TILE_SIZE / 2;
+
+    const ghost = this.add.graphics().setDepth(5);
+    ghost.fillStyle(0x9a7bff, 0.55).fillRect(fromX, fromY, TILE_SIZE, TILE_SIZE);
+    this.world.add(ghost);
+    this.tweens.add({
+      targets: ghost,
+      alpha: 0,
+      duration: 320,
+      onComplete: () => ghost.destroy(),
+    });
+
+    const streak = this.add.graphics().setDepth(5);
+    streak.lineStyle(6, 0xc4b0ff, 0.7);
+    streak.lineBetween(fromX + half, fromY + half, toX + half, toY + half);
+    this.world.add(streak);
+    this.tweens.add({
+      targets: streak,
+      alpha: 0,
+      duration: 260,
+      onComplete: () => streak.destroy(),
+    });
+  }
+
+  /** Repaints the shield readout from the replicated state and local timers. */
+  private refreshShieldHud(): void {
+    const el = this.shieldHudEl;
+    if (!el || this.isDead) return;
+
+    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    if (level < SHIELD_UNLOCK_LEVEL) {
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+
+    const now = Date.now();
+    if (this.shieldActiveUntil > now) {
+      const left = ((this.shieldActiveUntil - now) / 1000).toFixed(1);
+      el.className = "shield-hud shield-active";
+      el.textContent = `SHIELD UP ${left}s`;
+    } else if (this.shieldReadyAt > now) {
+      const left = Math.ceil((this.shieldReadyAt - now) / 1000);
+      el.className = "shield-hud shield-cooling";
+      el.textContent = `SHIELD ${left}s`;
+    } else {
+      el.className = "shield-hud shield-ready";
+      el.textContent = "SHIELD READY [SHIFT]";
+    }
+  }
+
+  /** Tracks shield windows locally so the HUD can count down between packets. */
+  private shieldActiveUntil = 0;
+  private shieldReadyAt = 0;
+
+  /** Applies a shield state change from the server. */
+  private onShieldChanged(msg: ShieldChangedMessage): void {
+    if (this.isDead) return;
+
+    const now = Date.now();
+    if (msg.active) {
+      this.shieldActiveUntil = now + (msg.durationMs ?? 0);
+      this.shieldReadyAt = 0;
+      // Rising chime as it comes up.
+      this.tone({ type: "sine", startHz: 440, endHz: 880, duration: 0.22 });
+    } else if (msg.ready) {
+      this.shieldActiveUntil = 0;
+      this.shieldReadyAt = 0;
+      this.tone({ type: "sine", startHz: 880, duration: 0.09, volume: 0.08 });
+    } else {
+      this.shieldActiveUntil = 0;
+      this.shieldReadyAt = now + (msg.cooldownMs ?? 0);
+    }
+
+    this.refreshShieldHud();
+  }
+
+  private buildMenuButton(): void {
+    const btn = document.createElement("button");
+    btn.className = "menu-btn";
+    btn.type = "button";
+    btn.textContent = "MENU";
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      btn.textContent = "...";
+      const room = this.room ?? this.campaignRoom;
+      if (!room) { window.location.reload(); return; }
+      void leaveRoom(room).finally(() => window.location.reload());
+    });
+    document.body.appendChild(btn);
+    this.menuBtnEl = btn;
+  }
+
   private buildBestiary(): void {
     if (this.bestiaryEl) return;
 
@@ -1321,10 +1842,13 @@ export class GameScene extends Phaser.Scene {
       { name: "Jammer", color: "#00008b", desc: "Halves your fire rate" },
       { name: "Mimic", color: "#ffd700", desc: "Disguises as Intel" },
       { name: "Ghost", color: "#cccccc", desc: "Cloaked until firing" },
+      { name: "Sapper", color: "#ff8a00", desc: "Shells you over walls" },
+      { name: "Lurcher", color: "#ff5c8a", desc: "Grapples and drags you in" },
+      { name: "Nullifier", color: "#6f7d8c", desc: "Jams your abilities nearby" },
     ];
 
     const panel = document.createElement("div");
-    panel.className = "bestiary-panel";
+    panel.className = "bestiary-panel bestiary-collapsed";
 
     const title = document.createElement("div");
     title.className = "bestiary-title";
@@ -1358,6 +1882,16 @@ export class GameScene extends Phaser.Scene {
 
     document.body.appendChild(panel);
     this.bestiaryEl = panel;
+
+    const toggle = document.createElement("div");
+    toggle.className = "bestiary-toggle";
+    toggle.textContent = "?";
+    toggle.addEventListener("click", () => {
+      panel.classList.toggle("bestiary-collapsed");
+      toggle.textContent = panel.classList.contains("bestiary-collapsed") ? "?" : "X";
+    });
+    document.body.appendChild(toggle);
+    this.bestiaryToggleEl = toggle;
   }
 
   /**
@@ -1513,6 +2047,20 @@ export class GameScene extends Phaser.Scene {
           // Scaled up to its hitbox (1.5x a tile) and painted siege-orange.
           sprite.setScale(tank.width / TILE_SIZE);
           sprite.setTint(0xffa500);
+        } else if (tank.variant === "bastion") {
+          // Gunmetal, with a plating marker drawn across its armoured face so
+          // the player can read which side is safe to shoot at a glance.
+          sprite.setScale(tank.width / TILE_SIZE);
+          sprite.setTint(0x8a94a6);
+          this.createBastionPlate(tank);
+        } else if (tank.variant === "hydra") {
+          // Sickly green, and scaled to whichever tier this fragment is.
+          sprite.setScale(tank.width / TILE_SIZE);
+          sprite.setTint(0x66cc44);
+        } else if (tank.variant === "architect") {
+          // Cold violet. Pulses while sealed so its invulnerability is legible.
+          sprite.setScale(tank.width / TILE_SIZE);
+          sprite.setTint(0x9a7bff);
         } else if (tank.variant === "juggernaut") {
           // Massive crimson siege boss — scaled up to fill its 2-tile hull.
           sprite.setScale(2.0);
@@ -1532,6 +2080,29 @@ export class GameScene extends Phaser.Scene {
           // Cyan shield unit; its protective aura is drawn separately.
           sprite.setTint(0x00ffff);
           this.createAegisAura(tank);
+        } else if (tank.variant === "sapper") {
+          // Orange standoff siege unit — matches its lob telegraph.
+          sprite.setTint(0xff8a00);
+        } else if (tank.variant === "lurcher") {
+          // Hot pink grappler — matches the colour of its tether.
+          sprite.setTint(0xff5c8a);
+        } else if (tank.variant === "nullifier") {
+          // Muted slate, with a bubble drawn separately showing its reach.
+          sprite.setTint(0x6f7d8c);
+          this.createNullifierField(tank);
+        } else if (tank.variant === "effigy") {
+          // The mirror boss. Player-sized, so colour is the only thing marking
+          // it out — bright magenta, plus a pulse, so it never reads as an add.
+          sprite.setTint(0xff33cc);
+          this.time.addEvent({
+            delay: 90,
+            loop: true,
+            callback: () => {
+              if (!this.isLive(sprite)) return;
+              const hot = Math.floor(Date.now() / 180) % 2 === 0;
+              sprite.setTint(hot ? 0xff33cc : 0xffffff);
+            },
+          });
         } else if (tank.variant === "jammer") {
           // Dark-blue electronic-warfare unit.
           sprite.setTint(0x00008b);
@@ -1598,6 +2169,8 @@ export class GameScene extends Phaser.Scene {
       this.labels.delete(tank);
       this.aegisAuras.get(tank)?.destroy();
       this.aegisAuras.delete(tank);
+      this.bastionPlates.get(tank)?.destroy();
+      this.bastionPlates.delete(tank);
     }));
 
     // Identity lives on the player record, so watch that for name/colour.
@@ -1652,6 +2225,12 @@ export class GameScene extends Phaser.Scene {
       }),
     );
 
+    this.roomCleanups.push(
+      room.onMessage(ServerMessage.MineDetonated, (message: MineDetonatedMessage) => {
+        this.spawnMineBlast(message);
+      }),
+    );
+
     // The campaign boss rebounding off a wall throws a heavy jolt through the
     // camera, to sell its weight. The Juggernaut's frequent block-crushes send
     // `subtle` — a barely-there rumble instead, so grinding the maze open does
@@ -1677,10 +2256,16 @@ export class GameScene extends Phaser.Scene {
   private showMortarWarning(message: MortarWarningMessage): void {
     if (this.isDead) return;
 
-    const radius = 1.5 * TILE_SIZE;
+    // Sapper lobs carry their own, tighter radius; the artillery boss's mortars
+    // omit it and keep the original 1.5-tile circle.
+    const radius = message.radius ?? 1.5 * TILE_SIZE;
+    const small = message.radius !== undefined;
+    const fill = small ? 0xff8a00 : 0xff0000;
+    const line = small ? 0xffaa33 : 0xff2020;
+
     const circle = this.add.graphics().setDepth(3);
-    circle.fillStyle(0xff0000, 0.25).fillCircle(message.x, message.y, radius);
-    circle.lineStyle(2, 0xff2020, 0.9).strokeCircle(message.x, message.y, radius);
+    circle.fillStyle(fill, 0.25).fillCircle(message.x, message.y, radius);
+    circle.lineStyle(2, line, 0.9).strokeCircle(message.x, message.y, radius);
     this.world.add(circle);
 
     // Pulse the alpha so it reads as an active, incoming threat.
@@ -1693,7 +2278,7 @@ export class GameScene extends Phaser.Scene {
         this.tweens.killTweensOf(circle);
         circle.destroy();
       }
-      this.spawnMortarBlast(message.x, message.y);
+      this.spawnMortarBlast(message.x, message.y, small ? 0.6 : 1);
     });
   }
 
@@ -1701,19 +2286,57 @@ export class GameScene extends Phaser.Scene {
    * A violent mortar blast at the impact point: a bright orange/yellow disc that
    * snaps outward and fades over ~300ms, so the hit lands hard visually.
    */
-  private spawnMortarBlast(x: number, y: number): void {
+  /**
+   * A mine going off underfoot.
+   *
+   * An absorbed blast is drawn in the shield's own cyan and kept small, so it
+   * reads as the shield eating the hit rather than as a near miss.
+   */
+  private spawnMineBlast(message: MineDetonatedMessage): void {
+    if (this.isDead) return;
+
+    const { x, y, absorbed } = message;
+
+    const blast = this.add.graphics().setDepth(6);
+    if (absorbed) {
+      blast.fillStyle(0x66ddff, 0.7).fillCircle(0, 0, TILE_SIZE * 1.1);
+      blast.fillStyle(0xccf6ff, 0.9).fillCircle(0, 0, TILE_SIZE * 0.55);
+    } else {
+      blast.fillStyle(0xff8a00, 0.85).fillCircle(0, 0, TILE_SIZE * 1.3);
+      blast.fillStyle(0xffe14a, 0.95).fillCircle(0, 0, TILE_SIZE * 0.75);
+    }
+    blast.setPosition(x, y).setScale(0.3);
+    this.world.add(blast);
+
+    this.tweens.add({
+      targets: blast,
+      scale: absorbed ? 1.0 : 1.5,
+      alpha: 0,
+      duration: absorbed ? 260 : 320,
+      ease: "Cubic.Out",
+      onComplete: () => blast.destroy(),
+    });
+
+    this.tone(
+      absorbed
+        ? { type: "sine", startHz: 520, endHz: 720, duration: 0.12, volume: 0.09 }
+        : { type: "square", startHz: 180, endHz: 60, duration: 0.3, volume: 0.16 },
+    );
+  }
+
+  private spawnMortarBlast(x: number, y: number, scale = 1): void {
     if (this.isDead) return;
 
     const blast = this.add.graphics().setDepth(6);
     // Layered fireball — a yellow-hot core inside an orange shell.
     blast.fillStyle(0xff8a00, 0.85).fillCircle(0, 0, TILE_SIZE * 1.5);
     blast.fillStyle(0xffe14a, 0.95).fillCircle(0, 0, TILE_SIZE * 0.9);
-    blast.setPosition(x, y).setScale(0.3);
+    blast.setPosition(x, y).setScale(0.3 * scale);
     this.world.add(blast);
 
     this.tweens.add({
       targets: blast,
-      scale: 1.6,
+      scale: 1.6 * scale,
       alpha: 0,
       duration: 300,
       ease: "Cubic.Out",
@@ -1842,6 +2465,50 @@ export class GameScene extends Phaser.Scene {
 
       aura.setPosition(sprite.x, sprite.y);
     }
+
+    this.syncShieldAura();
+    this.syncBastionPlates();
+  }
+
+  /** This client's own tank in the replicated state, if it is currently alive. */
+  private findLocalTank(): TankView | undefined {
+    const room = this.room ?? this.campaignRoom;
+    if (!room) return undefined;
+    return room.state.tanks.find(
+      (tank: TankView) => !tank.isEnemy && tank.ownerId === room.sessionId,
+    );
+  }
+
+  /**
+   * Draws a ring around the local player while their deflector is up.
+   *
+   * Created on demand and destroyed the moment the shield drops, so there is
+   * nothing to keep in step when the ability is idle.
+   */
+  private syncShieldAura(): void {
+    const player = this.findLocalTank();
+    const up = player?.isShielded === true;
+
+    if (!up) {
+      if (this.shieldAura) {
+        this.shieldAura.destroy();
+        this.shieldAura = undefined;
+      }
+      return;
+    }
+
+    const sprite = player ? this.tankSprites.get(player) : undefined;
+    if (!sprite || !this.isLive(sprite)) return;
+
+    if (!this.shieldAura || !this.isLive(this.shieldAura)) {
+      this.shieldAura = this.add.circle(0, 0, TILE_SIZE * 0.95, 0x66ddff, 0.16).setDepth(3);
+      this.shieldAura.setStrokeStyle(2, 0x99eeff, 0.9);
+      this.world.add(this.shieldAura);
+    }
+
+    // Gentle pulse so it reads as an active field rather than a static decal.
+    const pulse = 0.9 + Math.sin(Date.now() / 120) * 0.08;
+    this.shieldAura.setPosition(sprite.x, sprite.y).setScale(pulse);
   }
 
   /**
@@ -1887,6 +2554,77 @@ export class GameScene extends Phaser.Scene {
   }
 
   /** Draws a faint cyan aura circle (3-tile radius) around an Aegis unit. */
+  /**
+   * Registers a Bastion's armour marker. The drawing itself happens in
+   * {@link syncBastionPlates}, which re-runs as the hull swings around.
+   */
+  private createBastionPlate(tank: TankView): void {
+    const plate = this.add.graphics().setDepth(4);
+    this.world.add(plate);
+    this.bastionPlates.set(tank, plate);
+  }
+
+  /**
+   * Redraws every Bastion's plating: a heavy slab across the armoured face and
+   * a bright bar over the exposed rear.
+   *
+   * The rear marker is the important half — it tells the player exactly where
+   * the shot has to come from, which is the entire puzzle of the encounter.
+   */
+  private syncBastionPlates(): void {
+    for (const [tank, plate] of this.bastionPlates) {
+      const sprite = this.tankSprites.get(tank);
+      if (!sprite || !this.isLive(sprite) || !this.isLive(plate)) continue;
+
+      // Facing unit vector, and the axis across it.
+      const fx = tank.direction === Direction.Left ? -1 : tank.direction === Direction.Right ? 1 : 0;
+      const fy = tank.direction === Direction.Up ? -1 : tank.direction === Direction.Down ? 1 : 0;
+      const ax = fy;
+      const ay = fx;
+
+      const half = tank.width / 2;
+      const span = half * 0.85;
+      const cx = sprite.x;
+      const cy = sprite.y;
+
+      plate.clear();
+
+      // Armoured face.
+      plate.lineStyle(5, 0x3d4655, 0.95);
+      plate.lineBetween(
+        cx + fx * half - ax * span,
+        cy + fy * half - ay * span,
+        cx + fx * half + ax * span,
+        cy + fy * half + ay * span,
+      );
+
+      // Exposed rear — shoot here.
+      plate.lineStyle(4, 0xffd23f, 0.95);
+      plate.lineBetween(
+        cx - fx * half - ax * span,
+        cy - fy * half - ay * span,
+        cx - fx * half + ax * span,
+        cy - fy * half + ay * span,
+      );
+    }
+  }
+
+  /**
+   * The Nullifier's suppression bubble.
+   *
+   * Drawn at the shared radius so the player can see exactly where their kit
+   * stops working, rather than discovering it by pressing a dead key.
+   */
+  private createNullifierField(tank: TankView): void {
+    const radius = NULLIFIER_RADIUS_TILES * TILE_SIZE;
+    const aura = this.add.graphics().setDepth(2);
+    aura.fillStyle(0x6f7d8c, 0.10).fillCircle(0, 0, radius);
+    aura.lineStyle(2, 0x9fb0c2, 0.45).strokeCircle(0, 0, radius);
+    aura.setPosition(tank.x + tank.width / 2, tank.y + tank.height / 2);
+    this.world.add(aura);
+    this.aegisAuras.set(tank, aura);
+  }
+
   private createAegisAura(tank: TankView): void {
     const radius = 3 * TILE_SIZE;
     const aura = this.add.graphics().setDepth(2);

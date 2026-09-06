@@ -27,6 +27,20 @@ export const ServerMessage = {
   BossBounce: "boss_bounce",
   /** An artillery mortar is inbound — drives the telegraph circle before impact. */
   MortarWarning: "mortar_warning",
+  /** The player's deflector shield was raised, dropped, or came off cooldown. */
+  ShieldChanged: "shield_changed",
+  /** The player blinked, or a blink charge finished recharging. */
+  TeleportChanged: "teleport_changed",
+  /** A mine went off under the player — drives the blast effect. */
+  MineDetonated: "mine_detonated",
+  /** The player's close-in blast fired, or came off cooldown. */
+  BlastChanged: "blast_changed",
+  /** The ram surge started, ended, or came off cooldown. */
+  RamChanged: "ram_changed",
+  /** A decoy beacon was dropped, expired, or the ability came off cooldown. */
+  DecoyChanged: "decoy_changed",
+  /** A Lurcher's grapple connected — drives the tether effect and the yank. */
+  GrappleHit: "grapple_hit",
 } as const;
 export type ServerMessage = (typeof ServerMessage)[keyof typeof ServerMessage];
 
@@ -98,6 +112,94 @@ export interface MortarWarningMessage {
   y: number;
   /** Milliseconds until detonation — how long to show the telegraph. */
   delay: number;
+  /**
+   * Blast radius in world units. Omitted for the artillery boss's own mortars,
+   * which keep the original 1.5-tile telegraph; Sapper lobs pass a tighter one
+   * so the two threats stay tellable apart at a glance.
+   */
+  radius?: number;
+}
+
+/** Broadcast when the player's deflector shield changes state. */
+export interface ShieldChangedMessage {
+  /** True when the shield has just gone up, false when it dropped. */
+  active: boolean;
+  /** How long the shield will hold, in ms. Present when `active`. */
+  durationMs?: number;
+  /** How long until it can be raised again, in ms. Present when it dropped. */
+  cooldownMs?: number;
+  /** True on the message announcing the cooldown has finished. */
+  ready?: boolean;
+}
+
+/** Broadcast when a mine detonates under the player. */
+export interface MineDetonatedMessage {
+  /** Blast centre, in world units. */
+  x: number;
+  y: number;
+  /**
+   * True when a raised shield soaked the blast and the player walked away.
+   * The client plays a cooler, smaller burst for these.
+   */
+  absorbed: boolean;
+}
+
+/** Broadcast when the player's blast fires, or when it comes off cooldown. */
+export interface BlastChangedMessage {
+  /** ms until it can be fired again; 0 when ready. */
+  cooldownMs: number;
+  /** Blast centre, in world units — present only on an actual detonation. */
+  x?: number;
+  y?: number;
+  /** Blast kill radius, in world units. Present alongside the centre. */
+  radius?: number;
+  /**
+   * The smaller radius within which terrain actually broke, in world units.
+   * Drawn as an inner ring so the two areas are tellable apart.
+   */
+  brickRadius?: number;
+}
+
+/** Broadcast when the ram surge fires, ends, or comes off cooldown. */
+export interface RamChangedMessage {
+  /** True while the surge is running. */
+  active: boolean;
+  /** ms until it can be fired again; 0 when ready. */
+  cooldownMs: number;
+}
+
+/** Broadcast when a decoy beacon is dropped, expires, or comes off cooldown. */
+export interface DecoyChangedMessage {
+  /** ms until another beacon can be dropped; 0 when ready. */
+  cooldownMs: number;
+  /** Beacon position in world units, present while one is standing. */
+  x?: number;
+  y?: number;
+  /** ms the beacon will hold attention for. Present alongside the position. */
+  durationMs?: number;
+}
+
+/** Broadcast when a Lurcher's grapple lands on the player. */
+export interface GrappleHitMessage {
+  /** The Lurcher's muzzle, in world units. */
+  fromX: number;
+  fromY: number;
+  /** Where the player was yanked to, in world units. */
+  toX: number;
+  toY: number;
+}
+
+/** Broadcast when the player blinks, or when a blink charge returns. */
+export interface TeleportChangedMessage {
+  /** Charges banked after this change. */
+  charges: number;
+  /** ms until the next charge returns; 0 when the bank is full. */
+  rechargeMs: number;
+  /** The jump itself, in world units — present only on an actual blink. */
+  fromX?: number;
+  fromY?: number;
+  toX?: number;
+  toY?: number;
 }
 
 /** Lifecycle of a match, replicated on GameState.matchState. */

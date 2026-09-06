@@ -43,6 +43,8 @@ export interface TankView extends EntityView {
   isDisguised: boolean;
   /** True for a Ghost that is currently cloaked (near-invisible). */
   isCloaked: boolean;
+  /** True while the player's deflector shield is up — the client rings the hull. */
+  isShielded: boolean;
 }
 
 export interface BulletView extends EntityView {

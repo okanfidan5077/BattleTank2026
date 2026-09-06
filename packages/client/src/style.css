@@ -394,7 +394,7 @@ body {
 
 .bestiary-panel {
   position: fixed;
-  top: 70px;
+  top: 106px;
   right: 8px;
   z-index: 12;
   width: 200px;
@@ -443,4 +443,224 @@ body {
   font-size: 10px;
   color: var(--muted);
   line-height: 1.3;
+}
+
+.bestiary-panel.bestiary-collapsed {
+  display: none;
+}
+
+.bestiary-toggle {
+  position: fixed;
+  top: 70px;
+  right: 8px;
+  z-index: 13;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: rgb(11 13 16 / 88%);
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.bestiary-toggle:hover {
+  color: #f7f3e8;
+  border-color: #f7f3e8;
+}
+
+/* ------------------------------------------------------------- menu button */
+
+.menu-btn {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 20;
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgb(20 24 30 / 92%);
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  cursor: pointer;
+}
+
+.menu-btn:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.menu-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ------------------------------------------------------------- shield readout */
+
+.shield-hud {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  z-index: 14;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgb(11 13 16 / 90%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.shield-hud[hidden] {
+  display: none;
+}
+
+.shield-hud.shield-ready {
+  border-color: #2f6f8f;
+  color: #7fd4ff;
+}
+
+.shield-hud.shield-active {
+  border-color: #99eeff;
+  background: rgb(20 60 80 / 92%);
+  color: #ccf6ff;
+  text-shadow: 0 0 10px rgb(120 220 255 / 70%);
+}
+
+.shield-hud.shield-cooling {
+  border-color: var(--line);
+  color: #6b7785;
+}
+
+/* ------------------------------------------------------------ blink readout */
+
+.teleport-hud {
+  position: fixed;
+  bottom: 52px;
+  left: 16px;
+  z-index: 14;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgb(11 13 16 / 90%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.teleport-hud[hidden] {
+  display: none;
+}
+
+.teleport-hud.teleport-ready {
+  border-color: #6a4fbf;
+  color: #c4b0ff;
+}
+
+.teleport-hud.teleport-empty {
+  border-color: var(--line);
+  color: #6b7785;
+}
+
+/* ------------------------------------------------------------ blast readout */
+
+.blast-hud {
+  position: fixed;
+  bottom: 88px;
+  left: 16px;
+  z-index: 14;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgb(11 13 16 / 90%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.blast-hud[hidden] {
+  display: none;
+}
+
+.blast-hud.blast-ready {
+  border-color: #a8862a;
+  color: #ffd23f;
+}
+
+.blast-hud.blast-cooling {
+  border-color: var(--line);
+  color: #6b7785;
+}
+
+/* ------------------------------------------------ ram & decoy readouts */
+
+.ram-hud,
+.decoy-hud {
+  position: fixed;
+  left: 16px;
+  z-index: 14;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgb(11 13 16 / 90%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.ram-hud {
+  bottom: 124px;
+}
+
+.decoy-hud {
+  bottom: 160px;
+}
+
+.ram-hud[hidden],
+.decoy-hud[hidden] {
+  display: none;
+}
+
+.ram-hud.ram-ready {
+  border-color: #a8492a;
+  color: #ff9a76;
+}
+
+.decoy-hud.decoy-ready {
+  border-color: #2a8f6a;
+  color: #7dffcf;
+}
+
+.ram-hud.ram-cooling,
+.decoy-hud.decoy-cooling {
+  border-color: var(--line);
+  color: #6b7785;
+}
+
+/* A Nullifier is in range: the ability is switched off, not merely cooling. */
+.ability-suppressed {
+  border-color: #7a3b52 !important;
+  color: #ff6b8a !important;
+  text-decoration: line-through;
 }

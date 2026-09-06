@@ -26,6 +26,8 @@ export interface TankInit extends EntityInit {
   isDisguised?: boolean;
   /** True for a Ghost that is currently cloaked (near-invisible); defaults to false. */
   isCloaked?: boolean;
+  /** True while the player's deflector shield is up; defaults to false. */
+  isShielded?: boolean;
 }
 
 /** A player- or AI-controlled tank. */
@@ -66,6 +68,13 @@ export class Tank extends Entity<TankInit> {
    * When the Ghost fires, the server uncloaks it for a brief window.
    */
   @type("boolean") isCloaked: boolean = false;
+
+  /**
+   * The player's deflector shield is raised: shells, mines and blasts are turned
+   * away. Deliberately *not* proof against a boss hull — see
+   * `CampaignRoom.resolveSweeperContact`. The client rings a shielded tank.
+   */
+  @type("boolean") isShielded: boolean = false;
 
   constructor(init?: TankInit) {
     super();

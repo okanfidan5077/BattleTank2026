@@ -4,6 +4,9 @@ import {
   DIRECTION_VECTORS,
   ENEMY_BRICK_FIRE_CHANCE,
   ENEMY_CHAOS_CHANCE,
+  ENEMY_PREDICTIVE_FIRE_CHANCE,
+  ENEMY_PREDICT_TICKS,
+  ENEMY_PREDICT_TOLERANCE,
   ENEMY_SIGHT_RANGE_TILES,
 } from "../gameplay.js";
 import { type GameState, type Tank, isInsideGrid, tileIndex } from "../schema/index.js";
@@ -70,6 +73,69 @@ export function castForward(
   }
 
   return "none";
+}
+
+/**
+ * Whether the firing axis is clear of walls out to `distance`.
+ *
+ * Sampled at the same quarter-tile granularity as {@link castForward}, so a
+ * 32px wall can never be stepped over.
+ */
+function axisClear(state: GameState, originX: number, originY: number, tank: Tank, distance: number): boolean {
+  const heading = DIRECTION_VECTORS[tank.direction];
+
+  for (let travelled = tank.width / 2; travelled < distance; travelled += RAY_STEP) {
+    const x = originX + heading.x * travelled;
+    const y = originY + heading.y * travelled;
+    if (x < 0 || y < 0 || x >= WORLD_WIDTH || y >= WORLD_HEIGHT) return false;
+
+    const tile = state.grid.at(tileIndex(Math.floor(x / TILE_SIZE), Math.floor(y / TILE_SIZE)));
+    if (tile === TileType.Brick || tile === TileType.Steel) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Whether a player is about to cross this tank's line of fire.
+ *
+ * Projects each player forward along their current heading and asks whether
+ * that predicted point sits on the tank's firing axis, within range and behind
+ * no wall — so an enemy shoots at where the player is *going*, not only at
+ * where they already are. Without this, moving is a near-perfect defence: the
+ * shot only ever leaves once the player is centred, by which time they have
+ * gone.
+ */
+export function predictsPlayerCrossing(
+  state: GameState,
+  tank: Tank,
+  rangeTiles: number = ENEMY_SIGHT_RANGE_TILES,
+): boolean {
+  const heading = DIRECTION_VECTORS[tank.direction];
+  const originX = tank.x + tank.width / 2;
+  const originY = tank.y + tank.height / 2;
+  const maxDistance = rangeTiles * TILE_SIZE;
+
+  for (let i = 0; i < state.tanks.length; i++) {
+    const player = state.tanks.at(i);
+    if (player.isEnemy) continue;
+
+    const lead = DIRECTION_VECTORS[player.direction];
+    const px = player.x + player.width / 2 + lead.x * player.speed * ENEMY_PREDICT_TICKS;
+    const py = player.y + player.height / 2 + lead.y * player.speed * ENEMY_PREDICT_TICKS;
+
+    // Distance along the firing axis; behind the muzzle does not count.
+    const along = (px - originX) * heading.x + (py - originY) * heading.y;
+    if (along <= 0 || along > maxDistance) continue;
+
+    // Distance off the axis.
+    const perp = Math.abs((px - originX) * -heading.y + (py - originY) * heading.x);
+    if (perp > ENEMY_PREDICT_TOLERANCE) continue;
+
+    if (axisClear(state, originX, originY, tank, along)) return true;
+  }
+
+  return false;
 }
 
 /** Hooks the room provides so the AI can route, ask about, and take shots. */
@@ -209,6 +275,14 @@ export function updateEnemies(state: GameState, ctx: EnemyContext): void {
         break;
 
       default:
+        // Nothing in the sights right now — but the player may be about to run
+        // into them. Lead the shot rather than waiting to be walked past.
+        if (
+          random() < ENEMY_PREDICTIVE_FIRE_CHANCE &&
+          predictsPlayerCrossing(state, tank)
+        ) {
+          ctx.shoot(tank);
+        }
         break;
     }
   }

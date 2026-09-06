@@ -168,10 +168,31 @@ export const ENEMY_PLAYER_HUNTER_SHARE = 0.4;
 export const HUNTER_FIELD_REBUILD_TICKS = 10;
 
 /** How far ahead an enemy looks when deciding whether to fire, in tiles. */
-export const ENEMY_SIGHT_RANGE_TILES = 15;
+export const ENEMY_SIGHT_RANGE_TILES = 30;
 
 /** Chance an enemy shoots a brick further down its line of sight. */
 export const ENEMY_BRICK_FIRE_CHANCE = 0.25;
+
+/**
+ * How far ahead an enemy leads a moving player, in ticks.
+ *
+ * Enemies that only fire when the player is already dead in their sights are
+ * trivially dodged by never standing still — every shot arrives where the
+ * player just was. Leading the target makes crossing a firing line dangerous,
+ * which is the whole point of a firing line.
+ */
+export const ENEMY_PREDICT_TICKS = 12;
+
+/** How far off the firing axis a predicted position may sit, in pixels. */
+export const ENEMY_PREDICT_TOLERANCE = TILE_SIZE * 0.6;
+
+/**
+ * Chance an enemy takes a predicted shot on a given opportunity.
+ *
+ * Below 1 on purpose: enemies that always led perfectly would be sniper-precise
+ * and read as unfair, where an occasional anticipated shot reads as competent.
+ */
+export const ENEMY_PREDICTIVE_FIRE_CHANCE = 0.45;
 
 /**
  * Chance an enemy ignores the flow field on a fresh decision and instead strikes

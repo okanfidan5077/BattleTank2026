@@ -75,16 +75,23 @@ function resolveTileCollision(
           break;
 
         case TileType.Radar:
-          // A campaign jamming tower: one shell levels it, like brick.
-          state.grid[index] = TileType.Empty;
-          destroyed.radars++;
+          // A campaign jamming tower. Only the player levels it: these are the
+          // player's objectives, and enemy shells flying loose across the map
+          // would otherwise demolish them and win the level unaided. An enemy
+          // shell is still stopped, so the tower doubles as cover.
+          if (!bullet.isEnemy) {
+            state.grid[index] = TileType.Empty;
+            destroyed.radars++;
+          }
           consumed = true;
           break;
 
         case TileType.Factory:
-          // A campaign factory: one shell levels it, like brick.
-          state.grid[index] = TileType.Empty;
-          destroyed.factories++;
+          // A campaign factory: player-only, for the same reason as Radar.
+          if (!bullet.isEnemy) {
+            state.grid[index] = TileType.Empty;
+            destroyed.factories++;
+          }
           consumed = true;
           break;
 
