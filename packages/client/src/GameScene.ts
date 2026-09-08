@@ -16,6 +16,7 @@ import {
   MatchStatus,
   MoveDirection,
   PLAYER_SHOOT_COOLDOWN_MS,
+  campaignShootCooldownMs,
   PLAYER_TOP_BOUNDARY_Y,
   BLAST_UNLOCK_LEVEL,
   DECOY_UNLOCK_LEVEL,
@@ -191,6 +192,19 @@ export class GameScene extends Phaser.Scene {
 
   /** Armed 1/2/3 hotkeys for the current upgrade hand, if any. */
   private upgradeKeyHandler?: (event: KeyboardEvent) => void;
+
+  /**
+   * Upgrade stacks this player owns, mirrored from the server's offers.
+   *
+   * The client needs them for the two readouts that are computed rather than
+   * pushed: its own reload (Autoloader) and the blink ceiling (Phase
+   * Capacitor). Refreshed with every offer, including the empty one that
+   * follows a pick.
+   */
+  private ownedUpgrades: Record<string, number> = {};
+
+  /** The id taken from the current hand, so the row can show what was picked. */
+  private pickedUpgradeId: string | null = null;
 
   /** Pending typewriter tick, so a phase change can cancel a half-typed line. */
   private typewriterTimer?: number;
@@ -1286,7 +1300,11 @@ export class GameScene extends Phaser.Scene {
 
     room.onMessage(ServerMessage.RamChanged, (msg: RamChangedMessage) => {
       if (this.isDead) return;
-      this.ramReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+      // A surge somebody else is running — the mirror boss's — is drawn and
+      // heard, but never written into this player's own cooldown.
+      if (!msg.foreign) {
+        this.ramReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+      }
       if (msg.active) {
         this.cameras.main.shake(160, 0.006);
         this.tone({ type: "sawtooth", startHz: 140, endHz: 420, duration: 0.28, volume: 0.15 });
@@ -1422,14 +1440,35 @@ export class GameScene extends Phaser.Scene {
     const cards = this.campaignCardsEl;
     if (!cards || this.isDead) return;
 
-    cards.replaceChildren();
-    this.upgradeKeyHandler = undefined;
+    this.ownedUpgrades = msg.owned;
 
+    if (this.upgradeKeyHandler) {
+      window.removeEventListener("keydown", this.upgradeKeyHandler);
+      this.upgradeKeyHandler = undefined;
+    }
+
+    // An empty hand means the pick has been spent (or there was nothing left to
+    // offer). Rather than blanking the row — which left the player unsure which
+    // card, if any, had actually been taken — name the one they chose.
     if (msg.ids.length === 0) {
-      cards.hidden = true;
+      cards.replaceChildren();
+
+      const picked = this.pickedUpgradeId ? findUpgrade(this.pickedUpgradeId) : undefined;
+      if (!picked) {
+        cards.hidden = true;
+        return;
+      }
+
+      const taken = document.createElement("div");
+      taken.className = "upgrade-taken";
+      taken.textContent = `ACQUIRED: ${picked.name} — ${picked.detail}`;
+      cards.appendChild(taken);
+      cards.hidden = false;
       return;
     }
 
+    cards.replaceChildren();
+    this.pickedUpgradeId = null;
     cards.hidden = false;
 
     msg.ids.forEach((id, index) => {
@@ -1439,6 +1478,7 @@ export class GameScene extends Phaser.Scene {
       const card = document.createElement("button");
       card.className = "upgrade-card";
       card.type = "button";
+      card.dataset.upgradeId = id;
 
       const owned = msg.owned[id] ?? 0;
       card.innerHTML =
@@ -1472,8 +1512,21 @@ export class GameScene extends Phaser.Scene {
   private pickUpgrade(id: string): void {
     const room = this.campaignRoom;
     if (!room) return;
+    if (this.pickedUpgradeId) return; // one card per hand
 
+    this.pickedUpgradeId = id;
     room.send(CampaignMessage.ChooseUpgrade, { id });
+
+    // Mark the choice immediately rather than waiting on the round trip: the
+    // three cards are otherwise identical the instant after a click, and only
+    // one of them was taken.
+    const cards = this.campaignCardsEl;
+    if (cards) {
+      for (const card of cards.querySelectorAll<HTMLButtonElement>(".upgrade-card")) {
+        card.disabled = true;
+        card.classList.add(card.dataset.upgradeId === id ? "picked" : "passed");
+      }
+    }
 
     if (this.upgradeKeyHandler) {
       window.removeEventListener("keydown", this.upgradeKeyHandler);
@@ -1776,6 +1829,12 @@ export class GameScene extends Phaser.Scene {
     }
     el.hidden = false;
 
+    if (this.abilitiesSuppressed()) {
+      el.className = "blast-hud ability-suppressed";
+      el.textContent = "BLAST JAMMED";
+      return;
+    }
+
     const now = Date.now();
     if (this.blastReadyAt > now) {
       el.className = "blast-hud blast-cooling";
@@ -1790,7 +1849,11 @@ export class GameScene extends Phaser.Scene {
   private onBlastChanged(msg: BlastChangedMessage): void {
     if (this.isDead) return;
 
-    this.blastReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+    // Only this player's own blast moves this player's cooldown; the mirror
+    // boss's copy of the ability is drawn and nothing more.
+    if (!msg.foreign) {
+      this.blastReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+    }
 
     if (msg.x !== undefined && msg.y !== undefined) {
       this.spawnBlastWave(msg.x, msg.y, msg.radius ?? TILE_SIZE * 6, msg.brickRadius);
@@ -1845,8 +1908,20 @@ export class GameScene extends Phaser.Scene {
     }
     el.hidden = false;
 
+    if (this.abilitiesSuppressed()) {
+      el.className = "teleport-hud ability-suppressed";
+      el.textContent = "BLINK JAMMED";
+      return;
+    }
+
+    // The ceiling rises with each Phase Capacitor, so the empty pips have to
+    // be counted against that rather than against the base two.
+    const cap = Math.max(
+      TELEPORT_MAX_CHARGES + (this.ownedUpgrades.blink ?? 0),
+      this.teleportCharges,
+    );
     const pips = "●".repeat(this.teleportCharges) + "○".repeat(
-      Math.max(0, TELEPORT_MAX_CHARGES - this.teleportCharges),
+      Math.max(0, cap - this.teleportCharges),
     );
 
     const now = Date.now();
@@ -1864,8 +1939,12 @@ export class GameScene extends Phaser.Scene {
   private onTeleportChanged(msg: TeleportChangedMessage): void {
     if (this.isDead) return;
 
-    this.teleportCharges = msg.charges;
-    this.teleportReadyAt = msg.rechargeMs > 0 ? Date.now() + msg.rechargeMs : 0;
+    // Same rule as the blast: a blink the mirror boss took is an effect to
+    // draw, not a charge count to adopt.
+    if (!msg.foreign) {
+      this.teleportCharges = msg.charges;
+      this.teleportReadyAt = msg.rechargeMs > 0 ? Date.now() + msg.rechargeMs : 0;
+    }
 
     if (msg.fromX !== undefined && msg.toX !== undefined) {
       this.spawnBlinkEffect(msg.fromX, msg.fromY ?? 0, msg.toX, msg.toY ?? 0);
@@ -1917,6 +1996,14 @@ export class GameScene extends Phaser.Scene {
       return;
     }
     el.hidden = false;
+
+    // A shield already up is not stripped by a Nullifier — only reaching for a
+    // new one is refused — so the jam marker waits until it has dropped.
+    if (this.shieldActiveUntil <= Date.now() && this.abilitiesSuppressed()) {
+      el.className = "shield-hud ability-suppressed";
+      el.textContent = "SHIELD JAMMED";
+      return;
+    }
 
     const now = Date.now();
     if (this.shieldActiveUntil > now) {
@@ -2085,11 +2172,27 @@ export class GameScene extends Phaser.Scene {
       this.lastMoveSentAt = time;
     }
 
-    if (this.isShootDown() && time - this.lastShotAt >= SHOOT_INTERVAL_MS) {
+    if (this.isShootDown() && time - this.lastShotAt >= this.campaignShootInterval()) {
       room.send(ClientMessage.Shoot);
       this.soundFire();
       this.lastShotAt = time;
     }
+  }
+
+  /**
+   * This tank's current reload, in ms — the same figure the server enforces.
+   *
+   * Throttling on the flat base instead would quietly eat the shots an
+   * Autoloader stack (or the late-campaign refit) has earned, and throttling
+   * looser than the server would play a firing sound for shots it then refuses.
+   */
+  private campaignShootInterval(): number {
+    const state = this.campaignRoom?.state;
+    const level = state?.currentLevel ?? 1;
+    const jammed =
+      state?.tanks?.some((tank: TankView) => tank.isEnemy && tank.variant === "jammer") ?? false;
+
+    return campaignShootCooldownMs(level, this.ownedUpgrades.rate ?? 0, jammed);
   }
 
   /** Pulls the campaign HUD — level, enemies, the dynamic objective, and lives. */
@@ -2738,11 +2841,13 @@ export class GameScene extends Phaser.Scene {
   }
 
   /**
-   * Redraws every Bastion's plating: a heavy slab across the armoured face and
-   * a bright bar over the exposed rear.
+   * Redraws every Bastion's plating: a heavy slab across its armoured bow, and
+   * bright bars over the three faces that are not.
    *
-   * The rear marker is the important half — it tells the player exactly where
-   * the shot has to come from, which is the entire puzzle of the encounter.
+   * The bright markers are the important half — they tell the player exactly
+   * where a shot will land, which is the whole puzzle of the encounter. They
+   * cover both flanks as well as the stern because the plating is bow armour
+   * only: standing anywhere but in front of it is enough.
    */
   private syncBastionPlates(): void {
     for (const [tank, plate] of this.bastionPlates) {
@@ -2762,7 +2867,7 @@ export class GameScene extends Phaser.Scene {
 
       plate.clear();
 
-      // Armoured face.
+      // Armoured bow — shells bounce off this face and only this one.
       plate.lineStyle(5, 0x3d4655, 0.95);
       plate.lineBetween(
         cx + fx * half - ax * span,
@@ -2771,14 +2876,25 @@ export class GameScene extends Phaser.Scene {
         cy + fy * half + ay * span,
       );
 
-      // Exposed rear — shoot here.
+      // Exposed stern and both flanks — shoot any of these.
       plate.lineStyle(4, 0xffd23f, 0.95);
-      plate.lineBetween(
-        cx - fx * half - ax * span,
-        cy - fy * half - ay * span,
-        cx - fx * half + ax * span,
-        cy - fy * half + ay * span,
-      );
+      const faces: Array<[number, number]> = [
+        [-fx, -fy],
+        [ax, ay],
+        [-ax, -ay],
+      ];
+      for (const [nx, ny] of faces) {
+        // The span runs across whichever face this is: the axis perpendicular
+        // to its own outward normal.
+        const sx = ny;
+        const sy = nx;
+        plate.lineBetween(
+          cx + nx * half - sx * span,
+          cy + ny * half - sy * span,
+          cx + nx * half + sx * span,
+          cy + ny * half + sy * span,
+        );
+      }
     }
   }
 

@@ -16,6 +16,8 @@ import {
   BLAST_RADIUS_TILES,
   BLAST_UNLOCK_LEVEL,
   BOMB_DEFUSAL_DURATION_SECONDS,
+  JAMMER_COOLDOWN_MULTIPLIER,
+  campaignShootCooldownMs,
   DECOY_COOLDOWN_MS,
   DECOY_DURATION_MS,
   DECOY_UNLOCK_LEVEL,
@@ -143,15 +145,29 @@ const KAMIKAZE_CHANCE_BOSS = 0.35;
 /**
  * Kamikaze speed as a multiple of the player's base speed ({@link TANK_SPEED}),
  * so they are always faster than the player and force them to keep moving.
+ *
+ * Trimmed 20% from the original 2.0-2.5: still quicker than the player, but
+ * slow enough that a rusher spotted across the field can actually be shot or
+ * driven away from rather than simply landing on them.
  */
-const KAMIKAZE_SPEED_MIN = 2.0;
-const KAMIKAZE_SPEED_MAX = 2.5;
+const KAMIKAZE_SPEED_MIN = 1.6;
+const KAMIKAZE_SPEED_MAX = 2.0;
 
 /** The enemy `variant` string for the fast contact-detonating rushers. */
 const KAMIKAZE = "kamikaze";
 
 /** Slack, in px, for judging a kamikaze "in contact" with the player. */
 const KAMIKAZE_CONTACT_PADDING = 6;
+
+/**
+ * How far from every player a rusher must appear, in tiles.
+ *
+ * A kamikaze is meant to be a threat the player sees coming and answers. One
+ * released onto a spawn tile a few squares away is not a threat, it is a
+ * coin-flip — so a spawn inside this radius is refused and the release either
+ * moves to a farther tile or comes out as an ordinary tank.
+ */
+const KAMIKAZE_MIN_SPAWN_TILES = 10;
 
 /** The Level 5 boss hitbox, three tiles square — massive. */
 const SWEEPER_SIZE = TILE_SIZE * 3;
@@ -168,8 +184,17 @@ const SWEEPER_HOMING_CHANCE = 0.33;
 /** The enemy `variant` string for the Level 6 trench-laying miniboss. */
 const CONSTRUCTOR = "constructor";
 
-/** Chance a Level 6 spawn is a Constructor rather than a standard tank. */
-const CONSTRUCTOR_CHANCE = 0.35;
+/**
+ * Chance a Level 6 spawn is a Constructor rather than a standard tank.
+ *
+ * Low, and backed by {@link MAX_CONSTRUCTORS}: every Constructor permanently
+ * rewrites the map behind it, so a field with four or five of them turns the
+ * factory assault into a maze the player cannot shoot their way out of.
+ */
+const CONSTRUCTOR_CHANCE = 0.18;
+
+/** Constructors allowed on the field at once. */
+const MAX_CONSTRUCTORS = 2;
 
 /** A Constructor's hit points — tankier than the rank and file. */
 const CONSTRUCTOR_HP = 1;
@@ -215,7 +240,7 @@ const CONVOY_CONTACT_INTERVAL_MS = 500;
 const ARTILLERY = "artillery";
 
 /** The artillery boss's hit points. */
-const ARTILLERY_HP = 15;
+const ARTILLERY_HP = 12;
 
 /** The artillery boss hitbox, one and a half tiles square. */
 const ARTILLERY_SIZE = Math.round(TILE_SIZE * 1.5);
@@ -227,11 +252,22 @@ const ARTILLERY_SIZE = Math.round(TILE_SIZE * 1.5);
  */
 const ARTILLERY_SPEED = TANK_SPEED * (1000 / TICK_MS) * 0.5;
 
+/**
+ * How close the player must get, in tiles, before the artillery runs.
+ *
+ * It used to flee from any range at all, which meant a boss at half the
+ * player's speed still had the whole map to retreat across and the fight became
+ * a chase with no end to it. Beyond this it holds its ground and shells; inside
+ * it, it backs off — so closing the distance is still work, but work that
+ * finishes.
+ */
+const ARTILLERY_FLEE_TILES = 11;
+
 /** The (1-based) level whose boss is the Artillery rather than the Sweeper. */
 const ARTILLERY_BOSS_LEVEL = 10;
 
 /** How often the artillery launches a mortar strike, in ms. */
-const MORTAR_INTERVAL_MS = 3600;
+const MORTAR_INTERVAL_MS = 4200;
 
 /** How long a mortar is telegraphed before it detonates, in ms. */
 const MORTAR_DETONATION_MS = 2000;
@@ -256,9 +292,6 @@ const JAMMER_LEVEL = 12;
 
 /** Chance a Level 12 spawn is a Jammer. */
 const JAMMER_CHANCE = 0.35;
-
-/** Player fire-cooldown multiplier while any Jammer is on the field. */
-const JAMMER_COOLDOWN_MULTIPLIER = 2;
 
 /** The `variant` string for the Level 13 disguised-loot miniboss. */
 const MIMIC = "mimic";
@@ -475,8 +508,17 @@ const NULLIFIER = "nullifier";
 /** The (1-based) level that introduces Nullifiers. */
 const NULLIFIER_LEVEL = 17;
 
-/** Chance a spawn on {@link NULLIFIER_LEVEL} is a Nullifier. */
-const NULLIFIER_CHANCE = 0.3;
+/**
+ * Chance a spawn on {@link NULLIFIER_LEVEL} is a Nullifier.
+ *
+ * Halved from 0.3, and capped by {@link MAX_NULLIFIERS}: their bubbles overlap,
+ * so a handful of them do not stack into a harder fight — they simply switch
+ * the player's whole kit off for the length of the level.
+ */
+const NULLIFIER_CHANCE = 0.15;
+
+/** Nullifiers allowed on the field at once. */
+const MAX_NULLIFIERS = 2;
 
 /** A Nullifier's hit points. */
 const NULLIFIER_HP = 2;
@@ -523,6 +565,37 @@ const EFFIGY_BLAST_RADIUS_TILES = 3;
 /** Gap between the Effigy's shells, in ms. */
 const EFFIGY_SHOOT_INTERVAL_MS = 900;
 
+/** Gap between the Effigy's ram surges, in ms. */
+const EFFIGY_RAM_COOLDOWN_MS = 8000;
+
+/** How far down a lane the Effigy will start a charge, in tiles. */
+const EFFIGY_RAM_MIN_TILES = 3;
+const EFFIGY_RAM_MAX_TILES = 11;
+
+/** How far off a lane's centre line the player may be for a charge, in px. */
+const EFFIGY_RAM_ALIGN_SLACK = TILE_SIZE * 0.75;
+
+/** Gap between the Effigy's decoys, in ms. */
+const EFFIGY_DECOY_COOLDOWN_MS = 13_000;
+
+/** How long one of the Effigy's mirages stands before it fades, in ms. */
+const EFFIGY_DECOY_DURATION_MS = 6000;
+
+/** How close the player must be, in tiles, for a mirage to be worth dropping. */
+const EFFIGY_DECOY_TRIGGER_TILES = 10;
+
+/**
+ * How long the Effigy may sit in one tile before it is treated as wedged.
+ *
+ * Bosses are exempt from the general anti-stuck pass, and this one is steered
+ * by the flow field: anything that leaves it off the tile lattice — a blink or
+ * a charge that ended mid-tile, a traffic jitter — leaves it unable to ever
+ * turn again, so it drives into the nearest wall and stays there for the rest
+ * of the fight. Measured in tiles rather than pixels so a hull grinding back
+ * and forth against an obstacle still counts as stuck.
+ */
+const EFFIGY_STUCK_MS = 1500;
+
 // ------------------------------------------------------------------ bastion
 //
 // A boss that cannot be beaten by out-shooting it. Its frontal plating turns
@@ -536,7 +609,7 @@ const BASTION = "bastion";
 const BASTION_LEVEL = 12;
 
 /** The Bastion's hit points. Low, because landing a hit at all is the work. */
-const BASTION_HP = 12;
+const BASTION_HP = 16;
 
 /** The Bastion's hitbox, two tiles square. */
 const BASTION_SIZE = TILE_SIZE * 2;
@@ -550,7 +623,7 @@ const BASTION_SPEED = TANK_SPEED * (1000 / TICK_MS) * 0.35;
  * This is the whole encounter's tuning knob: it sets how long a window the
  * player has behind the plating after getting there.
  */
-const BASTION_TURN_INTERVAL_MS = 900;
+const BASTION_TURN_INTERVAL_MS = 1100;
 
 /** Gap between the Bastion's forward shells, in ms. */
 const BASTION_SHOOT_INTERVAL_MS = 1700;
@@ -583,6 +656,16 @@ const HYDRA_TIERS: readonly { size: number; health: number; speed: number }[] = 
 
 /** How far apart split children are nudged, in px, so they do not stack. */
 const HYDRA_SPLIT_SPREAD = TILE_SIZE;
+
+/**
+ * The size at or below which a Hydra fragment behaves like an ordinary tank.
+ *
+ * Anything larger drives itself (see {@link moveHydra}) and ploughs through
+ * whatever it meets. A multi-tile hull steered by the shared mover is refused
+ * every step that would touch another tank, so the old three-tile Hydra spent
+ * the fight wedged against its own escort instead of hunting the player.
+ */
+const HYDRA_CRUSHER_SIZE = TILE_SIZE;
 
 // ---------------------------------------------------------------- architect
 //
@@ -618,6 +701,19 @@ const ARCHITECT_RING_BASE_MS = 6000;
  * so it keeps steady pressure on while it works.
  */
 const ARCHITECT_LOB_INTERVAL_MS = 3400;
+
+/**
+ * The Architect's speed once its pylons are down, in px/s.
+ *
+ * It is stationary while it is sealed — it is building, not fighting — but a
+ * boss that never moves at all once it is exposed simply stands there being
+ * shot, which reads as broken rather than as beaten. Losing the pylons turns it
+ * into a slow, grinding hunter.
+ */
+const ARCHITECT_SPEED = TANK_SPEED * (1000 / TICK_MS) * 0.45;
+
+/** Lob interval multiplier once the Architect is exposed — twice the rate. */
+const ARCHITECT_ENRAGED_LOB_FACTOR = 0.5;
 
 /** How long the Architect telegraphs an incoming contraction, in ms. */
 const ARCHITECT_RING_WARNING_MS = 1500;
@@ -714,7 +810,13 @@ interface AbilityState {
   blinkLockMs: number;
 }
 
-/** A fresh, everything-ready ability loadout. */
+/**
+ * A fresh, everything-ready ability loadout.
+ *
+ * The blink bank starts at the *base* ceiling; {@link CampaignRoom.freshFor}
+ * tops it up to whatever Phase Capacitor stacks that seat has bought, which is
+ * the only place the upgrade is known.
+ */
 function freshAbilities(): AbilityState {
   return {
     shieldActiveMs: 0,
@@ -843,11 +945,21 @@ export class CampaignRoom extends Room<CampaignState> {
   /** ms remaining on the Effigy's own shield. */
   private effigyShieldMs = 0;
 
-  /** Cooldown timers for the Effigy's three borrowed abilities. */
+  /** Cooldown timers for the Effigy's borrowed abilities. */
   private effigyShieldCdMs = 0;
   private effigyBlinkCdMs = 0;
   private effigyBlastCdMs = 0;
   private effigyShootMs = 0;
+  private effigyRamCdMs = 0;
+  private effigyRamMs = 0;
+  private effigyRamDirection: Direction = Direction.Up;
+  private effigyDecoyCdMs = 0;
+
+  /** ownerId -> ms left before one of the Effigy's mirages fades. */
+  private readonly effigyMirages = new Map<string, number>();
+
+  /** Watchdog for a wedged Effigy: last tile it occupied, and for how long. */
+  private effigyStuck: { x: number; y: number; ms: number } | null = null;
 
   /** sessionId -> that player's ability cooldowns and live effects. */
   private readonly abilities = new Map<string, AbilityState>();
@@ -994,7 +1106,7 @@ export class CampaignRoom extends Room<CampaignState> {
       client.sessionId,
       new Player({ sessionId: client.sessionId, name, color, lives: this.state.lives, tier: 1 }),
     );
-    this.abilities.set(client.sessionId, freshAbilities());
+    this.abilities.set(client.sessionId, this.freshFor(client.sessionId));
 
     // First one in runs the room and gets the Start button.
     if (!this.state.hostId) this.state.hostId = client.sessionId;
@@ -1083,6 +1195,8 @@ export class CampaignRoom extends Room<CampaignState> {
     this.sapperLobTimers.clear();
     this.sapperLobs = [];
     this.lurcherTimers.clear();
+    this.effigyMirages.clear();
+    this.effigyStuck = null;
     this.coreMortarTimerMs = 0;
     this.resetShield();
     this.resetTeleport();
@@ -1326,6 +1440,62 @@ export class CampaignRoom extends Room<CampaignState> {
     }
   }
 
+  /**
+   * Drives every oversized Hydra body straight at the nearest player.
+   *
+   * The tiers above one tile are bosses in the literal sense: they are not
+   * steered by the flow field, they are not stopped by other hulls, and
+   * anything they roll over — brick, the escort of adds the level spawns, the
+   * player — is destroyed. Only the smallest tier is small enough to behave
+   * like an ordinary tank, and that one keeps the shared steering.
+   */
+  private moveHydra(deltaMs: number): void {
+    const dt = deltaMs / 1000;
+
+    for (let i = 0; i < this.state.tanks.length; i++) {
+      const body = this.state.tanks.at(i);
+      if (body.variant !== HYDRA || body.width <= HYDRA_CRUSHER_SIZE) continue;
+
+      const player = this.nearestPlayerTo(body);
+      if (player) {
+        const cx = body.x + body.width / 2;
+        const cy = body.y + body.height / 2;
+        const angle = Math.atan2(
+          player.y + player.height / 2 - cy,
+          player.x + player.width / 2 - cx,
+        );
+        // Tier speeds are px/tick, like every other tank's; the ballistic
+        // movers here work in px/s.
+        const speed = body.speed * (1000 / TICK_MS);
+
+        const nextX = body.x + Math.cos(angle) * speed * dt;
+        if (!this.sweeperHitsWall(nextX, body.y, body.width, body.height)) body.x = nextX;
+
+        const nextY = body.y + Math.sin(angle) * speed * dt;
+        if (!this.sweeperHitsWall(body.x, nextY, body.width, body.height)) body.y = nextY;
+
+        body.direction = this.angleToDirection(angle);
+      }
+
+      if (this.crushJuggernautTiles(body.x, body.y, body.width, body.height)) {
+        this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+        this.onSweeperBounce(body, true);
+      }
+      this.crushEnemies(body);
+
+      // A hull this size runs a player down the way every other boss does.
+      for (const target of this.playerTanks()) {
+        if (target.isInvulnerable) continue;
+        if (
+          boxesOverlap(body.x, body.y, body.width, body.height, target.x, target.y, target.width, target.height)
+        ) {
+          this.killPlayer(target.ownerId);
+        }
+      }
+      if (this.state.phase !== CampaignPhase.Playing) return;
+    }
+  }
+
   /** Spawns the Level 20 Architect dead centre, surrounded by its pylons. */
   private spawnArchitect(): void {
     const id = `boss-${this.enemySequence++}`;
@@ -1499,7 +1669,7 @@ export class CampaignRoom extends Room<CampaignState> {
       : PLAYER_INVULNERABILITY_MS;
     this.invulnerableUntilMs.set(ownerId, this.elapsedMs + invulnMs);
     this.respawnAtMs.delete(ownerId);
-    this.abilities.set(ownerId, freshAbilities());
+    this.abilities.set(ownerId, this.freshFor(ownerId));
 
     const player = this.state.players.get(ownerId);
     if (player) player.respawnInSeconds = 0;
@@ -1628,6 +1798,10 @@ export class CampaignRoom extends Room<CampaignState> {
 
     // The Juggernaut homes straight at the player, ploughing through the maze.
     this.moveJuggernaut(deltaMs);
+
+    // Every oversized Hydra body drives itself and crushes what it touches.
+    this.moveHydra(deltaMs);
+    if (this.state.phase !== CampaignPhase.Playing) return;
 
     // The artillery boss skulks away from the player, hiding behind cover.
     this.moveArtillery(deltaMs);
@@ -2123,6 +2297,10 @@ export class CampaignRoom extends Room<CampaignState> {
         const candX = player.x - ux * travelled;
         const candY = player.y - uy * travelled;
         if (isBlocked(this.state, candX, candY, player.width, player.height)) break;
+        // And stop short of any hull, the Lurcher's own included. Without this
+        // the yank drags the player into the grappler and the two end up
+        // overlapping, wedged on each other with neither able to move.
+        if (collidesWithTank(this.state, player, candX, candY)) break;
         toX = candX;
         toY = candY;
       }
@@ -2180,6 +2358,11 @@ export class CampaignRoom extends Room<CampaignState> {
     this.effigyBlinkCdMs = 0;
     this.effigyBlastCdMs = 0;
     this.effigyShootMs = 0;
+    this.effigyRamCdMs = 0;
+    this.effigyRamMs = 0;
+    this.effigyDecoyCdMs = 0;
+    this.effigyStuck = null;
+    this.effigyMirages.clear();
 
     this.state.tanks.push(
       new Tank({
@@ -2199,19 +2382,23 @@ export class CampaignRoom extends Room<CampaignState> {
   }
 
   /**
-   * Runs the Effigy's borrowed kit: shield, blink and blast, on their own
-   * cooldowns, used the way a competent player would use them.
+   * Runs the Effigy's borrowed kit — every ability the player has: shield,
+   * blink, blast, ram and decoy, each on its own cooldown and used the way a
+   * competent player would use them.
    *
-   * It shields when hurt, blinks away when the player crowds it, and blasts
-   * when they crowd it anyway. Movement is the ordinary hunter field, because
-   * the point of the fight is the abilities, not exotic pathing.
+   * It shields when hurt, charges down an open lane, blinks away when the
+   * player crowds it, blasts when they crowd it anyway, and leaves a copy of
+   * itself standing where it was so the next few shells go into nothing.
+   * Movement is otherwise the ordinary hunter field — the fight is about the
+   * kit, not exotic pathing — with a watchdog on top of it, because a boss the
+   * general anti-stuck pass deliberately skips has no other way out of a wall.
    */
   private updateEffigy(deltaMs: number): void {
+    this.tickEffigyMirages(deltaMs);
+
     if (!this.bossId) return;
     const boss = this.findTank(this.bossId);
     if (!boss || boss.variant !== EFFIGY) return;
-
-    const player = this.nearestPlayerTo(boss);
 
     // Its shield runs on the same shape of timer the player's does.
     if (this.effigyShieldMs > 0) {
@@ -2226,8 +2413,19 @@ export class CampaignRoom extends Room<CampaignState> {
 
     if (this.effigyBlinkCdMs > 0) this.effigyBlinkCdMs = Math.max(0, this.effigyBlinkCdMs - deltaMs);
     if (this.effigyBlastCdMs > 0) this.effigyBlastCdMs = Math.max(0, this.effigyBlastCdMs - deltaMs);
+    if (this.effigyRamCdMs > 0) this.effigyRamCdMs = Math.max(0, this.effigyRamCdMs - deltaMs);
+    if (this.effigyDecoyCdMs > 0) this.effigyDecoyCdMs = Math.max(0, this.effigyDecoyCdMs - deltaMs);
 
+    // A charge is committed: it runs to its end before anything else happens.
+    if (this.effigyRamMs > 0) {
+      this.driveEffigyRam(boss, deltaMs);
+      return;
+    }
+
+    const player = this.nearestPlayerTo(boss);
     if (!player) return;
+
+    this.watchEffigyStuck(boss, deltaMs);
 
     const dx = player.x + player.width / 2 - (boss.x + boss.width / 2);
     const dy = player.y + player.height / 2 - (boss.y + boss.height / 2);
@@ -2250,11 +2448,22 @@ export class CampaignRoom extends Room<CampaignState> {
       return;
     }
 
-    // Blinks away when crowded, to reopen the range it wants to shoot from.
+    // Blinks away when crowded, to reopen the range it wants to shoot from —
+    // and leaves a mirage behind on the way out whenever it has one banked.
     if (this.effigyBlinkCdMs === 0 && dist <= EFFIGY_BLAST_TRIGGER_TILES * TILE_SIZE * 1.6) {
       this.effigyBlinkCdMs = EFFIGY_BLINK_COOLDOWN_MS;
+      this.maybeDropEffigyMirage(boss, dist);
       this.effigyBlink(boss, dx, dy);
+      return;
     }
+
+    // Charges down an open lane at mid range: the player's own ram, aimed back
+    // at them, and lethal on contact for exactly as long as it is running.
+    if (this.effigyRamCdMs === 0 && this.startEffigyRam(boss, dx, dy)) return;
+
+    // Drops a mirage while the player is closing, so the shells they open with
+    // go into a copy rather than into the boss.
+    this.maybeDropEffigyMirage(boss, dist);
 
     // And shoots, briskly, the rest of the time.
     this.effigyShootMs += deltaMs;
@@ -2268,6 +2477,213 @@ export class CampaignRoom extends Room<CampaignState> {
       )) {
         this.fire(boss);
       }
+    }
+  }
+
+  /**
+   * Frees an Effigy that has stopped moving.
+   *
+   * It is steered by the flow field, and that steering only ever turns a tank
+   * standing exactly on the tile lattice. A blink that lands it half a tile off
+   * — which the ordinary mid-step blink does — therefore leaves it able to
+   * drive in one direction and never turn again: it runs to the nearest wall
+   * and sits there for the rest of the fight. Snapping it back onto the lattice
+   * is the fix; a forced step covers the case where it is genuinely boxed in.
+   */
+  private watchEffigyStuck(boss: Tank, deltaMs: number): void {
+    const tileX = Math.floor(boss.x / TILE_SIZE);
+    const tileY = Math.floor(boss.y / TILE_SIZE);
+
+    const previous = this.effigyStuck;
+    if (!previous) {
+      this.effigyStuck = { x: tileX, y: tileY, ms: 0 };
+      return;
+    }
+
+    if (tileX !== previous.x || tileY !== previous.y) {
+      previous.x = tileX;
+      previous.y = tileY;
+      previous.ms = 0;
+      return;
+    }
+
+    previous.ms += deltaMs;
+    if (previous.ms < EFFIGY_STUCK_MS) return;
+    previous.ms = 0;
+
+    const snapX = Math.round(boss.x / TILE_SIZE) * TILE_SIZE;
+    const snapY = Math.round(boss.y / TILE_SIZE) * TILE_SIZE;
+    if (
+      (snapX !== boss.x || snapY !== boss.y) &&
+      !isBlocked(this.state, snapX, snapY, boss.width, boss.height) &&
+      !collidesWithTank(this.state, boss, snapX, snapY)
+    ) {
+      boss.x = snapX;
+      boss.y = snapY;
+    }
+
+    // Still pinned: turn somewhere it can actually go and take the step itself.
+    const escape = this.randomPassableDir(boss, boss.direction);
+    if (escape === null) return;
+    boss.direction = escape;
+    moveTank(this.state, boss, false);
+
+    previous.x = Math.floor(boss.x / TILE_SIZE);
+    previous.y = Math.floor(boss.y / TILE_SIZE);
+  }
+
+  /**
+   * Starts a charge when the player is sitting in an open lane.
+   *
+   * Aligned and at range, in the same window the player's own ram is useful in:
+   * close enough to reach before they can walk out of it, far enough that it is
+   * a charge rather than a bump.
+   */
+  private startEffigyRam(boss: Tank, dx: number, dy: number): boolean {
+    const min = EFFIGY_RAM_MIN_TILES * TILE_SIZE;
+    const max = EFFIGY_RAM_MAX_TILES * TILE_SIZE;
+
+    let direction: Direction | null = null;
+    if (Math.abs(dy) <= EFFIGY_RAM_ALIGN_SLACK && Math.abs(dx) >= min && Math.abs(dx) <= max) {
+      direction = dx > 0 ? Direction.Right : Direction.Left;
+    } else if (Math.abs(dx) <= EFFIGY_RAM_ALIGN_SLACK && Math.abs(dy) >= min && Math.abs(dy) <= max) {
+      direction = dy > 0 ? Direction.Down : Direction.Up;
+    }
+    if (direction === null) return false;
+
+    this.effigyRamCdMs = EFFIGY_RAM_COOLDOWN_MS;
+    this.effigyRamMs = RAM_DURATION_MS;
+    this.effigyRamDirection = direction;
+    boss.direction = direction;
+
+    this.broadcast(ServerMessage.RamChanged, {
+      active: true,
+      cooldownMs: 0,
+      foreign: true,
+    } satisfies RamChangedMessage);
+    return true;
+  }
+
+  /**
+   * Advances a running charge: brick gives way, steel ends it, and a player
+   * caught by the hull is run down unless their deflector is up.
+   *
+   * The shield exception is the player's own rule played back at them — their
+   * ram turns a rusher only while the deflector holds — so the counter to the
+   * charge is the same one they have been using all campaign.
+   */
+  private driveEffigyRam(boss: Tank, deltaMs: number): void {
+    this.effigyRamMs = Math.max(0, this.effigyRamMs - deltaMs);
+
+    const heading = DIRECTION_VECTORS[this.effigyRamDirection];
+    const step = TANK_SPEED * RAM_SPEED_FACTOR;
+    const nextX = boss.x + heading.x * step;
+    const nextY = boss.y + heading.y * step;
+
+    boss.direction = this.effigyRamDirection;
+
+    if (isBlocked(this.state, nextX, nextY, boss.width, boss.height)) {
+      if (!this.ramThroughBrick(boss, nextX, nextY)) {
+        this.endEffigyRam(boss);
+        return;
+      }
+    }
+
+    boss.x = nextX;
+    boss.y = nextY;
+
+    for (const player of this.playerTanks()) {
+      if (player.isInvulnerable) continue;
+      if (
+        !boxesOverlap(boss.x, boss.y, boss.width, boss.height, player.x, player.y, player.width, player.height)
+      ) {
+        continue;
+      }
+
+      if (this.isShieldUp(player)) {
+        this.endEffigyRam(boss);
+        return;
+      }
+      this.killPlayer(player.ownerId);
+      this.endEffigyRam(boss);
+      return;
+    }
+
+    if (this.effigyRamMs === 0) this.endEffigyRam(boss);
+  }
+
+  /**
+   * Ends a charge, re-seats the hull on the tile lattice, and tells the clients
+   * to drop the surge effect.
+   *
+   * The re-seat is not cosmetic: a surge advances in steps that do not divide a
+   * tile, and a flow-field mover left mid-tile can never turn again.
+   */
+  private endEffigyRam(boss?: Tank): void {
+    if (boss) {
+      const snapX = Math.round(boss.x / TILE_SIZE) * TILE_SIZE;
+      const snapY = Math.round(boss.y / TILE_SIZE) * TILE_SIZE;
+      if (
+        !isBlocked(this.state, snapX, snapY, boss.width, boss.height) &&
+        !collidesWithTank(this.state, boss, snapX, snapY)
+      ) {
+        boss.x = snapX;
+        boss.y = snapY;
+      }
+    }
+    if (this.effigyStuck) this.effigyStuck.ms = 0;
+    this.effigyRamMs = 0;
+    this.broadcast(ServerMessage.RamChanged, {
+      active: false,
+      cooldownMs: 0,
+      foreign: true,
+    } satisfies RamChangedMessage);
+  }
+
+  /**
+   * Leaves a standing copy of the Effigy behind, if one is off cooldown.
+   *
+   * The player's decoy pulls enemy attention onto a beacon; the Effigy has no
+   * allies to misdirect, so its version misdirects the player instead — a
+   * mirage that looks exactly like the boss, walks at them like the boss, and
+   * evaporates the moment a single shell finds it.
+   */
+  private maybeDropEffigyMirage(boss: Tank, dist: number): void {
+    if (this.effigyDecoyCdMs > 0) return;
+    if (dist > EFFIGY_DECOY_TRIGGER_TILES * TILE_SIZE) return;
+
+    this.effigyDecoyCdMs = EFFIGY_DECOY_COOLDOWN_MS;
+
+    const id = `mirage-${this.enemySequence++}`;
+    this.state.tanks.push(
+      new Tank({
+        x: boss.x,
+        y: boss.y,
+        width: boss.width,
+        height: boss.height,
+        ownerId: id,
+        maxHealth: 1,
+        speed: TANK_SPEED,
+        direction: boss.direction,
+        isEnemy: true,
+        variant: EFFIGY,
+      }),
+    );
+    this.effigyMirages.set(id, EFFIGY_DECOY_DURATION_MS);
+  }
+
+  /** Fades out any mirage that has outlived its duration. */
+  private tickEffigyMirages(deltaMs: number): void {
+    for (const [ownerId, remaining] of this.effigyMirages) {
+      const left = remaining - deltaMs;
+      if (left > 0) {
+        this.effigyMirages.set(ownerId, left);
+        continue;
+      }
+
+      this.effigyMirages.delete(ownerId);
+      const index = this.state.tanks.findIndex((tank) => tank.ownerId === ownerId);
+      if (index >= 0) this.state.tanks.splice(index, 1);
     }
   }
 
@@ -2304,10 +2720,27 @@ export class CampaignRoom extends Room<CampaignState> {
     boss.y = destY;
     boss.direction = away;
 
-    // Reuses the player's own blink effect, which is exactly the point.
+    // Land square on the lattice. A blink taken mid-step preserves the fraction
+    // of a tile the boss was standing off by, and a flow-field mover that is
+    // not tile-aligned can never turn again — it drives into the nearest wall
+    // and stops there, which is exactly how this fight used to end itself.
+    const snapX = Math.round(boss.x / TILE_SIZE) * TILE_SIZE;
+    const snapY = Math.round(boss.y / TILE_SIZE) * TILE_SIZE;
+    if (
+      !isBlocked(this.state, snapX, snapY, boss.width, boss.height) &&
+      !collidesWithTank(this.state, boss, snapX, snapY)
+    ) {
+      boss.x = snapX;
+      boss.y = snapY;
+    }
+
+    // Reuses the player's own blink effect, which is exactly the point —
+    // flagged foreign so the client draws it without adopting the charge count
+    // as its own and blanking the player's blink readout.
     this.broadcast(ServerMessage.TeleportChanged, {
       charges: 0,
       rechargeMs: 0,
+      foreign: true,
       fromX,
       fromY,
       toX: destX,
@@ -2323,6 +2756,7 @@ export class CampaignRoom extends Room<CampaignState> {
 
     this.broadcast(ServerMessage.BlastChanged, {
       cooldownMs: 0,
+      foreign: true,
       x: cx,
       y: cy,
       radius,
@@ -2747,8 +3181,11 @@ export class CampaignRoom extends Room<CampaignState> {
     this.state.phase = CampaignPhase.Outro;
 
     // The outro is where the run is shaped: deal each survivor a hand while
-    // they read the debrief.
-    this.offerUpgrades();
+    // they read the debrief. Not after the last level, though — there is no
+    // next level for it to shape, and offering three cards to a player who has
+    // just won reads as though the run were still going.
+    if (this.state.currentLevel < CAMPAIGN_LEVELS.length) this.offerUpgrades();
+    else this.upgradeOffers.clear();
 
     console.log(`[room ${this.roomId}] level ${this.state.currentLevel} cleared`);
     return true;
@@ -3139,6 +3576,12 @@ export class CampaignRoom extends Room<CampaignState> {
     const playerCx = player.x + player.width / 2;
     const playerCy = player.y + player.height / 2;
 
+    // Only runs once the player is actually on top of it; from across the map
+    // it stands and shells, so the approach is a push rather than a chase.
+    if (Math.hypot(bossCx - playerCx, bossCy - playerCy) > ARTILLERY_FLEE_TILES * TILE_SIZE) {
+      return;
+    }
+
     // Reverse of the angle to the player: head straight away from them.
     const angle = Math.atan2(bossCy - playerCy, bossCx - playerCx);
     const dt = deltaMs / 1000;
@@ -3157,15 +3600,17 @@ export class CampaignRoom extends Room<CampaignState> {
   /**
    * True when a shell is striking the Bastion's armoured plating.
    *
-   * Only a shot into its back lands. A bullet travelling the same way the
-   * Bastion faces must have come from behind it, so that — and only that — is a
-   * hit; shells from the front or either flank spark off. Deliberately a hard
-   * rule rather than a fuzzy arc, so the player can read the fight from the
-   * hull's facing alone and know exactly where they need to be.
+   * Bow armour only: a shell meeting the hull head-on — travelling the opposite
+   * way to the Bastion's facing — sparks off, and everything into a flank or
+   * the stern lands. It used to be the reverse, rear-only, which read well on
+   * paper and did not survive contact: the Bastion re-aims every
+   * {@link BASTION_TURN_INTERVAL_MS} and simply kept its nose on the player, so
+   * the one vulnerable face was the one nobody could ever be standing on.
+   * Circling it is still the fight; it is now a fight that can be won.
    */
   private isBastionArmoured(target: Tank, bullet: Bullet): boolean {
     if (target.variant !== BASTION) return false;
-    return bullet.direction !== target.direction;
+    return bullet.direction === ((target.direction + 2) % 4);
   }
 
   /** Swings the Bastion toward the player and walks it slowly forward. */
@@ -3249,18 +3694,26 @@ export class CampaignRoom extends Room<CampaignState> {
     const boss = this.findTank(this.bossId);
     if (!boss || boss.variant !== ARCHITECT) return;
 
-    // Steady suppressing fire, so the boss is visibly alive while it builds.
-    // It keeps lobbing after the pylons fall — that is when it is exposed and
-    // has nothing left to do but fight.
+    const pylons = this.architectPylons();
+
+    // Steady suppressing fire, so the boss is visibly alive while it builds —
+    // and twice as fast once the pylons are down, which is when it stops
+    // building and has nothing left to do but fight.
+    const lobInterval =
+      pylons > 0
+        ? ARCHITECT_LOB_INTERVAL_MS
+        : ARCHITECT_LOB_INTERVAL_MS * ARCHITECT_ENRAGED_LOB_FACTOR;
     this.architectLobMs += deltaMs;
-    if (this.architectLobMs >= ARCHITECT_LOB_INTERVAL_MS) {
-      this.architectLobMs -= ARCHITECT_LOB_INTERVAL_MS;
-      const player = this.anyPlayer();
-      if (player) this.launchSapperLob(boss, player);
+    if (this.architectLobMs >= lobInterval) {
+      this.architectLobMs -= lobInterval;
+      const target = this.anyPlayer();
+      if (target) this.launchSapperLob(boss, target);
     }
 
-    const pylons = this.architectPylons();
-    if (pylons === 0) return;
+    if (pylons === 0) {
+      this.driveArchitect(boss, deltaMs);
+      return;
+    }
     if (this.architectRings >= ARCHITECT_MAX_RINGS) return;
 
     const destroyed = Math.max(0, 4 - pylons);
@@ -3286,6 +3739,48 @@ export class CampaignRoom extends Room<CampaignState> {
 
     this.architectRings++;
     this.closeArchitectRing(this.architectRings);
+  }
+
+  /**
+   * Walks the exposed Architect at the player, grinding through whatever it
+   * meets.
+   *
+   * Only ever runs with the pylons down. Until then it is invulnerable and the
+   * arena is the threat; afterwards the arena stops moving and it has to be one
+   * itself, or the last third of the fight is a stationary target being shot at
+   * from across a room it has already finished shrinking.
+   */
+  private driveArchitect(boss: Tank, deltaMs: number): void {
+    const player = this.nearestPlayerTo(boss);
+    if (!player) return;
+
+    const cx = boss.x + boss.width / 2;
+    const cy = boss.y + boss.height / 2;
+    const angle = Math.atan2(player.y + player.height / 2 - cy, player.x + player.width / 2 - cx);
+    const dt = deltaMs / 1000;
+
+    const nextX = boss.x + Math.cos(angle) * ARCHITECT_SPEED * dt;
+    if (!this.sweeperHitsWall(nextX, boss.y, boss.width, boss.height)) boss.x = nextX;
+
+    const nextY = boss.y + Math.sin(angle) * ARCHITECT_SPEED * dt;
+    if (!this.sweeperHitsWall(boss.x, nextY, boss.width, boss.height)) boss.y = nextY;
+
+    boss.direction = this.angleToDirection(angle);
+
+    if (this.crushJuggernautTiles(boss.x, boss.y, boss.width, boss.height)) {
+      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.onSweeperBounce(boss, true);
+    }
+    this.crushEnemies(boss);
+
+    for (const target of this.playerTanks()) {
+      if (target.isInvulnerable) continue;
+      if (
+        boxesOverlap(boss.x, boss.y, boss.width, boss.height, target.x, target.y, target.width, target.height)
+      ) {
+        this.killPlayer(target.ownerId);
+      }
+    }
   }
 
   /**
@@ -3713,10 +4208,24 @@ export class CampaignRoom extends Room<CampaignState> {
   private abilitiesOf(ownerId: string): AbilityState {
     let state = this.abilities.get(ownerId);
     if (!state) {
-      state = freshAbilities();
+      state = this.freshFor(ownerId);
       this.abilities.set(ownerId, state);
     }
     return state;
+  }
+
+  /**
+   * A ready loadout for one seat, banked to that seat's own blink ceiling.
+   *
+   * Phase Capacitor raises the ceiling, so handing back a flat
+   * {@link TELEPORT_MAX_CHARGES} made the upgrade look like it had done nothing:
+   * the player took "+1 blink charge", started the next level on two, and had
+   * to wait out a full recharge to ever see the third.
+   */
+  private freshFor(ownerId: string): AbilityState {
+    const abilities = freshAbilities();
+    abilities.teleportCharges = this.blinkCap(ownerId);
+    return abilities;
   }
 
   /** Every living player tank on the field. */
@@ -4293,7 +4802,7 @@ export class CampaignRoom extends Room<CampaignState> {
   /** Returns every blink bank to full — used on death and on level change. */
   private resetTeleport(): void {
     for (const [ownerId, abilities] of this.abilities) {
-      abilities.teleportCharges = TELEPORT_MAX_CHARGES;
+      abilities.teleportCharges = this.blinkCap(ownerId);
       abilities.teleportRechargeMs = 0;
       abilities.blinkLockMs = 0;
 
@@ -4518,11 +5027,11 @@ export class CampaignRoom extends Room<CampaignState> {
   private clearAbilities(ownerId: string): void {
     const player = this.findTank(ownerId);
     if (player) player.isShielded = false;
-    this.abilities.set(ownerId, freshAbilities());
+    this.abilities.set(ownerId, this.freshFor(ownerId));
 
     this.sendTo(ownerId, ServerMessage.ShieldChanged, { active: false, ready: true });
     this.sendTo(ownerId, ServerMessage.TeleportChanged, {
-      charges: TELEPORT_MAX_CHARGES,
+      charges: this.blinkCap(ownerId),
       rechargeMs: 0,
     });
     this.sendTo(ownerId, ServerMessage.BlastChanged, { cooldownMs: 0 });
@@ -4673,6 +5182,7 @@ export class CampaignRoom extends Room<CampaignState> {
     this.mimicLungeTimers.delete(tank.ownerId);
     this.sapperLobTimers.delete(tank.ownerId);
     this.lurcherTimers.delete(tank.ownerId);
+    this.effigyMirages.delete(tank.ownerId);
     if (tank.isBoss) this.bossId = null;
 
     // Enemies just vanish; only the player's death costs a life.
@@ -4755,6 +5265,13 @@ export class CampaignRoom extends Room<CampaignState> {
    * {@link countStandardEnemies}).
    */
   private releaseEnemies(): void {
+    // The Effigy level is a duel and is written as one — "no armor to flank, no
+    // pylons to drop, no adds to clear". It was getting the standard boss-level
+    // escort anyway, which crowded the arena, blocked the mirror boss against
+    // its own reinforcements, and turned the one fight in the campaign that is
+    // supposed to be one-on-one into another swarm.
+    if (this.state.currentLevel === EFFIGY_LEVEL) return;
+
     let interval = Math.max(
       SPAWN_INTERVAL_MIN_MS,
       SPAWN_INTERVAL_BASE_MS - this.state.currentLevel * SPAWN_INTERVAL_PER_LEVEL_MS,
@@ -4767,7 +5284,7 @@ export class CampaignRoom extends Room<CampaignState> {
     if (this.countStandardEnemies() >= MAX_ENEMIES) return;
 
     // Factory levels spawn guards beside the factories; elsewhere, at map edges.
-    const spawn =
+    let spawn =
       this.currentWinCondition() === CampaignWinCondition.DestroyFactories
         ? this.factorySpawnPoint()
         : this.edgeSpawnPoint();
@@ -4790,8 +5307,8 @@ export class CampaignRoom extends Room<CampaignState> {
       // zone, backed by cloaked Ghosts and shielded Aegis units.
       const roll = Math.random();
       if (roll < NULLIFIER_CHANCE) variant = NULLIFIER;
-      else if (roll < 0.55) variant = GHOST;
-      else if (roll < 0.75) variant = AEGIS;
+      else if (roll < 0.4) variant = GHOST;
+      else if (roll < 0.6) variant = AEGIS;
     } else if (this.state.currentLevel === 18) {
       // The Fragments: fake intel Mimics and mine-laying Trappers.
       const roll = Math.random();
@@ -4829,6 +5346,25 @@ export class CampaignRoom extends Room<CampaignState> {
     if (variant === JAMMER) {
       const hasJammer = this.state.tanks.some((t) => t.isEnemy && t.variant === JAMMER);
       if (hasJammer) variant = "standard";
+    }
+
+    // The same rule for the two other variants that stack badly: Constructors
+    // permanently rewrite the map, and Nullifier bubbles overlap into one big
+    // dead zone. Over the cap they come out as ordinary tanks instead.
+    if (variant === CONSTRUCTOR && this.countVariant(CONSTRUCTOR) >= MAX_CONSTRUCTORS) {
+      variant = "standard";
+    }
+    if (variant === NULLIFIER && this.countVariant(NULLIFIER) >= MAX_NULLIFIERS) {
+      variant = "standard";
+    }
+
+    // A rusher has to be seen coming: hand it a spawn tile well clear of every
+    // player, and if the map cannot offer one this tick, release an ordinary
+    // tank rather than dropping a bomb in the player's lap.
+    if (variant === KAMIKAZE) {
+      const distant = this.distantSpawnPoint(KAMIKAZE_MIN_SPAWN_TILES);
+      if (distant) spawn = distant;
+      else variant = "standard";
     }
 
     // Resolve variant-specific stats (health, speed, flags) after the pick, so
@@ -4909,6 +5445,46 @@ export class CampaignRoom extends Room<CampaignState> {
       if (this.isSpawnClear(x, y)) return { x, y };
     }
     return null;
+  }
+
+  /**
+   * A clear edge spawn tile at least `minTiles` from every player, or null.
+   *
+   * Used for the units that are only fair at a distance. Falls back to nothing
+   * rather than to the nearest tile: the caller downgrades the spawn instead,
+   * which is always better than releasing the unit on top of someone.
+   */
+  private distantSpawnPoint(minTiles: number): { x: number; y: number } | null {
+    const players = this.playerTanks();
+    const minDistance = minTiles * TILE_SIZE;
+
+    for (let k = 0; k < ENEMY_SPAWNS.length; k++) {
+      const tile = ENEMY_SPAWNS[(this.enemySequence + k) % ENEMY_SPAWNS.length]!;
+      const x = tile.x * TILE_SIZE;
+      const y = tile.y * TILE_SIZE;
+      if (!this.isSpawnClear(x, y)) continue;
+
+      const cx = x + TANK_SIZE / 2;
+      const cy = y + TANK_SIZE / 2;
+      const tooClose = players.some(
+        (player) =>
+          Math.hypot(player.x + player.width / 2 - cx, player.y + player.height / 2 - cy) <
+          minDistance,
+      );
+      if (!tooClose) return { x, y };
+    }
+
+    return null;
+  }
+
+  /** How many live enemies carry a given variant. */
+  private countVariant(variant: string): number {
+    let count = 0;
+    for (let i = 0; i < this.state.tanks.length; i++) {
+      const tank = this.state.tanks.at(i);
+      if (tank.isEnemy && tank.variant === variant) count++;
+    }
+    return count;
   }
 
   /**
@@ -5020,6 +5596,13 @@ export class CampaignRoom extends Room<CampaignState> {
    */
   private usesHunterField(tank: Tank): boolean {
     if (!tank.isEnemy) return false;
+    // Only the smallest Hydra fragment is an ordinary tank; the bigger tiers
+    // steer themselves in moveHydra and shoulder everything else aside.
+    if (tank.variant === HYDRA) return tank.width <= HYDRA_CRUSHER_SIZE;
+    // A charging Effigy is committed to its lane: the field would curve the
+    // surge mid-flight and stack ordinary movement on top of it, exactly as it
+    // would for a player who kept steering during their own ram.
+    if (tank.variant === EFFIGY && tank.ownerId === this.bossId && this.effigyRamMs > 0) return false;
     switch (tank.variant) {
       case SWEEPER:
       case ARTILLERY:
@@ -5255,10 +5838,14 @@ export class CampaignRoom extends Room<CampaignState> {
     const tank = this.findTank(ownerId);
     if (!tank) return;
 
-    let cooldown = this.profileFor(tank).cooldownMs;
-    if (this.state.currentLevel > 10) cooldown *= 0.70;
-    // While any Jammer is on the field the player's weapons are throttled.
-    if (this.jammersActive()) cooldown *= JAMMER_COOLDOWN_MULTIPLIER;
+    // The whole reload — base, the late-campaign refit, Autoloader stacks and
+    // any Jammer throttle — comes from the shared formula, because the client
+    // throttles its own input against exactly the same numbers.
+    const cooldown = campaignShootCooldownMs(
+      this.state.currentLevel,
+      this.upgradeCount(ownerId, "rate"),
+      this.jammersActive(),
+    );
 
     if (!this.readyToShoot(tank, cooldown)) return;
     this.fire(tank);
@@ -5277,8 +5864,11 @@ export class CampaignRoom extends Room<CampaignState> {
    * True when `target` sits inside the aura of an Aegis unit and should soak a
    * shell for no damage.
    *
-   * Only enemies are protected, and an Aegis never shields itself — only a
-   * *different* Aegis can cover one.
+   * Only enemies are protected, and an Aegis is never covered by another Aegis.
+   * Two of them inside each other's radius used to make a mutually invulnerable
+   * pair that could only be broken by killing them in the same instant — which
+   * is not a puzzle, it is a wall. An Aegis is the thing that protects the rank
+   * and file; it takes its own shells.
    */
   private isAegisShielded(target: Tank): boolean {
     if (!target.isEnemy) return false;
@@ -5291,9 +5881,14 @@ export class CampaignRoom extends Room<CampaignState> {
       if (shield === target) continue;
 
       let radius: number;
-      if (shield.variant === AEGIS) radius = AEGIS_RADIUS;
-      else if (shield.variant === WARDEN) radius = WARDEN_SHIELD_RADIUS;
-      else continue;
+      if (shield.variant === AEGIS) {
+        if (target.variant === AEGIS) continue;
+        radius = AEGIS_RADIUS;
+      } else if (shield.variant === WARDEN) {
+        radius = WARDEN_SHIELD_RADIUS;
+      } else {
+        continue;
+      }
 
       const dx = shield.x + shield.width / 2 - tcx;
       const dy = shield.y + shield.height / 2 - tcy;
@@ -5302,15 +5897,16 @@ export class CampaignRoom extends Room<CampaignState> {
     return false;
   }
 
-  /** Whether a tank may fire: cooldown elapsed, and (enemies) no shell in flight. */
+  /**
+   * Whether a tank may fire: cooldown elapsed, and (enemies) no shell in flight.
+   *
+   * `cooldownMs` is the final figure — the Autoloader discount is applied by
+   * {@link playerShoot} through the shared formula, not here, so the player's
+   * reload is computed in exactly one place.
+   */
   private readyToShoot(tank: Tank, cooldownMs: number): boolean {
-    // Autoloader shortens the player's reload; enemies are unaffected.
-    const effective = tank.isEnemy
-      ? cooldownMs
-      : cooldownMs * Math.pow(0.85, this.upgradeCount(tank.ownerId, "rate"));
-
     const lastShot = this.lastShotAtMs.get(tank.ownerId);
-    if (lastShot !== undefined && this.elapsedMs - lastShot < effective) return false;
+    if (lastShot !== undefined && this.elapsedMs - lastShot < cooldownMs) return false;
     if (tank.isEnemy) return !this.state.bullets.some((bullet) => bullet.ownerId === tank.ownerId);
     return true;
   }

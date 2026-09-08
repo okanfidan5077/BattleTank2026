@@ -725,6 +725,34 @@ body {
   color: #4caf50;
 }
 
+/* The card that was taken, and the two that were not — so a spent hand still
+   shows what it was spent on rather than simply vanishing. */
+.upgrade-card.picked {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  cursor: default;
+}
+
+.upgrade-card.passed {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.upgrade-card:disabled:hover {
+  transform: none;
+}
+
+.upgrade-taken {
+  padding: 10px 16px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: rgb(18 22 28 / 95%);
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 1px;
+}
+
 /* A Nullifier is in range: the ability is switched off, not merely cooling. */
 .ability-suppressed {
   border-color: #7a3b52 !important;

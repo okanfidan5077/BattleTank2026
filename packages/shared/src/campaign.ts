@@ -146,6 +146,52 @@ export const BLAST_BRICK_RADIUS_TILES = 3;
 /** Cooldown between blasts, in ms. */
 export const BLAST_COOLDOWN_MS = 25_000;
 
+// ------------------------------------------------------------- fire control
+
+/**
+ * The campaign player's base gap between shots, in ms.
+ *
+ * Deliberately slower than the arena's {@link PLAYER_SHOOT_COOLDOWN_MS}: the
+ * campaign tank opens its run with half the rate of fire it finishes with, so
+ * Autoloader picks and the late-campaign refit read as real upgrades rather
+ * than as trimming an already-generous cadence. The early levels were being
+ * walked over by a gun that could simply out-shoot whatever wandered into it.
+ */
+export const CAMPAIGN_SHOOT_COOLDOWN_MS = 800;
+
+/** Reload multiplier from the late-campaign fire-control refit. */
+export const CAMPAIGN_REFIT_FIRE_FACTOR = 0.7;
+
+/** The (1-based) level from which that refit applies. */
+export const CAMPAIGN_REFIT_LEVEL = 11;
+
+/** Reload multiplier per stack of the Autoloader upgrade. */
+export const AUTOLOADER_FIRE_FACTOR = 0.85;
+
+/** Reload multiplier while any Jammer is on the field. */
+export const JAMMER_COOLDOWN_MULTIPLIER = 2;
+
+/**
+ * The campaign player's current reload, in ms.
+ *
+ * Shared because the client throttles its own input against it: a client
+ * holding a flat base would swallow the shots an Autoloader stack has earned,
+ * and one throttling looser than the server would play a firing sound for
+ * shots the server then refuses. The server still enforces it independently
+ * and remains the authority.
+ */
+export function campaignShootCooldownMs(
+  level: number,
+  rateStacks: number,
+  jammed = false,
+): number {
+  let cooldown = CAMPAIGN_SHOOT_COOLDOWN_MS;
+  if (level >= CAMPAIGN_REFIT_LEVEL) cooldown *= CAMPAIGN_REFIT_FIRE_FACTOR;
+  cooldown *= Math.pow(AUTOLOADER_FIRE_FACTOR, Math.max(0, rateStacks));
+  if (jammed) cooldown *= JAMMER_COOLDOWN_MULTIPLIER;
+  return cooldown;
+}
+
 // ---------------------------------------------------------------------- ram
 
 /**
@@ -156,8 +202,14 @@ export const BLAST_COOLDOWN_MS = 25_000;
  */
 export const RAM_UNLOCK_LEVEL = 9;
 
-/** How long a ram surge lasts, in ms. */
-export const RAM_DURATION_MS = 320;
+/**
+ * How long a ram surge lasts, in ms.
+ *
+ * Half again the original 320ms: at three times walking speed the old surge
+ * crossed barely three tiles, which was rarely enough to actually reach what
+ * it was aimed at from anywhere safe to launch it from.
+ */
+export const RAM_DURATION_MS = 480;
 
 /** Ram speed as a multiple of the player's normal speed. */
 export const RAM_SPEED_FACTOR = 3;
@@ -426,10 +478,15 @@ function buildLevel1Grid(): number[] {
 }
 
 /**
- * Level 2: a strict winding maze north to the extraction pad. Full-width walls —
- * indestructible steel alternating with brick — each leave a single gap on the
- * opposite side to the one below it, so there is never a straight run north: the
- * player must serpentine the whole way up, side to side, to reach the pad.
+ * Level 2: a fortified depot approach — three barricade lines north to the pad.
+ *
+ * The original was seven full-width walls whose gaps alternated hard left and
+ * hard right, which made the level a long, safe commute: the player crossed the
+ * whole map six times and the only difficulty was the distance. This keeps the
+ * barricades but gives each one two ways through — an open gap and brick panels
+ * that can simply be shot out — so the route is a decision rather than a
+ * corridor, and the drive is a third as long. Cover between the lines gives the
+ * guards somewhere to fight from, which is what the level was missing.
  */
 function buildLevel2Grid(): number[] {
   const grid = steelBordered();
@@ -437,24 +494,47 @@ function buildLevel2Grid(): number[] {
   // Extraction pad: a 6-wide band across the top centre, just inside the wall.
   fillRect(grid, GRID_WIDTH / 2 - 3, 1, GRID_WIDTH / 2 + 2, 2, TileType.ExtractionZone);
 
-  // Full-width barrier walls, gaps alternating hard left / hard right, so the
-  // only route is a tight zig-zag. Steel walls seal the approach to the pad;
-  // brick walls lower down give the guns something to chew if they miss the gap.
-  const walls: Array<{ y: number; gap: [number, number]; tile: TileType }> = [
-    { y: 5, gap: [3, 7], tile: TileType.Steel },
-    { y: 9, gap: [52, 56], tile: TileType.Steel },
-    { y: 13, gap: [3, 7], tile: TileType.Steel },
-    { y: 17, gap: [52, 56], tile: TileType.Steel },
-    { y: 21, gap: [3, 7], tile: TileType.Steel },
-    { y: 25, gap: [52, 56], tile: TileType.Steel },
-    { y: 29, gap: [3, 7], tile: TileType.Steel },
+  // Three barricade lines. Each is mostly steel with open gaps cut through it;
+  // the marked spans are brick, so a player who does not want to walk to a gap
+  // can make their own hole and pay for it in time and ammunition instead.
+  //
+  // The outermost gaps also keep the flanking enemy spawn tiles (columns 6 and
+  // 53) on passable ground — a barricade laid straight across one would wall
+  // that spawn off for the whole level.
+  const lines: Array<{ y: number; gaps: Array<[number, number]>; brick: Array<[number, number]> }> = [
+    { y: 24, gaps: [[40, 44]], brick: [[10, 16], [26, 32]] },
+    { y: 16, gaps: [[5, 7], [15, 19], [52, 54]], brick: [[28, 34], [44, 50]] },
+    { y: 8, gaps: [[38, 42]], brick: [[12, 18], [26, 31]] },
   ];
-  for (const { y, gap, tile } of walls) {
+
+  for (const { y, gaps, brick } of lines) {
     for (let x = 1; x < GRID_WIDTH - 1; x++) {
-      if (x >= gap[0] && x <= gap[1]) continue;
-      grid[at(x, y)] = tile;
+      if (gaps.some(([from, to]) => x >= from && x <= to)) continue;
+      const soft = brick.some(([from, to]) => x >= from && x <= to);
+      grid[at(x, y)] = soft ? TileType.Brick : TileType.Steel;
     }
   }
+
+  // Cover in the bays between the lines, so the fights happen somewhere rather
+  // than in an empty lane, and neither side has a clean shot down the middle.
+  coverClusters(grid, [
+    [8, 27],
+    [30, 27],
+    [50, 27],
+    [7, 19],
+    [24, 19],
+    [52, 19],
+    [20, 11],
+    [46, 11],
+    [30, 4],
+  ], 2);
+
+  steelPillars(grid, [
+    [20, 27],
+    [40, 19],
+    [10, 11],
+    [34, 11],
+  ], 2);
 
   return grid;
 }
@@ -805,23 +885,37 @@ function buildLevel10Grid(): number[] {
     [47, 2],
   ]);
 
-  // The serpentine. Gaps alternate hard left / hard right; the two top walls are
-  // steel (they block the line of sight up to the boss), the rest brick.
-  const walls: Array<{ y: number; gap: [number, number]; tile: TileType }> = [
-    { y: 6, gap: [3, 6], tile: TileType.Steel },
-    { y: 10, gap: [53, 56], tile: TileType.Steel },
-    { y: 14, gap: [3, 6], tile: TileType.Steel },
-    { y: 18, gap: [53, 56], tile: TileType.Steel },
-    { y: 22, gap: [3, 6], tile: TileType.Steel },
-    { y: 26, gap: [53, 56], tile: TileType.Steel },
-    { y: 29, gap: [3, 6], tile: TileType.Steel },
+  // Two banks of cover rather than a seven-wall serpentine.
+  //
+  // The old layout sealed the boss behind full-width steel with gaps at the far
+  // edges, so a boss that flees at half the player's speed could be chased the
+  // length of the map for minutes without ever being cornered. These bands are
+  // gapped in the middle as well as at the sides: they still break the line of
+  // fire and give the artillery somewhere to hide, but the player can always
+  // cut across and get an angle on it.
+  const bands: Array<{ y: number; gaps: Array<[number, number]>; tile: TileType }> = [
+    { y: 9, gaps: [[8, 12], [27, 33], [47, 51]], tile: TileType.Steel },
+    { y: 18, gaps: [[4, 8], [22, 27], [38, 43], [54, 56]], tile: TileType.Brick },
+    { y: 25, gaps: [[10, 15], [28, 32], [45, 50]], tile: TileType.Brick },
   ];
-  for (const { y, gap, tile } of walls) {
+  for (const { y, gaps, tile } of bands) {
     for (let x = 1; x < GRID_WIDTH - 1; x++) {
-      if (x >= gap[0] && x <= gap[1]) continue;
+      if (gaps.some(([from, to]) => x >= from && x <= to)) continue;
       grid[at(x, y)] = tile;
     }
   }
+
+  // Loose cover in the open bays, to break the mortar's line on the player the
+  // same way the bands break the player's line on the boss.
+  coverClusters(grid, [
+    [16, 12],
+    [42, 12],
+    [9, 21],
+    [30, 21],
+    [49, 21],
+    [20, 28],
+    [38, 28],
+  ], 2);
 
   return grid;
 }
@@ -1391,9 +1485,9 @@ export const CAMPAIGN_LEVELS: CampaignLevel[] = [
     id: 12,
     winCondition: CampaignWinCondition.AssassinateBoss,
     introText:
-      "They have brought up a Bastion to hold the coolant basins. Frontal plating my shells will not scratch — I have watched three bounce off. It turns to face whatever it can see. The plating does not wrap all the way round. Get behind it. Blink if I have to.",
+      "They have brought up a Bastion to hold the coolant basins. Frontal plating my shells will not scratch — I have watched three bounce off. It turns to face whatever it can see, and it is quick about it. But that is bow armour only: anything into a flank or the stern goes straight in. Circle it. Blink if I have to.",
     outroText:
-      "Bastion down — through the back, where the armor was not. Noted. The Protocol is getting desperate.",
+      "Bastion down — through the flank, where the armor was not. Noted. The Protocol is getting desperate.",
     mapGrid: buildLevel12Grid(),
   },
   {
@@ -1463,7 +1557,7 @@ export const CAMPAIGN_LEVELS: CampaignLevel[] = [
     id: 20,
     winCondition: CampaignWinCondition.AssassinateBoss,
     introText:
-      "The Core's antechamber. Something is in here with me, and it is not shooting — it is building. The walls are coming in. My shells will not touch it while its four pylons stand. Drop the pylons to slow the walls, then finish it. If the room closes first, it does not need to fight me at all.",
+      "The Core's antechamber. Something is in here with me, and it is not shooting — it is building. The walls are coming in. My shells will not touch it while its four pylons stand. Drop the pylons to slow the walls, then finish it — and expect it to stop building and come for me the moment the last one falls. If the room closes first, it does not need to fight me at all.",
     outroText:
       "Pylons down, walls stopped, Architect scrapped. Whatever it was walling in, it did not want me reaching. The Logic Core is dead ahead.",
     mapGrid: buildLevel20Grid(),

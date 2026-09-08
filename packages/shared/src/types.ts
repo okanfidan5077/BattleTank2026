@@ -150,6 +150,15 @@ export interface MineDetonatedMessage {
 export interface BlastChangedMessage {
   /** ms until it can be fired again; 0 when ready. */
   cooldownMs: number;
+  /**
+   * Somebody else's ability, not the receiving player's.
+   *
+   * The campaign's mirror boss fires the player's own kit back at them and
+   * reuses these messages to draw it, so the client has to be told which ones
+   * describe its own cooldowns and which are only there to be rendered. Without
+   * it, a boss ability announces itself as the player's and resets their HUD.
+   */
+  foreign?: boolean;
   /** Blast centre, in world units — present only on an actual detonation. */
   x?: number;
   y?: number;
@@ -168,6 +177,8 @@ export interface RamChangedMessage {
   active: boolean;
   /** ms until it can be fired again; 0 when ready. */
   cooldownMs: number;
+  /** Somebody else's surge — see {@link BlastChangedMessage.foreign}. */
+  foreign?: boolean;
 }
 
 /** Broadcast when a decoy beacon is dropped, expires, or comes off cooldown. */
@@ -203,6 +214,8 @@ export interface UpgradeOfferMessage {
 export interface TeleportChangedMessage {
   /** Charges banked after this change. */
   charges: number;
+  /** Somebody else's blink — see {@link BlastChangedMessage.foreign}. */
+  foreign?: boolean;
   /** ms until the next charge returns; 0 when the bank is full. */
   rechargeMs: number;
   /** The jump itself, in world units — present only on an actual blink. */
