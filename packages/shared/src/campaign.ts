@@ -9,6 +9,14 @@ import { GRID_HEIGHT, GRID_LENGTH, GRID_WIDTH, TileType } from "./constants.js";
  * a bad one is easy to reject — the same convention as `MatchStatus`.
  */
 export const CampaignPhase = {
+  /**
+   * Gathering seats before the run begins; the world is frozen.
+   *
+   * The campaign seats up to four, so it needs the same "wait for everyone"
+   * step the battle rooms have — without it the host's run starts the instant
+   * they press the button and anyone they invite arrives mid-level.
+   */
+  Staging: "staging",
   /** Showing the level's intro briefing; the world is frozen. */
   Intro: "intro",
   /** The level is live and simulating. */
@@ -45,6 +53,10 @@ export const CampaignMessage = {
   Ram: "ram",
   /** Drop a decoy beacon that pulls enemy pathing off the player. */
   Decoy: "decoy",
+  /** Take one of the upgrades offered after a level. */
+  ChooseUpgrade: "choose_upgrade",
+  /** Host only: leave staging and begin the run. */
+  StartCampaign: "start_campaign",
 } as const;
 export type CampaignMessage = (typeof CampaignMessage)[keyof typeof CampaignMessage];
 
@@ -173,6 +185,49 @@ export const DECOY_COOLDOWN_MS = 20_000;
  * tank positions alone, without the server having to publish a suppressed flag.
  */
 export const NULLIFIER_RADIUS_TILES = 5;
+
+// ---------------------------------------------------------------- upgrades
+//
+// Offered between levels, three at a time, and stacking on top of the fixed
+// ability unlocks rather than replacing them — so every level stays beatable as
+// designed while builds still diverge from run to run. Half are plain numbers
+// and half change how an ability behaves; the plain ones are the reliable pick
+// when a build needs shoring up, the others are what make a run memorable.
+
+/** One offerable upgrade. */
+export interface CampaignUpgrade {
+  readonly id: string;
+  readonly name: string;
+  /** One line, shown on the card. */
+  readonly detail: string;
+  /** How many times it may be taken. */
+  readonly maxStacks: number;
+}
+
+/** How many choices are offered after each level. */
+export const UPGRADE_CHOICES = 3;
+
+/** The full upgrade pool. */
+export const CAMPAIGN_UPGRADES: readonly CampaignUpgrade[] = [
+  // Plain numbers.
+  { id: "hull", name: "Reinforced Hull", detail: "+1 max hull integrity", maxStacks: 4 },
+  { id: "rate", name: "Autoloader", detail: "-15% reload time", maxStacks: 3 },
+  { id: "speed", name: "Overdrive", detail: "+12% movement speed", maxStacks: 3 },
+  { id: "shell", name: "Hot Loads", detail: "+20% shell velocity", maxStacks: 3 },
+  { id: "life", name: "Spare Crew", detail: "+1 team life, right now", maxStacks: 99 },
+  // Rule-changers.
+  { id: "blink", name: "Phase Capacitor", detail: "+1 blink charge", maxStacks: 2 },
+  { id: "shieldup", name: "Hardened Deflector", detail: "+1.5s shield duration", maxStacks: 3 },
+  { id: "blastup", name: "Wide Payload", detail: "+2 tiles blast radius", maxStacks: 3 },
+  { id: "ramup", name: "Ablative Prow", detail: "+60% ram duration", maxStacks: 2 },
+  { id: "decoyup", name: "Loud Beacon", detail: "+4s decoy duration", maxStacks: 2 },
+  { id: "cool", name: "Coolant Loop", detail: "-20% all ability cooldowns", maxStacks: 3 },
+];
+
+/** Looks an upgrade up by id. */
+export function findUpgrade(id: string): CampaignUpgrade | undefined {
+  return CAMPAIGN_UPGRADES.find((upgrade) => upgrade.id === id);
+}
 
 /** Default seconds the player must hold out on a `survive_time` level. */
 export const SURVIVE_DURATION_SECONDS = 60;

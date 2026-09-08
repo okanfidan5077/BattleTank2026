@@ -5,6 +5,7 @@ import {
   BoonType,
   CAMPAIGN_LEVELS,
   CAMPAIGN_ROOM,
+  findUpgrade,
   CampaignMessage,
   CampaignPhase,
   ClientMessage,
@@ -40,6 +41,7 @@ import {
   type MineDetonatedMessage,
   type MortarWarningMessage,
   type ShieldChangedMessage,
+  type UpgradeOfferMessage,
   type TeleportChangedMessage,
   type MatchStatsRow,
   type MoveMessage,
@@ -184,6 +186,12 @@ export class GameScene extends Phaser.Scene {
   private campaignTextEl?: HTMLDivElement;
   private campaignPromptEl?: HTMLDivElement;
 
+  /** Row of between-level upgrade cards inside the briefing overlay. */
+  private campaignCardsEl?: HTMLDivElement;
+
+  /** Armed 1/2/3 hotkeys for the current upgrade hand, if any. */
+  private upgradeKeyHandler?: (event: KeyboardEvent) => void;
+
   /** Pending typewriter tick, so a phase change can cancel a half-typed line. */
   private typewriterTimer?: number;
 
@@ -310,6 +318,14 @@ export class GameScene extends Phaser.Scene {
 
   /** Armour/weak-point markers drawn over each Bastion. */
   private bastionPlates = new Map<TankView, Phaser.GameObjects.Graphics>();
+
+  /**
+   * Last seen health per tank, so a drop can be spotted.
+   *
+   * The wire carries the new value, not the delta, so the only way to know a
+   * hit landed is to remember what it was a moment ago.
+   */
+  private lastHealth = new Map<TankView, number>();
 
   private cursors?: Phaser.Types.Input.Keyboard.CursorKeys;
   private wasd?: Record<"W" | "A" | "S" | "D", Phaser.Input.Keyboard.Key>;
@@ -597,6 +613,23 @@ export class GameScene extends Phaser.Scene {
 
     this.buildMenuButton();
 
+    // Re-apply the campaign phase once the scene is genuinely up.
+    //
+    // Colyseus `listen` fires immediately with the current value. Before the
+    // staging screen existed, Phaser booted the instant the room was joined and
+    // the state had not decoded yet, so that first call arrived asynchronously —
+    // safely after create(). Now the room is fully decoded while the party
+    // gathers, so it lands *inside* create(), where `sys.isActive()` is still
+    // false and `onCampaignPhase` drops it as though the scene were dead. The
+    // briefing then never appeared, nothing ever sent `start_level`, and the
+    // level sat empty. Re-syncing here is idempotent and cheap.
+    if (this.isCampaign) {
+      this.events.once(Phaser.Scenes.Events.CREATE, () => {
+        const phase = this.campaignRoom?.state?.phase;
+        if (phase) this.onCampaignPhase(phase);
+      });
+    }
+
     // The room outlives this scene, so every listener bound to it must come off
     // the moment the scene stops or is destroyed — otherwise a late network
     // packet fires a callback that touches freed Phaser objects and crashes.
@@ -626,6 +659,11 @@ export class GameScene extends Phaser.Scene {
     this.campaignOverlay = undefined;
     this.campaignTextEl = undefined;
     this.campaignPromptEl = undefined;
+    this.campaignCardsEl = undefined;
+    if (this.upgradeKeyHandler) {
+      window.removeEventListener("keydown", this.upgradeKeyHandler);
+      this.upgradeKeyHandler = undefined;
+    }
 
     window.clearTimeout(this.upgradeNotifyTimer);
     this.upgradeNotifyTimer = undefined;
@@ -744,10 +782,17 @@ export class GameScene extends Phaser.Scene {
 
     const stars = "*".repeat(Math.max(0, player.tier - 1));
     const waiting = player.respawnInSeconds > 0 ? `  RESPAWN ${player.respawnInSeconds}` : "";
+
+    const me = this.findLocalTank();
+    const hp = me?.currentHealth ?? 0;
+    const maxHp = me?.maxHealth ?? 0;
+    const pips = maxHp > 0 ? `  ${"█".repeat(hp)}${"░".repeat(Math.max(0, maxHp - hp))}` : "";
+
+    const hurt = maxHp > 0 && hp <= maxHp / 2;
     this.setField(
       this.hudPlayer,
-      `LIVES ${player.lives}   TIER ${player.tier}${stars}${waiting}`,
-      player.respawnInSeconds > 0 ? "#f2c14e" : "#4caf50",
+      `LIVES ${player.lives}   TIER ${player.tier}${stars}${pips}${waiting}`,
+      player.respawnInSeconds > 0 ? "#f2c14e" : hurt ? "#f2c14e" : "#4caf50",
     );
   }
 
@@ -1263,6 +1308,10 @@ export class GameScene extends Phaser.Scene {
       this.spawnGrappleTether(msg);
     });
 
+    room.onMessage(ServerMessage.UpgradeOffer, (msg: UpgradeOfferMessage) => {
+      this.renderUpgradeOffer(msg);
+    });
+
     const onError = (code: number, message?: string) => {
       this.status.setText(`connection error ${code}: ${message ?? ""}`).setColor("#e0483a");
       console.error("[client] campaign room error", code, message);
@@ -1277,9 +1326,15 @@ export class GameScene extends Phaser.Scene {
 
     // Levels are 1-based; the array is 0-based. Guard the lookup so a level
     // beyond the authored set never dereferences undefined.
-    const level = CAMPAIGN_LEVELS[(this.campaignRoom?.state.currentLevel ?? 1) - 1];
+    const level = CAMPAIGN_LEVELS[(this.campaignRoom?.state?.currentLevel ?? 1) - 1];
 
     switch (phase) {
+      case CampaignPhase.Staging:
+        // Handled by the DOM staging panel before Phaser boots; the scene only
+        // ever sees this if a run somehow returns to it, so show nothing.
+        this.hideCampaignOverlay();
+        break;
+
       case CampaignPhase.Intro:
         this.showBriefing(level?.introText ?? "", "Press SPACE to Start");
         this.armCampaignAdvance(CampaignMessage.StartLevel);
@@ -1339,15 +1394,92 @@ export class GameScene extends Phaser.Scene {
     const text = document.createElement("div");
     text.className = "campaign-text";
 
+    // Upgrade cards sit between the debrief and the "continue" prompt, so the
+    // choice is the thing in the middle of the screen rather than a footnote.
+    const cards = document.createElement("div");
+    cards.className = "upgrade-cards";
+    cards.hidden = true;
+
     const prompt = document.createElement("div");
     prompt.className = "campaign-prompt";
 
-    overlay.append(text, prompt);
+    overlay.append(text, cards, prompt);
     document.body.appendChild(overlay);
 
     this.campaignOverlay = overlay;
     this.campaignTextEl = text;
+    this.campaignCardsEl = cards;
     this.campaignPromptEl = prompt;
+  }
+
+  /**
+   * Renders this player's upgrade hand.
+   *
+   * An empty offer means the pick has already been spent (or there was nothing
+   * left to offer), so the row collapses and the debrief reads as it always did.
+   */
+  private renderUpgradeOffer(msg: UpgradeOfferMessage): void {
+    const cards = this.campaignCardsEl;
+    if (!cards || this.isDead) return;
+
+    cards.replaceChildren();
+    this.upgradeKeyHandler = undefined;
+
+    if (msg.ids.length === 0) {
+      cards.hidden = true;
+      return;
+    }
+
+    cards.hidden = false;
+
+    msg.ids.forEach((id, index) => {
+      const upgrade = findUpgrade(id);
+      if (!upgrade) return;
+
+      const card = document.createElement("button");
+      card.className = "upgrade-card";
+      card.type = "button";
+
+      const owned = msg.owned[id] ?? 0;
+      card.innerHTML =
+        `<span class="upgrade-key">${index + 1}</span>` +
+        `<span class="upgrade-name"></span>` +
+        `<span class="upgrade-detail"></span>` +
+        (owned > 0 ? `<span class="upgrade-owned"></span>` : "");
+
+      // Names and details come from the shared catalogue, but they are written
+      // in as text rather than markup so the card can never inject anything.
+      card.querySelector(".upgrade-name")!.textContent = upgrade.name;
+      card.querySelector(".upgrade-detail")!.textContent = upgrade.detail;
+      if (owned > 0) {
+        card.querySelector(".upgrade-owned")!.textContent = `owned x${owned}`;
+      }
+
+      card.addEventListener("click", () => this.pickUpgrade(id));
+      cards.appendChild(card);
+    });
+
+    // 1/2/3 pick without reaching for the mouse.
+    this.upgradeKeyHandler = (event: KeyboardEvent) => {
+      const slot = Number.parseInt(event.key, 10);
+      if (Number.isNaN(slot) || slot < 1 || slot > msg.ids.length) return;
+      this.pickUpgrade(msg.ids[slot - 1]!);
+    };
+    window.addEventListener("keydown", this.upgradeKeyHandler);
+  }
+
+  /** Sends a pick and disarms the hand so it cannot be spent twice. */
+  private pickUpgrade(id: string): void {
+    const room = this.campaignRoom;
+    if (!room) return;
+
+    room.send(CampaignMessage.ChooseUpgrade, { id });
+
+    if (this.upgradeKeyHandler) {
+      window.removeEventListener("keydown", this.upgradeKeyHandler);
+      this.upgradeKeyHandler = undefined;
+    }
+    // The server echoes an empty offer back, which clears the row for real.
   }
 
   /**
@@ -1405,6 +1537,18 @@ export class GameScene extends Phaser.Scene {
     window.clearTimeout(this.typewriterTimer);
     this.typewriterTimer = undefined;
     this.disarmCampaignAdvance();
+
+    // The hand goes with the overlay — 1/2/3 must not stay bound once the
+    // level is running and those keys mean nothing.
+    if (this.campaignCardsEl) {
+      this.campaignCardsEl.replaceChildren();
+      this.campaignCardsEl.hidden = true;
+    }
+    if (this.upgradeKeyHandler) {
+      window.removeEventListener("keydown", this.upgradeKeyHandler);
+      this.upgradeKeyHandler = undefined;
+    }
+
     if (this.campaignOverlay) this.campaignOverlay.hidden = true;
   }
 
@@ -1510,13 +1654,14 @@ export class GameScene extends Phaser.Scene {
     if (!player) return false;
 
     const room = this.room ?? this.campaignRoom;
-    if (!room) return false;
+    const tanks = room?.state?.tanks;
+    if (!tanks) return false;
 
     const px = player.x + player.width / 2;
     const py = player.y + player.height / 2;
     const radius = NULLIFIER_RADIUS_TILES * TILE_SIZE;
 
-    return room.state.tanks.some((tank: TankView) => {
+    return tanks.some((tank: TankView) => {
       if (tank.variant !== "nullifier") return false;
       const dx = tank.x + tank.width / 2 - px;
       const dy = tank.y + tank.height / 2 - py;
@@ -1529,7 +1674,7 @@ export class GameScene extends Phaser.Scene {
     const el = this.ramHudEl;
     if (!el || this.isDead) return;
 
-    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    const level = this.campaignRoom?.state?.currentLevel ?? 1;
     if (level < RAM_UNLOCK_LEVEL) {
       el.hidden = true;
       return;
@@ -1557,7 +1702,7 @@ export class GameScene extends Phaser.Scene {
     const el = this.decoyHudEl;
     if (!el || this.isDead) return;
 
-    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    const level = this.campaignRoom?.state?.currentLevel ?? 1;
     if (level < DECOY_UNLOCK_LEVEL) {
       el.hidden = true;
       return;
@@ -1624,7 +1769,7 @@ export class GameScene extends Phaser.Scene {
     const el = this.blastHudEl;
     if (!el || this.isDead) return;
 
-    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    const level = this.campaignRoom?.state?.currentLevel ?? 1;
     if (level < BLAST_UNLOCK_LEVEL) {
       el.hidden = true;
       return;
@@ -1693,7 +1838,7 @@ export class GameScene extends Phaser.Scene {
     const el = this.teleportHudEl;
     if (!el || this.isDead) return;
 
-    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    const level = this.campaignRoom?.state?.currentLevel ?? 1;
     if (level < TELEPORT_UNLOCK_LEVEL) {
       el.hidden = true;
       return;
@@ -1766,7 +1911,7 @@ export class GameScene extends Phaser.Scene {
     const el = this.shieldHudEl;
     if (!el || this.isDead) return;
 
-    const level = this.campaignRoom?.state.currentLevel ?? 1;
+    const level = this.campaignRoom?.state?.currentLevel ?? 1;
     if (level < SHIELD_UNLOCK_LEVEL) {
       el.hidden = true;
       return;
@@ -1923,7 +2068,10 @@ export class GameScene extends Phaser.Scene {
   /** Per-frame campaign work: HUD, name labels, and (while playing) input. */
   private updateCampaign(time: number): void {
     const room = this.campaignRoom;
-    if (!room) return;
+    // The collections are only built when the first patch decodes, a frame or
+    // two after joining — see the note in refreshHud. Nothing downstream may
+    // read through the state until they exist.
+    if (!room || !room.state?.tanks) return;
 
     this.followLabels();
     this.refreshCampaignHud();
@@ -1958,10 +2106,22 @@ export class GameScene extends Phaser.Scene {
     // condition is — radars remaining, extraction, or the survival countdown.
     this.setField(this.hudEagle, state.objectiveText, "#00ff88");
 
+    // Lives *and* hull integrity. Several threats now chip a single point at a
+    // time (Sapper lobs, the Effigy's blast), so without the pips the player
+    // cannot tell a scratch from being one hit off dead.
+    const me = this.findLocalTank();
+    const hp = me?.currentHealth ?? 0;
+    const maxHp = me?.maxHealth ?? 0;
+    const pips = maxHp > 0 ? `  ${"█".repeat(hp)}${"░".repeat(Math.max(0, maxHp - hp))}` : "";
+
+    // Colour tracks whichever is more urgent — the last life or the last pip.
+    const critical = state.lives <= 0 || (maxHp > 0 && hp === 1);
+    const hurt = maxHp > 0 && hp <= maxHp / 2;
+
     this.setField(
       this.hudPlayer,
-      `LIVES ${state.lives}`,
-      state.lives > 0 ? "#4caf50" : "#e0483a",
+      `LIVES ${state.lives}${pips}`,
+      critical ? "#e0483a" : hurt ? "#f2c14e" : "#4caf50",
     );
 
     // A Jammer on the field throttles the player's weapons — flash a warning so
@@ -2150,6 +2310,10 @@ export class GameScene extends Phaser.Scene {
         if (owner) this.syncPlayerVisuals(owner);
       }
 
+      // Seed the health watcher so the first change is measured against the
+      // value the tank arrived with, not against zero.
+      this.lastHealth.set(tank, tank.currentHealth);
+
       $(tank).onChange(() => {
         this.placeEntity(sprite, tank);
         this.syncShield(tank, sprite);
@@ -2157,6 +2321,7 @@ export class GameScene extends Phaser.Scene {
         this.syncMimicAppearance(tank, sprite);
         // A Ghost fades in and out as it cloaks/uncloaks after firing.
         this.syncGhostAppearance(tank, sprite);
+        this.syncDamageFlash(tank, sprite);
       });
     }));
 
@@ -2171,6 +2336,7 @@ export class GameScene extends Phaser.Scene {
       this.aegisAuras.delete(tank);
       this.bastionPlates.get(tank)?.destroy();
       this.bastionPlates.delete(tank);
+      this.lastHealth.delete(tank);
     }));
 
     // Identity lives on the player record, so watch that for name/colour.
@@ -2470,11 +2636,18 @@ export class GameScene extends Phaser.Scene {
     this.syncBastionPlates();
   }
 
-  /** This client's own tank in the replicated state, if it is currently alive. */
+  /**
+   * This client's own tank in the replicated state, if it is currently alive.
+   *
+   * The render loop starts before the first state patch lands, so the schema
+   * collections are briefly undefined — a gap that is easy to miss locally and
+   * reliably hit over a real network. Everything here is optional-chained.
+   */
   private findLocalTank(): TankView | undefined {
     const room = this.room ?? this.campaignRoom;
-    if (!room) return undefined;
-    return room.state.tanks.find(
+    const tanks = room?.state?.tanks;
+    if (!room || !tanks) return undefined;
+    return tanks.find(
       (tank: TankView) => !tank.isEnemy && tank.ownerId === room.sessionId,
     );
   }
@@ -2615,6 +2788,37 @@ export class GameScene extends Phaser.Scene {
    * Drawn at the shared radius so the player can see exactly where their kit
    * stops working, rather than discovering it by pressing a dead key.
    */
+  /**
+   * Flashes a tank white when its health drops, and kicks the camera when the
+   * hit landed on the local player.
+   *
+   * Landing a shot previously produced no feedback at all until the target
+   * actually died, which made everything with more than one hit point feel
+   * unresponsive to shoot at. The flash restores the tint afterwards rather
+   * than assuming white — variants paint themselves in {@link bindWorld} and a
+   * blanket clearTint would wipe a Ghost's fade or a Mimic's disguise.
+   */
+  private syncDamageFlash(tank: TankView, sprite: Phaser.GameObjects.Image): void {
+    const previous = this.lastHealth.get(tank);
+    this.lastHealth.set(tank, tank.currentHealth);
+
+    if (previous === undefined || tank.currentHealth >= previous) return;
+    if (!this.isLive(sprite)) return;
+
+    const restore = sprite.tintTopLeft;
+    sprite.setTint(0xffffff);
+    this.time.delayedCall(70, () => {
+      if (this.isLive(sprite)) sprite.setTint(restore);
+    });
+
+    // Taking a hit yourself should be felt, not just seen.
+    const room = this.room ?? this.campaignRoom;
+    if (!tank.isEnemy && room && tank.ownerId === room.sessionId) {
+      this.cameras.main.shake(120, 0.006);
+      this.tone({ type: "square", startHz: 220, endHz: 90, duration: 0.14, volume: 0.13 });
+    }
+  }
+
   private createNullifierField(tank: TankView): void {
     const radius = NULLIFIER_RADIUS_TILES * TILE_SIZE;
     const aura = this.add.graphics().setDepth(2);

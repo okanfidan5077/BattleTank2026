@@ -59,14 +59,20 @@ export async function joinRoomById(roomId: string, options: JoinOptions): Promis
 }
 
 /**
- * Joins the single-player campaign, opening a room if none is waiting.
+ * Opens a fresh campaign run.
+ *
+ * `create` rather than `joinOrCreate`: the campaign now seats up to four for
+ * co-op, and matchmaking into it would drop a player who just wanted to play
+ * alone into a stranger's half-finished run — inheriting their level and their
+ * shared lives. Co-op is opt-in instead: the host shares their room code and a
+ * friend joins it through {@link joinRoomById}, exactly like a battle room.
  *
  * Deliberately not passed through {@link remember}: a campaign seat is
- * single-player and short-lived, so there is nothing to hold open for a
- * reconnect — a refresh simply returns to the lobby.
+ * short-lived, so there is nothing to hold open for a reconnect — a refresh
+ * simply returns to the lobby.
  */
 export async function joinCampaign(options: JoinOptions): Promise<CampaignRoom> {
-  return colyseus.joinOrCreate<CampaignStateView>(CAMPAIGN_ROOM, options);
+  return colyseus.create<CampaignStateView>(CAMPAIGN_ROOM, options);
 }
 
 /**

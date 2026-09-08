@@ -109,6 +109,8 @@ export interface CampaignStateView extends WorldStateView {
   lives: number;
   /** Where the playthrough is in its lifecycle. */
   phase: CampaignPhase;
+  /** Session id of the player allowed to start the run from staging. */
+  hostId: string;
   /** HUD objective line, e.g. "RADARS LEFT: 3" or "SURVIVE: 42s". */
   objectiveText: string;
   /** The objective's raw number (radars left, or seconds remaining). */

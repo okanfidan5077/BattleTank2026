@@ -23,9 +23,12 @@ export class CampaignState extends GameState {
 
   /**
    * Where the playthrough is in its lifecycle; one of {@link CampaignPhase}.
-   * Starts on the intro briefing with the world frozen.
+   *
+   * Starts in staging with the world frozen, so a co-op party can gather before
+   * anything begins. `hostId`, inherited from {@link GameState}, names the seat
+   * allowed to start it.
    */
-  @type("string") phase: CampaignPhase = CampaignPhase.Intro;
+  @type("string") phase: CampaignPhase = CampaignPhase.Staging;
 
   /**
    * Human-readable objective line for the HUD, kept current by the server —

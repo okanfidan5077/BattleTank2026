@@ -192,7 +192,14 @@ body {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgb(20 24 30 / 92%);
-  z-index: 9;
+  /*
+   * Above the staging overlay (10), not below it.
+   *
+   * Staging is exactly when the invite matters — it is the screen that tells
+   * you to share the link — and at z-index 9 the overlay covered it, so the
+   * hint pointed at a corner with nothing in it.
+   */
+  z-index: 11;
 }
 
 .share[hidden] {
@@ -656,6 +663,66 @@ body {
 .decoy-hud.decoy-cooling {
   border-color: var(--line);
   color: #6b7785;
+}
+
+/* ------------------------------------------------------- upgrade choices */
+
+.upgrade-cards {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: min(900px, 90vw);
+}
+
+.upgrade-cards[hidden] {
+  display: none;
+}
+
+.upgrade-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 220px;
+  padding: 18px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgb(18 22 28 / 95%);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.upgrade-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-3px);
+}
+
+.upgrade-key {
+  font-size: 11px;
+  letter-spacing: 2px;
+  color: var(--accent);
+}
+
+.upgrade-name {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.upgrade-detail {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.upgrade-owned {
+  margin-top: 2px;
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: #4caf50;
 }
 
 /* A Nullifier is in range: the ability is switched off, not merely cooling. */

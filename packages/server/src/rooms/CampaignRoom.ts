@@ -2,6 +2,7 @@ import { Room, type Client } from "colyseus";
 
 import {
   CAMPAIGN_LEVELS,
+  CAMPAIGN_UPGRADES,
   CampaignMessage,
   CampaignPhase,
   CampaignWinCondition,
@@ -31,6 +32,8 @@ import {
   TELEPORT_RECHARGE_MS,
   TELEPORT_TILES,
   TELEPORT_UNLOCK_LEVEL,
+  UPGRADE_CHOICES,
+  findUpgrade,
   surviveSecondsForLevel,
   ZONE_CONTROL_DURATION_SECONDS,
   ServerMessage,
@@ -55,6 +58,7 @@ import {
   type MortarWarningMessage,
   type ShieldChangedMessage,
   type SteelHitMessage,
+  type UpgradeOfferMessage,
   type TeleportChangedMessage,
   type TankDestroyedMessage,
 } from "@battletank/shared";
@@ -688,8 +692,51 @@ const SWEEPER = "sweeper";
  * {@link CampaignState.phase} rather than a lobby/match cycle, and with the enemy
  * flow field converging on the player instead of an eagle.
  */
+/**
+ * One player's ability cooldowns and live effects.
+ *
+ * Every one of these used to be a single field on the room, which was correct
+ * while the campaign was strictly solo. In co-op they have to be per-seat —
+ * otherwise one player raising a shield puts everyone's on cooldown.
+ */
+interface AbilityState {
+  shieldActiveMs: number;
+  shieldCooldownMs: number;
+  teleportCharges: number;
+  teleportRechargeMs: number;
+  blastCooldownMs: number;
+  ramActiveMs: number;
+  ramCooldownMs: number;
+  ramDirection: Direction;
+  decoy: { x: number; y: number; remainingMs: number } | null;
+  decoyCooldownMs: number;
+  blinkLockMs: number;
+}
+
+/** A fresh, everything-ready ability loadout. */
+function freshAbilities(): AbilityState {
+  return {
+    shieldActiveMs: 0,
+    shieldCooldownMs: 0,
+    teleportCharges: TELEPORT_MAX_CHARGES,
+    teleportRechargeMs: 0,
+    blastCooldownMs: 0,
+    ramActiveMs: 0,
+    ramCooldownMs: 0,
+    ramDirection: Direction.Up,
+    decoy: null,
+    decoyCooldownMs: 0,
+    blinkLockMs: 0,
+  };
+}
+
 export class CampaignRoom extends Room<CampaignState> {
-  override maxClients = 1;
+  /**
+   * Seats in a co-op run. The campaign was authored and tuned around one tank,
+   * so this is kept small deliberately — four is enough to be a party without
+   * turning every level into a shooting gallery the enemies cannot reach.
+   */
+  override maxClients = 4;
 
   /** Simulation tick counter; drives movement intents and field rebuilds. */
   private tick = 0;
@@ -710,7 +757,13 @@ export class CampaignRoom extends Room<CampaignState> {
   private readonly invulnerableUntilMs = new Map<string, number>();
 
   /** elapsedMs at which the destroyed player returns, or null. */
-  private respawnAtMs: number | null = null;
+  /**
+   * sessionId -> elapsed-ms at which that seat returns to the field.
+   *
+   * Per-seat rather than a single timer: in co-op, one player dying must not
+   * hold up or reset anyone else's respawn.
+   */
+  private readonly respawnAtMs = new Map<string, number>();
 
   /** elapsedMs of the last enemy release. */
   private lastEnemySpawnMs = 0;
@@ -783,29 +836,8 @@ export class CampaignRoom extends Room<CampaignState> {
   /** True once the incoming contraction has been telegraphed. */
   private architectWarned = false;
 
-  /** ms until the close-in blast can be fired again; 0 when ready. */
-  private blastCooldownMs = 0;
-
-  /** ms remaining on the ram surge; 0 when not ramming. */
-  private ramActiveMs = 0;
-
-  /** ms until the ram can be fired again; 0 when ready. */
-  private ramCooldownMs = 0;
-
-  /** The facing the ram was launched along; it cannot be steered mid-surge. */
-  private ramDirection: Direction = Direction.Up;
-
-  /** The standing decoy beacon, if one is out. */
-  private decoy: { x: number; y: number; remainingMs: number } | null = null;
-
-  /** ms until another decoy beacon can be dropped; 0 when ready. */
-  private decoyCooldownMs = 0;
-
   /** ownerId -> ms accumulated toward a Lurcher's next grapple. */
   private readonly lurcherTimers = new Map<string, number>();
-
-  /** ms remaining on a grapple's blink lock; 0 when the drive is free. */
-  private blinkLockMs = 0;
 
   /** ms remaining on the Effigy's own shield. */
   private effigyShieldMs = 0;
@@ -816,17 +848,14 @@ export class CampaignRoom extends Room<CampaignState> {
   private effigyBlastCdMs = 0;
   private effigyShootMs = 0;
 
-  /** Blink charges the player currently has banked. */
-  private teleportCharges = TELEPORT_MAX_CHARGES;
+  /** sessionId -> that player's ability cooldowns and live effects. */
+  private readonly abilities = new Map<string, AbilityState>();
 
-  /** ms until the next blink charge returns; 0 when the bank is full. */
-  private teleportRechargeMs = 0;
+  /** sessionId -> upgrade id -> stacks taken. */
+  private readonly upgrades = new Map<string, Map<string, number>>();
 
-  /** ms remaining on the player's raised shield; 0 when it is down. */
-  private shieldActiveMs = 0;
-
-  /** ms remaining before the shield can be raised again; 0 when ready. */
-  private shieldCooldownMs = 0;
+  /** sessionId -> the upgrade ids currently on the table for that player. */
+  private readonly upgradeOffers = new Map<string, string[]>();
 
   /** ms accumulated toward the next Core radial bullet wave. */
   private coreShootTimerMs = 0;
@@ -855,6 +884,18 @@ export class CampaignRoom extends Room<CampaignState> {
     this.setState(new CampaignState());
 
     // The player leaves the intro briefing: build the level and go live.
+    // Only the host leaves staging, and only from staging — so a late-joining
+    // client cannot restart a run that is already under way.
+    this.onMessage(CampaignMessage.StartCampaign, (client) => {
+      if (this.state.phase !== CampaignPhase.Staging) return;
+      if (client.sessionId !== this.state.hostId) return;
+
+      this.state.phase = CampaignPhase.Intro;
+      console.log(
+        `[room ${this.roomId}] campaign started with ${this.state.players.size} player(s)`,
+      );
+    });
+
     this.onMessage(CampaignMessage.StartLevel, () => {
       if (this.state.phase !== CampaignPhase.Intro) return;
       this.beginLevel();
@@ -877,8 +918,7 @@ export class CampaignRoom extends Room<CampaignState> {
       // Reactive Armor upgrade: grant +2 lives on reaching level 16.
       if (next === 16) {
         this.state.lives += 2;
-        const player = this.playerId ? this.state.players.get(this.playerId) : undefined;
-        if (player) player.lives = this.state.lives;
+        this.syncLives();
       }
 
       this.state.currentLevel = next;
@@ -891,29 +931,37 @@ export class CampaignRoom extends Room<CampaignState> {
       this.winLevel();
     });
 
-    this.onMessage(CampaignMessage.ActivateShield, () => {
+    // Each ability acts on the seat that asked for it, never on "the player".
+    this.onMessage(CampaignMessage.ActivateShield, (client) => {
       if (this.state.phase !== CampaignPhase.Playing) return;
-      this.raiseShield();
+      this.raiseShield(client.sessionId);
     });
 
-    this.onMessage(CampaignMessage.Teleport, () => {
+    this.onMessage(CampaignMessage.Teleport, (client) => {
       if (this.state.phase !== CampaignPhase.Playing) return;
-      this.teleportPlayer();
+      this.teleportPlayer(client.sessionId);
     });
 
-    this.onMessage(CampaignMessage.Blast, () => {
+    this.onMessage(CampaignMessage.Blast, (client) => {
       if (this.state.phase !== CampaignPhase.Playing) return;
-      this.fireBlast();
+      this.fireBlast(client.sessionId);
     });
 
-    this.onMessage(CampaignMessage.Ram, () => {
+    this.onMessage(CampaignMessage.Ram, (client) => {
       if (this.state.phase !== CampaignPhase.Playing) return;
-      this.startRam();
+      this.startRam(client.sessionId);
     });
 
-    this.onMessage(CampaignMessage.Decoy, () => {
+    this.onMessage(CampaignMessage.Decoy, (client) => {
       if (this.state.phase !== CampaignPhase.Playing) return;
-      this.dropDecoy();
+      this.dropDecoy(client.sessionId);
+    });
+
+    this.onMessage(CampaignMessage.ChooseUpgrade, (client, payload: unknown) => {
+      // Only during the debrief, and only from the hand that seat was dealt.
+      if (this.state.phase !== CampaignPhase.Outro) return;
+      const id = (payload as { id?: unknown } | undefined)?.id;
+      this.chooseUpgrade(client.sessionId, id);
     });
 
     this.onMessage(ClientMessage.Move, (client, payload: unknown) => {
@@ -945,8 +993,19 @@ export class CampaignRoom extends Room<CampaignState> {
       client.sessionId,
       new Player({ sessionId: client.sessionId, name, color, lives: this.state.lives, tier: 1 }),
     );
+    this.abilities.set(client.sessionId, freshAbilities());
 
-    console.log(`[room ${this.roomId}] ${name} joined the campaign`);
+    // First one in runs the room and gets the Start button.
+    if (!this.state.hostId) this.state.hostId = client.sessionId;
+
+    // Someone joining a level already in progress drops straight in rather than
+    // spectating until the next briefing — the invite link stays useful after
+    // the run has started.
+    if (this.state.phase === CampaignPhase.Playing) this.spawnPlayer(client.sessionId);
+
+    console.log(
+      `[room ${this.roomId}] ${name} joined the campaign (${this.state.players.size}/${this.maxClients})`,
+    );
   }
 
   override onLeave(client: Client): void {
@@ -955,7 +1014,29 @@ export class CampaignRoom extends Room<CampaignState> {
     this.moveIntents.delete(client.sessionId);
     this.lastShotAtMs.delete(client.sessionId);
     this.invulnerableUntilMs.delete(client.sessionId);
-    if (this.playerId === client.sessionId) this.playerId = null;
+    this.abilities.delete(client.sessionId);
+    this.respawnAtMs.delete(client.sessionId);
+
+    // `playerId` now only names a fallback seat for the solo-era code paths;
+    // hand it to whoever is still here rather than blanking it, so a departing
+    // host does not leave the room without one.
+    if (this.playerId === client.sessionId) {
+      this.playerId = null;
+      for (const [sessionId] of this.state.players) {
+        this.playerId = sessionId;
+        break;
+      }
+    }
+
+    // The host leaving must not strand everyone else on a staging screen with
+    // no Start button: pass the room to whoever is still in it.
+    if (this.state.hostId === client.sessionId) {
+      this.state.hostId = "";
+      for (const [sessionId] of this.state.players) {
+        this.state.hostId = sessionId;
+        break;
+      }
+    }
   }
 
   // --------------------------------------------------------------- level setup
@@ -980,7 +1061,7 @@ export class CampaignRoom extends Room<CampaignState> {
     this.lastEnemySpawnMs = 0;
     this.zoneProgressMs = 0;
     this.bombTimerMs = BOMB_MS;
-    this.respawnAtMs = null;
+    this.respawnAtMs.clear();
     this.bossId = null;
     this.moveIntents.clear();
     this.lastShotAtMs.clear();
@@ -1007,9 +1088,8 @@ export class CampaignRoom extends Room<CampaignState> {
     this.resetBlast();
     this.resetRam();
     this.resetDecoy();
-    this.blinkLockMs = 0;
 
-    this.spawnPlayer();
+    this.spawnAllPlayers();
     if (this.currentWinCondition() === CampaignWinCondition.AssassinateBoss) {
       if (this.state.currentLevel === CORE_LEVEL) this.spawnCore();
       else if (this.state.currentLevel === ARTILLERY_BOSS_LEVEL) this.spawnArtillery();
@@ -1359,22 +1439,44 @@ export class CampaignRoom extends Room<CampaignState> {
     return { x: startX, y: startY };
   }
 
-  /** Puts the player's tank on its spawn pad, invulnerable for a moment. */
-  private spawnPlayer(): boolean {
-    if (!this.playerId) return false;
+  /** Puts every seated player on the field. */
+  private spawnAllPlayers(): void {
+    for (const [sessionId] of this.state.players) this.spawnPlayer(sessionId);
+  }
 
-    // On the escort level the carrier takes the centre pad, so the player spawns
+  /**
+   * Puts one player's tank on its spawn pad, invulnerable for a moment.
+   *
+   * Seats are fanned out sideways from the pad so a co-op team does not all try
+   * to materialise on the same tile — {@link getSafeSpawnPosition} would push
+   * them apart anyway, but starting them spread keeps the search cheap and the
+   * formation tidy.
+   */
+  private spawnPlayer(ownerId: string): boolean {
+    if (!ownerId) return false;
+    // Already on the field — nothing to do.
+    if (this.findTank(ownerId)) return true;
+
+    // On the escort level the carrier takes the centre pad, so players spawn
     // beside it rather than on top of it.
+    const seat = this.seatIndex(ownerId);
+    const offset = seat % 2 === 0 ? seat : -(seat + 1);
     const spawnCol =
-      this.currentWinCondition() === CampaignWinCondition.Escort ? PLAYER_SPAWN.x + 4 : PLAYER_SPAWN.x;
-    const defaultX = spawnCol * TILE_SIZE;
+      (this.currentWinCondition() === CampaignWinCondition.Escort ? PLAYER_SPAWN.x + 4 : PLAYER_SPAWN.x) +
+      offset;
+
+    const defaultX = Math.max(1, Math.min(GRID_WIDTH - 2, spawnCol)) * TILE_SIZE;
     const defaultY = PLAYER_SPAWN.y * TILE_SIZE;
 
     const { x, y } = this.getSafeSpawnPosition(defaultX, defaultY);
 
     if (isBlocked(this.state, x, y, TANK_SIZE, TANK_SIZE)) return false;
 
-    const speed = this.state.currentLevel > 5 ? TANK_SPEED * 1.15 : TANK_SPEED;
+    const base = this.state.currentLevel > 5 ? TANK_SPEED * 1.15 : TANK_SPEED;
+    // Overdrive and Reinforced Hull are read here, so a tank always comes back
+    // built to whatever the run has earned so far.
+    const speed = base * (1 + 0.12 * this.upgradeCount(ownerId, "speed"));
+    const maxHealth = TANK_MAX_HEALTH + this.upgradeCount(ownerId, "hull");
 
     this.state.tanks.push(
       new Tank({
@@ -1382,8 +1484,8 @@ export class CampaignRoom extends Room<CampaignState> {
         y,
         width: TANK_SIZE,
         height: TANK_SIZE,
-        ownerId: this.playerId,
-        maxHealth: TANK_MAX_HEALTH,
+        ownerId,
+        maxHealth,
         speed,
         direction: Direction.Up,
         isEnemy: false,
@@ -1394,10 +1496,34 @@ export class CampaignRoom extends Room<CampaignState> {
     const invulnMs = this.state.currentLevel > 15
       ? PLAYER_INVULNERABILITY_MS * 2
       : PLAYER_INVULNERABILITY_MS;
-    this.invulnerableUntilMs.set(this.playerId, this.elapsedMs + invulnMs);
-    const player = this.state.players.get(this.playerId);
+    this.invulnerableUntilMs.set(ownerId, this.elapsedMs + invulnMs);
+    this.respawnAtMs.delete(ownerId);
+    this.abilities.set(ownerId, freshAbilities());
+
+    const player = this.state.players.get(ownerId);
     if (player) player.respawnInSeconds = 0;
     return true;
+  }
+
+  /**
+   * Mirrors the shared lives pool onto every seat's record.
+   *
+   * `state.lives` is the team's, but each Player carries a copy for its own HUD
+   * row — so every one of them has to be refreshed, not just the seat that
+   * happened to trigger the change.
+   */
+  private syncLives(): void {
+    for (const [, seat] of this.state.players) seat.lives = this.state.lives;
+  }
+
+  /** A stable 0-based index for a seat, used to fan spawns out. */
+  private seatIndex(ownerId: string): number {
+    let index = 0;
+    for (const [sessionId] of this.state.players) {
+      if (sessionId === ownerId) return index;
+      index++;
+    }
+    return 0;
   }
 
   // ---------------------------------------------------------------- simulation
@@ -1763,7 +1889,7 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** True when the player's hull overlaps any tile of the given type. */
   private playerOverlapsTile(tileType: TileType): boolean {
-    const tank = this.playerId ? this.findTank(this.playerId) : undefined;
+    const tank = this.anyPlayer();
     if (!tank) return false;
 
     const minTX = Math.floor(tank.x / TILE_SIZE);
@@ -1813,7 +1939,7 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** Defuses (clears) any bomb tile the player's hull is currently touching. */
   private defuseBombsUnderPlayer(): void {
-    const tank = this.playerId ? this.findTank(this.playerId) : undefined;
+    const tank = this.anyPlayer();
     if (!tank) return;
 
     const minTX = Math.floor(tank.x / TILE_SIZE);
@@ -1837,8 +1963,7 @@ export class CampaignRoom extends Room<CampaignState> {
    */
   private detonateBombs(): void {
     this.state.lives = Math.max(0, this.state.lives - 1);
-    const player = this.playerId ? this.state.players.get(this.playerId) : undefined;
-    if (player) player.lives = this.state.lives;
+    this.syncLives();
 
     if (this.state.lives <= 0) {
       this.state.phase = CampaignPhase.GameOver;
@@ -1869,7 +1994,7 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** Collects (clears) any intel tile the player's hull is currently touching. */
   private collectIntelUnderPlayer(): void {
-    const tank = this.playerId ? this.findTank(this.playerId) : undefined;
+    const tank = this.anyPlayer();
     if (!tank) return;
 
     const minTX = Math.floor(tank.x / TILE_SIZE);
@@ -1946,18 +2071,25 @@ export class CampaignRoom extends Room<CampaignState> {
    * counter-play is to break the line rather than to out-range it.
    */
   private tickLurchers(deltaMs: number): void {
-    if (this.blinkLockMs > 0) this.blinkLockMs = Math.max(0, this.blinkLockMs - deltaMs);
+    for (const abilities of this.abilities.values()) {
+      if (abilities.blinkLockMs > 0) {
+        abilities.blinkLockMs = Math.max(0, abilities.blinkLockMs - deltaMs);
+      }
+    }
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player) return;
-
-    const px = player.x + player.width / 2;
-    const py = player.y + player.height / 2;
     const range = LURCHER_RANGE_TILES * TILE_SIZE;
 
     for (let i = 0; i < this.state.tanks.length; i++) {
       const tank = this.state.tanks.at(i);
       if (tank.variant !== LURCHER) continue;
+
+      // Each Lurcher reels in whoever is closest to it, so in co-op they split
+      // across the team instead of every one of them ganging up on one seat.
+      const player = this.nearestPlayerTo(tank);
+      if (!player) continue;
+
+      const px = player.x + player.width / 2;
+      const py = player.y + player.height / 2;
 
       const timer = (this.lurcherTimers.get(tank.ownerId) ?? Math.random() * LURCHER_INTERVAL_MS) + deltaMs;
       if (timer < LURCHER_INTERVAL_MS) {
@@ -1996,7 +2128,7 @@ export class CampaignRoom extends Room<CampaignState> {
 
       player.x = toX;
       player.y = toY;
-      this.blinkLockMs = LURCHER_LOCK_MS;
+      this.abilitiesOf(player.ownerId).blinkLockMs = LURCHER_LOCK_MS;
 
       this.broadcast(ServerMessage.GrappleHit, {
         fromX: cx,
@@ -2078,7 +2210,7 @@ export class CampaignRoom extends Room<CampaignState> {
     const boss = this.findTank(this.bossId);
     if (!boss || boss.variant !== EFFIGY) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.nearestPlayerTo(boss);
 
     // Its shield runs on the same shape of timer the player's does.
     if (this.effigyShieldMs > 0) {
@@ -2195,15 +2327,16 @@ export class CampaignRoom extends Room<CampaignState> {
       radius,
     } satisfies BlastChangedMessage);
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player || player.isInvulnerable || this.isShieldUp(player)) return;
+    for (const player of this.playerTanks()) {
+      if (player.isInvulnerable || this.isShieldUp(player)) continue;
 
-    const dx = player.x + player.width / 2 - cx;
-    const dy = player.y + player.height / 2 - cy;
-    if (Math.hypot(dx, dy) > radius) return;
+      const dx = player.x + player.width / 2 - cx;
+      const dy = player.y + player.height / 2 - cy;
+      if (Math.hypot(dx, dy) > radius) continue;
 
-    player.currentHealth = Math.max(0, player.currentHealth - 1);
-    if (player.currentHealth === 0) this.killPlayer();
+      player.currentHealth = Math.max(0, player.currentHealth - 1);
+      if (player.currentHealth === 0) this.killPlayer(player.ownerId);
+    }
   }
 
   // ------------------------------------------------------------------ sappers
@@ -2253,15 +2386,18 @@ export class CampaignRoom extends Room<CampaignState> {
   private moveSappers(): void {
     this.sapperHolding.clear();
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player) return;
-
-    const px = player.x + player.width / 2;
-    const py = player.y + player.height / 2;
-
     for (let i = 0; i < this.state.tanks.length; i++) {
       const tank = this.state.tanks.at(i);
       if (tank.variant !== SAPPER) continue;
+
+      // Each Sapper keeps its standoff band against whoever is nearest to it,
+      // so in co-op they spread out across the team rather than all backing
+      // away from the same seat.
+      const player = this.nearestPlayerTo(tank);
+      if (!player) continue;
+
+      const px = player.x + player.width / 2;
+      const py = player.y + player.height / 2;
 
       const dx = px - (tank.x + tank.width / 2);
       const dy = py - (tank.y + tank.height / 2);
@@ -2300,12 +2436,14 @@ export class CampaignRoom extends Room<CampaignState> {
    * strike always resolves — the same rule the artillery boss plays by.
    */
   private tickSapperLobs(deltaMs: number): void {
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-
-    if (player) {
+    {
       for (let i = 0; i < this.state.tanks.length; i++) {
         const tank = this.state.tanks.at(i);
         if (tank.variant !== SAPPER) continue;
+
+        // Shells go at whoever this Sapper is actually holding off.
+        const player = this.nearestPlayerTo(tank);
+        if (!player) continue;
 
         // A fresh Sapper starts partway through its cycle, so a group that
         // spawned together does not fire in one synchronised salvo.
@@ -2378,16 +2516,19 @@ export class CampaignRoom extends Room<CampaignState> {
       if (this.state.grid.at(index) === TileType.Brick) this.state.grid[index] = TileType.Empty;
     }
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player || player.isInvulnerable || this.isShieldUp(player)) return;
-
     const bx = worldX - SAPPER_LOB_RADIUS;
     const by = worldY - SAPPER_LOB_RADIUS;
     const size = SAPPER_LOB_RADIUS * 2;
 
-    if (boxesOverlap(bx, by, size, size, player.x, player.y, player.width, player.height)) {
+    // A blast is a place, not a person: everyone standing in it is caught.
+    for (const player of this.playerTanks()) {
+      if (player.isInvulnerable || this.isShieldUp(player)) continue;
+      if (!boxesOverlap(bx, by, size, size, player.x, player.y, player.width, player.height)) {
+        continue;
+      }
+
       player.currentHealth = Math.max(0, player.currentHealth - SAPPER_LOB_DAMAGE);
-      if (player.currentHealth === 0) this.killPlayer();
+      if (player.currentHealth === 0) this.killPlayer(player.ownerId);
     }
   }
 
@@ -2411,39 +2552,43 @@ export class CampaignRoom extends Room<CampaignState> {
     }
   }
 
-  /** Detonates a mine under the player: clears the tile and kills the player. */
+  /** Detonates mines under any player: clears the tile and kills them. */
   private resolveMines(): void {
-    const tank = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!tank || tank.isInvulnerable) return;
+    // Every player treads on their own mines — checked per tank rather than
+    // once for "the player", or in co-op only one seat would ever set one off.
+    for (const tank of this.playerTanks()) {
+      if (tank.isInvulnerable) continue;
 
-    // A raised shield does not make the player intangible — the mine still goes
-    // off, it is still spent, and the blast is simply soaked. Skipping the whole
-    // pass instead would leave live charges armed under the player's tracks, to
-    // catch them the moment the shield lapsed.
-    const absorbed = this.isShieldUp(tank);
+      // A raised shield does not make the player intangible — the mine still
+      // goes off, it is still spent, and the blast is simply soaked. Skipping
+      // the pass instead would leave live charges armed under their tracks, to
+      // catch them the moment the shield lapsed.
+      const absorbed = this.isShieldUp(tank);
 
-    const minTX = Math.floor(tank.x / TILE_SIZE);
-    const maxTX = Math.floor((tank.x + tank.width - 1) / TILE_SIZE);
-    const minTY = Math.floor(tank.y / TILE_SIZE);
-    const maxTY = Math.floor((tank.y + tank.height - 1) / TILE_SIZE);
+      const minTX = Math.floor(tank.x / TILE_SIZE);
+      const maxTX = Math.floor((tank.x + tank.width - 1) / TILE_SIZE);
+      const minTY = Math.floor(tank.y / TILE_SIZE);
+      const maxTY = Math.floor((tank.y + tank.height - 1) / TILE_SIZE);
 
-    for (let ty = minTY; ty <= maxTY; ty++) {
-      for (let tx = minTX; tx <= maxTX; tx++) {
-        if (!isInsideGrid(tx, ty)) continue;
-        const index = tileIndex(tx, ty);
-        if (this.state.grid.at(index) !== TileType.Mine) continue;
+      let done = false;
+      for (let ty = minTY; ty <= maxTY && !done; ty++) {
+        for (let tx = minTX; tx <= maxTX && !done; tx++) {
+          if (!isInsideGrid(tx, ty)) continue;
+          const index = tileIndex(tx, ty);
+          if (this.state.grid.at(index) !== TileType.Mine) continue;
 
-        this.state.grid[index] = TileType.Empty;
-        this.forgetMine(tx, ty);
+          this.state.grid[index] = TileType.Empty;
+          this.forgetMine(tx, ty);
 
-        this.broadcast(ServerMessage.MineDetonated, {
-          x: tx * TILE_SIZE + TILE_SIZE / 2,
-          y: ty * TILE_SIZE + TILE_SIZE / 2,
-          absorbed,
-        } satisfies MineDetonatedMessage);
+          this.broadcast(ServerMessage.MineDetonated, {
+            x: tx * TILE_SIZE + TILE_SIZE / 2,
+            y: ty * TILE_SIZE + TILE_SIZE / 2,
+            absorbed,
+          } satisfies MineDetonatedMessage);
 
-        if (!absorbed) this.killPlayer();
-        return;
+          if (!absorbed) this.killPlayer(tank.ownerId);
+          done = true;
+        }
       }
     }
   }
@@ -2574,8 +2719,7 @@ export class CampaignRoom extends Room<CampaignState> {
   private loseConvoy(): void {
     this.convoyId = null;
     this.state.lives = Math.max(0, this.state.lives - 1);
-    const player = this.playerId ? this.state.players.get(this.playerId) : undefined;
-    if (player) player.lives = this.state.lives;
+    this.syncLives();
 
     if (this.state.lives <= 0) {
       this.state.phase = CampaignPhase.GameOver;
@@ -2600,6 +2744,11 @@ export class CampaignRoom extends Room<CampaignState> {
     }
     this.state.bullets.splice(0);
     this.state.phase = CampaignPhase.Outro;
+
+    // The outro is where the run is shaped: deal each survivor a hand while
+    // they read the debrief.
+    this.offerUpgrades();
+
     console.log(`[room ${this.roomId}] level ${this.state.currentLevel} cleared`);
     return true;
   }
@@ -2624,14 +2773,15 @@ export class CampaignRoom extends Room<CampaignState> {
    * respawn grace, matching how shells pass through an invulnerable tank.
    */
   private resolveKamikaze(): void {
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player || player.isInvulnerable || this.isShieldUp(player)) return;
-
     const pad = KAMIKAZE_CONTACT_PADDING;
 
     for (let i = this.state.tanks.length - 1; i >= 0; i--) {
       const enemy = this.state.tanks.at(i);
       if (!enemy.isEnemy || enemy.variant !== KAMIKAZE) continue;
+
+      // A rusher detonates on whoever it actually reached.
+      const player = this.nearestPlayerTo(enemy);
+      if (!player || player.isInvulnerable || this.isShieldUp(player)) continue;
 
       const inContact = boxesOverlap(
         enemy.x - pad,
@@ -2748,7 +2898,7 @@ export class CampaignRoom extends Room<CampaignState> {
   private maybeHomingBounce(boss: Tank, dt: number): void {
     if (Math.random() >= SWEEPER_HOMING_CHANCE) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.nearestPlayerTo(boss);
     if (!player) return;
 
     const bossCx = boss.x + boss.width / 2;
@@ -2846,7 +2996,7 @@ export class CampaignRoom extends Room<CampaignState> {
     }
     if (boss.variant !== JUGGERNAUT) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.nearestPlayerTo(boss);
     if (player) {
       const bossCx = boss.x + boss.width / 2;
       const bossCy = boss.y + boss.height / 2;
@@ -2910,7 +3060,7 @@ export class CampaignRoom extends Room<CampaignState> {
     const boss = this.findTank(this.bossId);
     if (!boss || boss.variant !== WARDEN) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.nearestPlayerTo(boss);
     if (player) {
       const bossCx = boss.x + boss.width / 2;
       const bossCy = boss.y + boss.height / 2;
@@ -2980,7 +3130,7 @@ export class CampaignRoom extends Room<CampaignState> {
     const boss = this.findTank(this.bossId);
     if (!boss || boss.variant !== ARTILLERY) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.nearestPlayerTo(boss);
     if (!player) return;
 
     const bossCx = boss.x + boss.width / 2;
@@ -3023,7 +3173,7 @@ export class CampaignRoom extends Room<CampaignState> {
     const boss = this.findTank(this.bossId);
     if (!boss || boss.variant !== BASTION) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.nearestPlayerTo(boss);
     if (!player) return;
 
     // Rotate one quarter-turn at a time, on a timer — the delay between swings
@@ -3104,7 +3254,7 @@ export class CampaignRoom extends Room<CampaignState> {
     this.architectLobMs += deltaMs;
     if (this.architectLobMs >= ARCHITECT_LOB_INTERVAL_MS) {
       this.architectLobMs -= ARCHITECT_LOB_INTERVAL_MS;
-      const player = this.playerId ? this.findTank(this.playerId) : undefined;
+      const player = this.anyPlayer();
       if (player) this.launchSapperLob(boss, player);
     }
 
@@ -3192,11 +3342,13 @@ export class CampaignRoom extends Room<CampaignState> {
       subtle: false,
     } satisfies BossBounceMessage);
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player || player.isInvulnerable) return;
-    // The closing wall kills through a shield, like a boss hull does.
-    if (isBlocked(this.state, player.x, player.y, player.width, player.height)) {
-      this.killPlayer();
+    // The closing wall kills through a shield, like a boss hull does — and it
+    // takes everyone it closed on, not just one of them.
+    for (const player of this.playerTanks()) {
+      if (player.isInvulnerable) continue;
+      if (isBlocked(this.state, player.x, player.y, player.width, player.height)) {
+        this.killPlayer(player.ownerId);
+      }
     }
   }
 
@@ -3253,7 +3405,7 @@ export class CampaignRoom extends Room<CampaignState> {
     const phase = this.corePhase(boss);
     if (phase === 1) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.nearestPlayerTo(boss);
     if (!player) return;
 
     const speed = phase === 2 ? CORE_PHASE2_SPEED : CORE_PHASE3_SPEED;
@@ -3319,7 +3471,7 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** Phase 2: 3-shot shotgun aimed at the player. */
   private fireCoreShotgun(boss: Tank): void {
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.nearestPlayerTo(boss);
     if (!player) return;
 
     const cx = boss.x + boss.width / 2;
@@ -3401,11 +3553,12 @@ export class CampaignRoom extends Room<CampaignState> {
    * it jumps to hunting speed and begins firing like a tank.
    */
   private revealMimics(): void {
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-
     for (let i = 0; i < this.state.tanks.length; i++) {
       const tank = this.state.tanks.at(i);
       if (tank.variant !== MIMIC || !tank.isDisguised) continue;
+
+      // Springs on whoever walks into it, not on one nominated player.
+      const player = this.nearestPlayerTo(tank);
 
       let reveal = tank.currentHealth < tank.maxHealth;
       if (!reveal && player) {
@@ -3423,6 +3576,195 @@ export class CampaignRoom extends Room<CampaignState> {
     }
   }
 
+  // --------------------------------------------------------------- upgrades
+
+  /** How many stacks of `id` this player has taken. */
+  private upgradeCount(ownerId: string, id: string): number {
+    return this.upgrades.get(ownerId)?.get(id) ?? 0;
+  }
+
+  /**
+   * A cooldown after Coolant Loop, floored so it can never reach zero.
+   *
+   * Multiplicative rather than additive: three stacks leave 51% of the original
+   * wait instead of wiping it out, which keeps the abilities on a leash however
+   * lucky the offers were.
+   */
+  private cooled(ownerId: string, ms: number): number {
+    return Math.round(ms * Math.pow(0.8, this.upgradeCount(ownerId, "cool")));
+  }
+
+  /** Shield duration after Hardened Deflector. */
+  private shieldDuration(ownerId: string): number {
+    return SHIELD_DURATION_MS + 1500 * this.upgradeCount(ownerId, "shieldup");
+  }
+
+  /** Blink charge ceiling after Phase Capacitor. */
+  private blinkCap(ownerId: string): number {
+    return TELEPORT_MAX_CHARGES + this.upgradeCount(ownerId, "blink");
+  }
+
+  /** Decoy beacon lifetime after Loud Beacon. */
+  private decoyDuration(ownerId: string): number {
+    return DECOY_DURATION_MS + 4000 * this.upgradeCount(ownerId, "decoyup");
+  }
+
+  /**
+   * Deals a fresh hand of upgrade choices to every seat.
+   *
+   * Hands are rolled per player, so in co-op two people building the same run
+   * still end up with different tanks. Anything already at its stack ceiling is
+   * left out rather than offered as a dead pick.
+   */
+  private offerUpgrades(): void {
+    this.upgradeOffers.clear();
+
+    for (const [sessionId] of this.state.players) {
+      const pool = CAMPAIGN_UPGRADES.filter(
+        (upgrade) => this.upgradeCount(sessionId, upgrade.id) < upgrade.maxStacks,
+      );
+
+      // Fisher-Yates over a copy, then take the first few.
+      const shuffled = [...pool];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j]!, shuffled[i]!];
+      }
+
+      const ids = shuffled.slice(0, UPGRADE_CHOICES).map((upgrade) => upgrade.id);
+      this.upgradeOffers.set(sessionId, ids);
+      this.sendUpgradeOffer(sessionId);
+    }
+  }
+
+  /** Pushes a seat's current offer (and holdings) to that client. */
+  private sendUpgradeOffer(ownerId: string): void {
+    const owned: Record<string, number> = {};
+    for (const [id, stacks] of this.upgrades.get(ownerId) ?? []) owned[id] = stacks;
+
+    this.sendTo(ownerId, ServerMessage.UpgradeOffer, {
+      ids: this.upgradeOffers.get(ownerId) ?? [],
+      owned,
+    } satisfies UpgradeOfferMessage);
+  }
+
+  /**
+   * Takes one of the upgrades on offer.
+   *
+   * The pick is validated against what was actually dealt to *this* seat, so a
+   * crafted message cannot mint an arbitrary upgrade or take the same card
+   * twice. Spending the hand clears it, which is also what stops a player
+   * taking a second pick from the same level.
+   */
+  private chooseUpgrade(ownerId: string, id: unknown): void {
+    if (typeof id !== "string") return;
+
+    const offer = this.upgradeOffers.get(ownerId);
+    if (!offer || !offer.includes(id)) return;
+
+    const upgrade = findUpgrade(id);
+    if (!upgrade) return;
+
+    let owned = this.upgrades.get(ownerId);
+    if (!owned) {
+      owned = new Map<string, number>();
+      this.upgrades.set(ownerId, owned);
+    }
+
+    const stacks = (owned.get(id) ?? 0) + 1;
+    if (stacks > upgrade.maxStacks) return;
+    owned.set(id, stacks);
+
+    // Spare Crew is the one pick that pays out immediately rather than shaping
+    // the next level; everything else is read where it is used.
+    if (id === "life") {
+      this.state.lives += 1;
+      this.syncLives();
+    }
+
+    this.upgradeOffers.delete(ownerId);
+    this.sendUpgradeOffer(ownerId);
+  }
+
+  // ------------------------------------------------------------------ co-op
+
+  /**
+   * Sends a message to one seat rather than the whole room.
+   *
+   * Ability readouts are personal: broadcasting a cooldown would light up every
+   * team-mate's HUD as though they had spent the ability too.
+   */
+  private sendTo(ownerId: string, type: string, payload: unknown): void {
+    for (const client of this.clients) {
+      if (client.sessionId === ownerId) {
+        client.send(type, payload);
+        return;
+      }
+    }
+  }
+
+  /** That player's ability state, created on first use. */
+  private abilitiesOf(ownerId: string): AbilityState {
+    let state = this.abilities.get(ownerId);
+    if (!state) {
+      state = freshAbilities();
+      this.abilities.set(ownerId, state);
+    }
+    return state;
+  }
+
+  /** Every living player tank on the field. */
+  private playerTanks(): Tank[] {
+    const players: Tank[] = [];
+    for (let i = 0; i < this.state.tanks.length; i++) {
+      const tank = this.state.tanks.at(i);
+      // Enemies are out, and so is the escort carrier — it is friendly but it
+      // is not a player and must never be treated as a target or an actor.
+      if (tank.isEnemy || tank.variant === CONVOY) continue;
+      players.push(tank);
+    }
+    return players;
+  }
+
+  /**
+   * The living player closest to a point, or undefined when none are up.
+   *
+   * This is what every hunter, boss and standoff unit aims at. Nearest rather
+   * than a fixed seat, so in co-op the threat follows whoever actually walked
+   * into it instead of ignoring them to chase a team-mate across the map.
+   */
+  private nearestPlayer(x: number, y: number): Tank | undefined {
+    let best: Tank | undefined;
+    let bestDistance = Infinity;
+
+    for (const tank of this.playerTanks()) {
+      const dx = tank.x + tank.width / 2 - x;
+      const dy = tank.y + tank.height / 2 - y;
+      const distance = dx * dx + dy * dy;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = tank;
+      }
+    }
+
+    return best;
+  }
+
+  /** The nearest player to a given tank — the usual form of the question. */
+  private nearestPlayerTo(tank: Tank): Tank | undefined {
+    return this.nearestPlayer(tank.x + tank.width / 2, tank.y + tank.height / 2);
+  }
+
+  /**
+   * Any one living player.
+   *
+   * For the handful of checks that only care whether the team is still on the
+   * field at all, rather than which member is closest.
+   */
+  private anyPlayer(): Tank | undefined {
+    return this.playerTanks()[0];
+  }
+
   // -------------------------------------------------------------- suppression
 
   /**
@@ -3433,8 +3775,7 @@ export class CampaignRoom extends Room<CampaignState> {
    * mid-fight — walking into a bubble does not kill you, it just means you
    * cannot reach for anything new until the Nullifier is dealt with.
    */
-  private abilitiesSuppressed(): boolean {
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+  private abilitiesSuppressed(player: Tank | undefined): boolean {
     if (!player) return false;
 
     const px = player.x + player.width / 2;
@@ -3469,24 +3810,27 @@ export class CampaignRoom extends Room<CampaignState> {
    * the back stay open, so charging past a gun line is still a real risk.
    */
   private ramDeflects(target: Tank, bullet: Bullet): boolean {
-    if (target.isEnemy || this.ramActiveMs <= 0) return false;
+    if (target.isEnemy) return false;
+    const abilities = this.abilities.get(target.ownerId);
+    if (!abilities || abilities.ramActiveMs <= 0) return false;
     // The shell is coming head-on when it travels opposite the charge.
-    return bullet.direction === ((this.ramDirection + 2) % 4);
+    return bullet.direction === ((abilities.ramDirection + 2) % 4);
   }
 
-  /** Launches the ram surge along the player's current facing. */
-  private startRam(): void {
+  /** Launches the ram surge along that player's current facing. */
+  private startRam(ownerId: string): void {
     if (!this.ramUnlocked()) return;
-    if (this.ramActiveMs > 0 || this.ramCooldownMs > 0) return;
-    if (this.abilitiesSuppressed()) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player) return;
+    const abilities = this.abilitiesOf(ownerId);
+    if (abilities.ramActiveMs > 0 || abilities.ramCooldownMs > 0) return;
 
-    this.ramActiveMs = RAM_DURATION_MS;
-    this.ramDirection = player.direction;
+    const player = this.findTank(ownerId);
+    if (!player || this.abilitiesSuppressed(player)) return;
 
-    this.broadcast(ServerMessage.RamChanged, {
+    abilities.ramActiveMs = Math.round(RAM_DURATION_MS * (1 + 0.6 * this.upgradeCount(ownerId, "ramup")));
+    abilities.ramDirection = player.direction;
+
+    this.sendTo(ownerId, ServerMessage.RamChanged, {
       active: true,
       cooldownMs: 0,
     } satisfies RamChangedMessage);
@@ -3503,78 +3847,83 @@ export class CampaignRoom extends Room<CampaignState> {
    * kamikaze, which gives the two abilities a real combo.
    */
   private tickRam(deltaMs: number): void {
-    if (this.ramActiveMs <= 0) {
-      if (this.ramCooldownMs > 0) {
-        this.ramCooldownMs = Math.max(0, this.ramCooldownMs - deltaMs);
-        if (this.ramCooldownMs === 0) {
-          this.broadcast(ServerMessage.RamChanged, {
-            active: false,
-            cooldownMs: 0,
-          } satisfies RamChangedMessage);
+    for (const [ownerId, abilities] of this.abilities) {
+      if (abilities.ramActiveMs <= 0) {
+        if (abilities.ramCooldownMs > 0) {
+          abilities.ramCooldownMs = Math.max(0, abilities.ramCooldownMs - deltaMs);
+          if (abilities.ramCooldownMs === 0) {
+            this.sendTo(ownerId, ServerMessage.RamChanged, {
+              active: false,
+              cooldownMs: 0,
+            } satisfies RamChangedMessage);
+          }
         }
-      }
-      return;
-    }
-
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player) {
-      this.endRam();
-      return;
-    }
-
-    this.ramActiveMs = Math.max(0, this.ramActiveMs - deltaMs);
-
-    // Advance along the locked heading. A wall simply ends the surge.
-    player.direction = this.ramDirection;
-    const heading = DIRECTION_VECTORS[this.ramDirection];
-    const step = TANK_SPEED * RAM_SPEED_FACTOR;
-    const nextX = player.x + heading.x * step;
-    const nextY = player.y + heading.y * step;
-
-    if (isBlocked(this.state, nextX, nextY, player.width, player.height)) {
-      // Brick gives way to a charging hull; steel and the objective tiles do
-      // not, and stop the surge dead.
-      if (!this.ramThroughBrick(player, nextX, nextY)) {
-        this.endRam();
-        return;
-      }
-    }
-
-    player.x = nextX;
-    player.y = nextY;
-
-    // Resolve whatever the hull is now inside.
-    for (let i = this.state.tanks.length - 1; i >= 0; i--) {
-      const tank = this.state.tanks.at(i);
-      if (!tank.isEnemy) continue;
-      if (!boxesOverlap(player.x, player.y, player.width, player.height, tank.x, tank.y, tank.width, tank.height)) {
         continue;
       }
 
-      // A boss shrugs the charge off and runs the player down.
-      if (tank.isBoss) {
-        this.endRam();
-        if (!player.isInvulnerable) this.killPlayer();
-        return;
+      const player = this.findTank(ownerId);
+      if (!player) {
+        this.endRam(ownerId);
+        continue;
       }
 
-      // A rusher detonates — unless the deflector is up, which turns it.
-      if (tank.variant === KAMIKAZE) {
-        if (this.isShieldUp(player)) {
-          this.state.tanks.splice(i, 1);
-          this.onTankDestroyed(tank);
+      abilities.ramActiveMs = Math.max(0, abilities.ramActiveMs - deltaMs);
+
+      // Advance along the locked heading. A wall simply ends the surge.
+      player.direction = abilities.ramDirection;
+      const heading = DIRECTION_VECTORS[abilities.ramDirection];
+      const step = TANK_SPEED * RAM_SPEED_FACTOR;
+      const nextX = player.x + heading.x * step;
+      const nextY = player.y + heading.y * step;
+
+      if (isBlocked(this.state, nextX, nextY, player.width, player.height)) {
+        // Brick gives way to a charging hull; steel and the objective tiles do
+        // not, and stop the surge dead.
+        if (!this.ramThroughBrick(player, nextX, nextY)) {
+          this.endRam(ownerId);
           continue;
         }
-        this.endRam();
-        if (!player.isInvulnerable) this.killPlayer();
-        return;
       }
 
-      this.state.tanks.splice(i, 1);
-      this.onTankDestroyed(tank);
-    }
+      player.x = nextX;
+      player.y = nextY;
 
-    if (this.ramActiveMs === 0) this.endRam();
+      // Resolve whatever the hull is now inside.
+      let ended = false;
+      for (let i = this.state.tanks.length - 1; i >= 0; i--) {
+        const tank = this.state.tanks.at(i);
+        if (!tank.isEnemy) continue;
+        if (!boxesOverlap(player.x, player.y, player.width, player.height, tank.x, tank.y, tank.width, tank.height)) {
+          continue;
+        }
+
+        // A boss shrugs the charge off and runs the player down.
+        if (tank.isBoss) {
+          this.endRam(ownerId);
+          if (!player.isInvulnerable) this.killPlayer(ownerId);
+          ended = true;
+          break;
+        }
+
+        // A rusher detonates — unless the deflector is up, which turns it.
+        if (tank.variant === KAMIKAZE) {
+          if (this.isShieldUp(player)) {
+            this.state.tanks.splice(i, 1);
+            this.onTankDestroyed(tank);
+            continue;
+          }
+          this.endRam(ownerId);
+          if (!player.isInvulnerable) this.killPlayer(ownerId);
+          ended = true;
+          break;
+        }
+
+        this.state.tanks.splice(i, 1);
+        this.onTankDestroyed(tank);
+      }
+
+      if (!ended && abilities.ramActiveMs === 0) this.endRam(ownerId);
+    }
   }
 
   /**
@@ -3614,26 +3963,29 @@ export class CampaignRoom extends Room<CampaignState> {
     return true;
   }
 
-  /** Ends the surge and starts its cooldown. */
-  private endRam(): void {
-    if (this.ramActiveMs === 0 && this.ramCooldownMs > 0) return;
-    this.ramActiveMs = 0;
-    this.ramCooldownMs = RAM_COOLDOWN_MS;
+  /** Ends one player's surge and starts its cooldown. */
+  private endRam(ownerId: string): void {
+    const abilities = this.abilitiesOf(ownerId);
+    if (abilities.ramActiveMs === 0 && abilities.ramCooldownMs > 0) return;
+    abilities.ramActiveMs = 0;
+    abilities.ramCooldownMs = this.cooled(ownerId, RAM_COOLDOWN_MS);
 
-    this.broadcast(ServerMessage.RamChanged, {
+    this.sendTo(ownerId, ServerMessage.RamChanged, {
       active: false,
-      cooldownMs: RAM_COOLDOWN_MS,
+      cooldownMs: this.cooled(ownerId, RAM_COOLDOWN_MS),
     } satisfies RamChangedMessage);
   }
 
-  /** Clears the ram state — used on death and on level change. */
+  /** Clears every player's ram state — used on death and on level change. */
   private resetRam(): void {
-    this.ramActiveMs = 0;
-    this.ramCooldownMs = 0;
-    this.broadcast(ServerMessage.RamChanged, {
-      active: false,
-      cooldownMs: 0,
-    } satisfies RamChangedMessage);
+    for (const [ownerId, abilities] of this.abilities) {
+      abilities.ramActiveMs = 0;
+      abilities.ramCooldownMs = 0;
+      this.sendTo(ownerId, ServerMessage.RamChanged, {
+        active: false,
+        cooldownMs: 0,
+      } satisfies RamChangedMessage);
+    }
   }
 
   // ------------------------------------------------------------------- decoy
@@ -3650,63 +4002,70 @@ export class CampaignRoom extends Room<CampaignState> {
    * hunter field is rebuilt toward it instead of the player, and every
    * field-following enemy on the map turns and walks to it.
    */
-  private dropDecoy(): void {
+  private dropDecoy(ownerId: string): void {
     if (!this.decoyUnlocked()) return;
-    if (this.decoyCooldownMs > 0 || this.decoy) return;
-    if (this.abilitiesSuppressed()) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player) return;
+    const abilities = this.abilitiesOf(ownerId);
+    if (abilities.decoyCooldownMs > 0 || abilities.decoy) return;
 
-    this.decoy = {
+    const player = this.findTank(ownerId);
+    if (!player || this.abilitiesSuppressed(player)) return;
+
+    abilities.decoy = {
       x: player.x + player.width / 2,
       y: player.y + player.height / 2,
-      remainingMs: DECOY_DURATION_MS,
+      remainingMs: this.decoyDuration(ownerId),
     };
 
     this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
 
+    // The beacon itself is visible to the whole team — it is a thing on the
+    // battlefield, not a private readout — but the cooldown is personal.
     this.broadcast(ServerMessage.DecoyChanged, {
       cooldownMs: 0,
-      x: this.decoy.x,
-      y: this.decoy.y,
-      durationMs: DECOY_DURATION_MS,
+      x: abilities.decoy.x,
+      y: abilities.decoy.y,
+      durationMs: this.decoyDuration(ownerId),
     } satisfies DecoyChangedMessage);
   }
 
-  /** Expires a standing beacon and runs the decoy cooldown. */
+  /** Expires standing beacons and runs each player's decoy cooldown. */
   private tickDecoy(deltaMs: number): void {
-    if (this.decoy) {
-      this.decoy.remainingMs -= deltaMs;
-      if (this.decoy.remainingMs <= 0) {
-        this.decoy = null;
-        this.decoyCooldownMs = DECOY_COOLDOWN_MS;
-        // Attention snaps back to the player the moment it goes out.
-        this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
-        this.broadcast(ServerMessage.DecoyChanged, {
-          cooldownMs: DECOY_COOLDOWN_MS,
-        } satisfies DecoyChangedMessage);
+    for (const [ownerId, abilities] of this.abilities) {
+      if (abilities.decoy) {
+        abilities.decoy.remainingMs -= deltaMs;
+        if (abilities.decoy.remainingMs <= 0) {
+          abilities.decoy = null;
+          abilities.decoyCooldownMs = this.cooled(ownerId, DECOY_COOLDOWN_MS);
+          // Attention snaps back to the players the moment it goes out.
+          this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+          this.sendTo(ownerId, ServerMessage.DecoyChanged, {
+            cooldownMs: this.cooled(ownerId, DECOY_COOLDOWN_MS),
+          } satisfies DecoyChangedMessage);
+        }
+        continue;
       }
-      return;
-    }
 
-    if (this.decoyCooldownMs > 0) {
-      this.decoyCooldownMs = Math.max(0, this.decoyCooldownMs - deltaMs);
-      if (this.decoyCooldownMs === 0) {
-        this.broadcast(ServerMessage.DecoyChanged, {
-          cooldownMs: 0,
-        } satisfies DecoyChangedMessage);
+      if (abilities.decoyCooldownMs > 0) {
+        abilities.decoyCooldownMs = Math.max(0, abilities.decoyCooldownMs - deltaMs);
+        if (abilities.decoyCooldownMs === 0) {
+          this.sendTo(ownerId, ServerMessage.DecoyChanged, {
+            cooldownMs: 0,
+          } satisfies DecoyChangedMessage);
+        }
       }
     }
   }
 
-  /** Clears the decoy state — used on death and on level change. */
+  /** Clears every decoy — used on death and on level change. */
   private resetDecoy(): void {
-    this.decoy = null;
-    this.decoyCooldownMs = 0;
-    this.broadcast(ServerMessage.DecoyChanged, {
-      cooldownMs: 0,
-    } satisfies DecoyChangedMessage);
+    for (const [ownerId, abilities] of this.abilities) {
+      abilities.decoy = null;
+      abilities.decoyCooldownMs = 0;
+      this.sendTo(ownerId, ServerMessage.DecoyChanged, {
+        cooldownMs: 0,
+      } satisfies DecoyChangedMessage);
+    }
   }
 
   // ------------------------------------------------------------------- blast
@@ -3728,17 +4087,18 @@ export class CampaignRoom extends Room<CampaignState> {
    * A button that ignored all three would delete those fights. The blast is the
    * answer to being swarmed, not the answer to a boss.
    */
-  private fireBlast(): void {
+  private fireBlast(ownerId: string): void {
     if (!this.blastUnlocked()) return;
-    if (this.blastCooldownMs > 0) return;
-    if (this.abilitiesSuppressed()) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player) return;
+    const abilities = this.abilitiesOf(ownerId);
+    if (abilities.blastCooldownMs > 0) return;
+
+    const player = this.findTank(ownerId);
+    if (!player || this.abilitiesSuppressed(player)) return;
 
     const cx = player.x + player.width / 2;
     const cy = player.y + player.height / 2;
-    const radius = BLAST_RADIUS_TILES * TILE_SIZE;
+    const radius = (BLAST_RADIUS_TILES + 2 * this.upgradeCount(ownerId, "blastup")) * TILE_SIZE;
 
     // Ordinary enemies inside the ring are destroyed outright.
     for (let i = this.state.tanks.length - 1; i >= 0; i--) {
@@ -3791,35 +4151,45 @@ export class CampaignRoom extends Room<CampaignState> {
       this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
     }
 
-    this.blastCooldownMs = BLAST_COOLDOWN_MS;
+    abilities.blastCooldownMs = this.cooled(ownerId, BLAST_COOLDOWN_MS);
 
+    // The shockwave is a world event everyone should see; the cooldown that
+    // follows belongs only to the player who spent it.
     this.broadcast(ServerMessage.BlastChanged, {
-      cooldownMs: BLAST_COOLDOWN_MS,
+      cooldownMs: 0,
       x: cx,
       y: cy,
       radius,
       brickRadius,
     } satisfies BlastChangedMessage);
+
+    this.sendTo(ownerId, ServerMessage.BlastChanged, {
+      cooldownMs: this.cooled(ownerId, BLAST_COOLDOWN_MS),
+    } satisfies BlastChangedMessage);
   }
 
-  /** Counts the blast cooldown down and announces when it is ready again. */
+  /** Counts each blast cooldown down and announces when it is ready again. */
   private tickBlast(deltaMs: number): void {
-    if (this.blastCooldownMs <= 0) return;
+    for (const [ownerId, abilities] of this.abilities) {
+      if (abilities.blastCooldownMs <= 0) continue;
 
-    this.blastCooldownMs = Math.max(0, this.blastCooldownMs - deltaMs);
-    if (this.blastCooldownMs > 0) return;
+      abilities.blastCooldownMs = Math.max(0, abilities.blastCooldownMs - deltaMs);
+      if (abilities.blastCooldownMs > 0) continue;
 
-    this.broadcast(ServerMessage.BlastChanged, {
-      cooldownMs: 0,
-    } satisfies BlastChangedMessage);
+      this.sendTo(ownerId, ServerMessage.BlastChanged, {
+        cooldownMs: 0,
+      } satisfies BlastChangedMessage);
+    }
   }
 
-  /** Clears the blast cooldown — used on death and on level change. */
+  /** Clears every blast cooldown — used on death and on level change. */
   private resetBlast(): void {
-    this.blastCooldownMs = 0;
-    this.broadcast(ServerMessage.BlastChanged, {
-      cooldownMs: 0,
-    } satisfies BlastChangedMessage);
+    for (const [ownerId, abilities] of this.abilities) {
+      abilities.blastCooldownMs = 0;
+      this.sendTo(ownerId, ServerMessage.BlastChanged, {
+        cooldownMs: 0,
+      } satisfies BlastChangedMessage);
+    }
   }
 
   // ---------------------------------------------------------------- teleport
@@ -3838,15 +4208,16 @@ export class CampaignRoom extends Room<CampaignState> {
    * player lands on the last clear tile before it. A blink with nowhere to go
    * costs nothing — the charge is only spent on a jump that actually moves.
    */
-  private teleportPlayer(): void {
+  private teleportPlayer(ownerId: string): void {
     if (!this.teleportUnlocked()) return;
-    if (this.teleportCharges <= 0) return;
-    if (this.abilitiesSuppressed()) return;
-    // A Lurcher's grapple clamps the drive shut for a moment after it lands.
-    if (this.blinkLockMs > 0) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player) return;
+    const abilities = this.abilitiesOf(ownerId);
+    if (abilities.teleportCharges <= 0) return;
+    // A Lurcher's grapple clamps the drive shut for a moment after it lands.
+    if (abilities.blinkLockMs > 0) return;
+
+    const player = this.findTank(ownerId);
+    if (!player || this.abilitiesSuppressed(player)) return;
 
     const heading = DIRECTION_VECTORS[player.direction];
     const fromX = player.x;
@@ -3875,12 +4246,13 @@ export class CampaignRoom extends Room<CampaignState> {
     player.x = destX;
     player.y = destY;
 
-    this.teleportCharges--;
-    if (this.teleportRechargeMs <= 0) this.teleportRechargeMs = TELEPORT_RECHARGE_MS;
+    abilities.teleportCharges--;
+    if (abilities.teleportRechargeMs <= 0) abilities.teleportRechargeMs = this.cooled(ownerId, TELEPORT_RECHARGE_MS);
 
+    // The jump streak is a world event; the charge count is personal.
     this.broadcast(ServerMessage.TeleportChanged, {
-      charges: this.teleportCharges,
-      rechargeMs: this.teleportRechargeMs,
+      charges: abilities.teleportCharges,
+      rechargeMs: abilities.teleportRechargeMs,
       fromX,
       fromY,
       toX: destX,
@@ -3888,37 +4260,42 @@ export class CampaignRoom extends Room<CampaignState> {
     } satisfies TeleportChangedMessage);
   }
 
-  /** Refills one blink charge at a time while the bank is below its cap. */
+  /** Refills one blink charge at a time, per player, below the cap. */
   private tickTeleport(deltaMs: number): void {
-    if (this.teleportCharges >= TELEPORT_MAX_CHARGES) {
-      this.teleportRechargeMs = 0;
-      return;
+    for (const [ownerId, abilities] of this.abilities) {
+      if (abilities.teleportCharges >= this.blinkCap(ownerId)) {
+        abilities.teleportRechargeMs = 0;
+        continue;
+      }
+
+      if (abilities.teleportRechargeMs <= 0) abilities.teleportRechargeMs = this.cooled(ownerId, TELEPORT_RECHARGE_MS);
+
+      abilities.teleportRechargeMs -= deltaMs;
+      if (abilities.teleportRechargeMs > 0) continue;
+
+      abilities.teleportCharges = Math.min(this.blinkCap(ownerId), abilities.teleportCharges + 1);
+      abilities.teleportRechargeMs =
+        abilities.teleportCharges < this.blinkCap(ownerId) ? this.cooled(ownerId, TELEPORT_RECHARGE_MS) : 0;
+
+      this.sendTo(ownerId, ServerMessage.TeleportChanged, {
+        charges: abilities.teleportCharges,
+        rechargeMs: abilities.teleportRechargeMs,
+      } satisfies TeleportChangedMessage);
     }
-
-    if (this.teleportRechargeMs <= 0) this.teleportRechargeMs = TELEPORT_RECHARGE_MS;
-
-    this.teleportRechargeMs -= deltaMs;
-    if (this.teleportRechargeMs > 0) return;
-
-    this.teleportCharges = Math.min(TELEPORT_MAX_CHARGES, this.teleportCharges + 1);
-    this.teleportRechargeMs =
-      this.teleportCharges < TELEPORT_MAX_CHARGES ? TELEPORT_RECHARGE_MS : 0;
-
-    this.broadcast(ServerMessage.TeleportChanged, {
-      charges: this.teleportCharges,
-      rechargeMs: this.teleportRechargeMs,
-    } satisfies TeleportChangedMessage);
   }
 
-  /** Returns the blink bank to full — used on death and on level change. */
+  /** Returns every blink bank to full — used on death and on level change. */
   private resetTeleport(): void {
-    this.teleportCharges = TELEPORT_MAX_CHARGES;
-    this.teleportRechargeMs = 0;
+    for (const [ownerId, abilities] of this.abilities) {
+      abilities.teleportCharges = TELEPORT_MAX_CHARGES;
+      abilities.teleportRechargeMs = 0;
+      abilities.blinkLockMs = 0;
 
-    this.broadcast(ServerMessage.TeleportChanged, {
-      charges: this.teleportCharges,
-      rechargeMs: 0,
-    } satisfies TeleportChangedMessage);
+      this.sendTo(ownerId, ServerMessage.TeleportChanged, {
+        charges: abilities.teleportCharges,
+        rechargeMs: 0,
+      } satisfies TeleportChangedMessage);
+    }
   }
 
   // ------------------------------------------------------------------ shield
@@ -3934,47 +4311,51 @@ export class CampaignRoom extends Room<CampaignState> {
    * The cooldown starts when the shield *drops*, not when it is raised, so the
    * gap between protection is always the full {@link SHIELD_COOLDOWN_MS}.
    */
-  private raiseShield(): void {
+  private raiseShield(ownerId: string): void {
     if (!this.shieldUnlocked()) return;
-    if (this.shieldActiveMs > 0 || this.shieldCooldownMs > 0) return;
-    if (this.abilitiesSuppressed()) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player) return;
+    const abilities = this.abilitiesOf(ownerId);
+    if (abilities.shieldActiveMs > 0 || abilities.shieldCooldownMs > 0) return;
 
-    this.shieldActiveMs = SHIELD_DURATION_MS;
+    const player = this.findTank(ownerId);
+    if (!player || this.abilitiesSuppressed(player)) return;
+
+    abilities.shieldActiveMs = this.shieldDuration(ownerId);
+    // Replicated on the tank, so team-mates see the bubble too.
     player.isShielded = true;
 
-    this.broadcast(ServerMessage.ShieldChanged, {
+    this.sendTo(ownerId, ServerMessage.ShieldChanged, {
       active: true,
-      durationMs: SHIELD_DURATION_MS,
+      durationMs: this.shieldDuration(ownerId),
     } satisfies ShieldChangedMessage);
   }
 
-  /** Counts the shield down, drops it when it expires, then runs the cooldown. */
+  /** Counts each shield down, drops it, then runs that player's cooldown. */
   private tickShield(deltaMs: number): void {
-    if (this.shieldActiveMs > 0) {
-      this.shieldActiveMs = Math.max(0, this.shieldActiveMs - deltaMs);
-      if (this.shieldActiveMs === 0) {
-        const player = this.playerId ? this.findTank(this.playerId) : undefined;
-        if (player) player.isShielded = false;
-        this.shieldCooldownMs = SHIELD_COOLDOWN_MS;
+    for (const [ownerId, abilities] of this.abilities) {
+      if (abilities.shieldActiveMs > 0) {
+        abilities.shieldActiveMs = Math.max(0, abilities.shieldActiveMs - deltaMs);
+        if (abilities.shieldActiveMs === 0) {
+          const player = this.findTank(ownerId);
+          if (player) player.isShielded = false;
+          abilities.shieldCooldownMs = this.cooled(ownerId, SHIELD_COOLDOWN_MS);
 
-        this.broadcast(ServerMessage.ShieldChanged, {
-          active: false,
-          cooldownMs: SHIELD_COOLDOWN_MS,
-        } satisfies ShieldChangedMessage);
+          this.sendTo(ownerId, ServerMessage.ShieldChanged, {
+            active: false,
+            cooldownMs: this.cooled(ownerId, SHIELD_COOLDOWN_MS),
+          } satisfies ShieldChangedMessage);
+        }
+        continue;
       }
-      return;
-    }
 
-    if (this.shieldCooldownMs > 0) {
-      this.shieldCooldownMs = Math.max(0, this.shieldCooldownMs - deltaMs);
-      if (this.shieldCooldownMs === 0) {
-        this.broadcast(ServerMessage.ShieldChanged, {
-          active: false,
-          ready: true,
-        } satisfies ShieldChangedMessage);
+      if (abilities.shieldCooldownMs > 0) {
+        abilities.shieldCooldownMs = Math.max(0, abilities.shieldCooldownMs - deltaMs);
+        if (abilities.shieldCooldownMs === 0) {
+          this.sendTo(ownerId, ServerMessage.ShieldChanged, {
+            active: false,
+            ready: true,
+          } satisfies ShieldChangedMessage);
+        }
       }
     }
   }
@@ -4000,12 +4381,19 @@ export class CampaignRoom extends Room<CampaignState> {
     return target.variant === EFFIGY && target.isShielded;
   }
 
-  /** Drops the shield and clears its timers — used on death and level change. */
+  /** Drops every shield and clears its timers — on death and level change. */
   private resetShield(): void {
-    this.shieldActiveMs = 0;
-    this.shieldCooldownMs = 0;
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (player) player.isShielded = false;
+    for (const [ownerId, abilities] of this.abilities) {
+      abilities.shieldActiveMs = 0;
+      abilities.shieldCooldownMs = 0;
+      const player = this.findTank(ownerId);
+      if (player) player.isShielded = false;
+
+      this.sendTo(ownerId, ServerMessage.ShieldChanged, {
+        active: false,
+        ready: true,
+      } satisfies ShieldChangedMessage);
+    }
   }
 
   /** Decays each sprung Mimic's lunge back to its steady hunting speed. */
@@ -4071,22 +4459,24 @@ export class CampaignRoom extends Room<CampaignState> {
     const boss = this.findTank(this.bossId);
     if (!boss) return;
 
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (!player || player.isInvulnerable) return;
+    // Anyone the hull is inside gets run over, shield or no shield.
+    for (const player of this.playerTanks()) {
+      if (player.isInvulnerable) continue;
 
-    if (
-      boxesOverlap(
-        boss.x,
-        boss.y,
-        boss.width,
-        boss.height,
-        player.x,
-        player.y,
-        player.width,
-        player.height,
-      )
-    ) {
-      this.killPlayer();
+      if (
+        boxesOverlap(
+          boss.x,
+          boss.y,
+          boss.width,
+          boss.height,
+          player.x,
+          player.y,
+          player.width,
+          player.height,
+        )
+      ) {
+        this.killPlayer(player.ownerId);
+      }
     }
   }
 
@@ -4099,21 +4489,39 @@ export class CampaignRoom extends Room<CampaignState> {
   }
 
   /** Removes the player's tank and runs the death/respawn/game-over path. */
-  private killPlayer(): void {
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+  /**
+   * Destroys one player's tank.
+   *
+   * `ownerId` names the seat; omitting it kills whichever player is on the
+   * field, which is what the solo-era call sites mean. Only that player's
+   * abilities are cleared — a team-mate's shield must not drop because someone
+   * else died.
+   */
+  private killPlayer(ownerId?: string): void {
+    const player = ownerId ? this.findTank(ownerId) : this.anyPlayer();
     if (!player) return;
 
-    // Both abilities die with the tank; the respawn comes back with them ready.
-    this.resetShield();
-    this.resetTeleport();
-    this.resetBlast();
-    this.resetRam();
-    this.resetDecoy();
-    this.blinkLockMs = 0;
+    this.clearAbilities(player.ownerId);
 
     const index = this.state.tanks.indexOf(player);
     if (index >= 0) this.state.tanks.splice(index, 1);
     this.onTankDestroyed(player);
+  }
+
+  /** Returns one seat's whole loadout to ready, and tells that client. */
+  private clearAbilities(ownerId: string): void {
+    const player = this.findTank(ownerId);
+    if (player) player.isShielded = false;
+    this.abilities.set(ownerId, freshAbilities());
+
+    this.sendTo(ownerId, ServerMessage.ShieldChanged, { active: false, ready: true });
+    this.sendTo(ownerId, ServerMessage.TeleportChanged, {
+      charges: TELEPORT_MAX_CHARGES,
+      rechargeMs: 0,
+    });
+    this.sendTo(ownerId, ServerMessage.BlastChanged, { cooldownMs: 0 });
+    this.sendTo(ownerId, ServerMessage.RamChanged, { active: false, cooldownMs: 0 });
+    this.sendTo(ownerId, ServerMessage.DecoyChanged, { cooldownMs: 0 });
   }
 
   // ---------------------------------------------------------------- artillery
@@ -4158,7 +4566,7 @@ export class CampaignRoom extends Room<CampaignState> {
    * works. Each shell is spread randomly within ±2 tiles of the chosen centre.
    */
   private launchMortar(): void {
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
+    const player = this.anyPlayer();
     if (!player) return;
 
     const intent = this.moveIntents.get(player.ownerId);
@@ -4226,14 +4634,14 @@ export class CampaignRoom extends Room<CampaignState> {
     }
 
     // A player caught in the blast is killed (unless still in respawn grace).
-    const player = this.playerId ? this.findTank(this.playerId) : undefined;
-    if (
-      player &&
-      !player.isInvulnerable &&
-      !this.isShieldUp(player) &&
-      boxesOverlap(bx, by, bw, bh, player.x, player.y, player.width, player.height)
-    ) {
-      this.killPlayer();
+    for (const player of this.playerTanks()) {
+      if (
+        !player.isInvulnerable &&
+        !this.isShieldUp(player) &&
+        boxesOverlap(bx, by, bw, bh, player.x, player.y, player.width, player.height)
+      ) {
+        this.killPlayer(player.ownerId);
+      }
     }
   }
 
@@ -4265,10 +4673,13 @@ export class CampaignRoom extends Room<CampaignState> {
     if (tank.isEnemy) return;
 
     this.invulnerableUntilMs.delete(tank.ownerId);
+
+    // One shared pool for the team: any death costs the run a life, and the run
+    // ends when it is empty regardless of who was still standing.
     this.state.lives = Math.max(0, this.state.lives - 1);
 
+    this.syncLives();
     const player = this.state.players.get(tank.ownerId);
-    if (player) player.lives = this.state.lives;
 
     if (this.state.lives <= 0) {
       this.state.phase = CampaignPhase.GameOver;
@@ -4276,21 +4687,29 @@ export class CampaignRoom extends Room<CampaignState> {
       return;
     }
 
-    this.respawnAtMs = this.elapsedMs + PLAYER_RESPAWN_DELAY_MS;
+    this.respawnAtMs.set(tank.ownerId, this.elapsedMs + PLAYER_RESPAWN_DELAY_MS);
     if (player) player.respawnInSeconds = Math.ceil(PLAYER_RESPAWN_DELAY_MS / 1000);
   }
 
-  /** Returns the player to the field once the delay is up and the pad is free. */
+  /** Returns each dead player to the field once their delay is up. */
   private respawnPlayer(): void {
-    if (this.respawnAtMs === null) return;
+    for (const [ownerId, dueAt] of this.respawnAtMs) {
+      const seat = this.state.players.get(ownerId);
 
-    if (this.elapsedMs < this.respawnAtMs) {
-      const player = this.playerId ? this.state.players.get(this.playerId) : undefined;
-      if (player) player.respawnInSeconds = Math.ceil((this.respawnAtMs - this.elapsedMs) / 1000);
-      return;
+      // The seat left mid-countdown: drop the pending respawn.
+      if (!seat) {
+        this.respawnAtMs.delete(ownerId);
+        continue;
+      }
+
+      if (this.elapsedMs < dueAt) {
+        seat.respawnInSeconds = Math.ceil((dueAt - this.elapsedMs) / 1000);
+        continue;
+      }
+
+      // spawnPlayer clears the entry itself once the pad is actually free.
+      this.spawnPlayer(ownerId);
     }
-
-    if (this.spawnPlayer()) this.respawnAtMs = null;
   }
 
   /** Drops the respawn shield once the grace period is up. */
@@ -4784,16 +5203,19 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** The player's current tile, as a flow-field seed (empty when dead). */
   private playerTargets(): { x: number; y: number }[] {
-    // A standing decoy beacon *is* the target: every field-following enemy
-    // routes to it instead, which is the entire effect of the ability.
-    if (this.decoy) {
-      return [
-        {
-          x: Math.floor(this.decoy.x / TILE_SIZE),
-          y: Math.floor(this.decoy.y / TILE_SIZE),
-        },
-      ];
+    // Standing decoy beacons *are* the targets: every field-following enemy
+    // routes to one instead, which is the entire effect of the ability. With
+    // several out the field converges on whichever is nearest, exactly as it
+    // does with several players.
+    const beacons: { x: number; y: number }[] = [];
+    for (const abilities of this.abilities.values()) {
+      if (!abilities.decoy) continue;
+      beacons.push({
+        x: Math.floor(abilities.decoy.x / TILE_SIZE),
+        y: Math.floor(abilities.decoy.y / TILE_SIZE),
+      });
     }
+    if (beacons.length > 0) return beacons;
 
     const targets: { x: number; y: number }[] = [];
     for (let i = 0; i < this.state.tanks.length; i++) {
@@ -4817,7 +5239,7 @@ export class CampaignRoom extends Room<CampaignState> {
     // A surge is committed: steering input is ignored until it ends, so the ram
     // travels the line it was launched along instead of being curved mid-charge
     // by a held key (which would also stack ordinary movement on top of it).
-    if (this.ramActiveMs > 0 && ownerId === this.playerId) return;
+    if (this.abilities.get(ownerId)?.ramActiveMs) return;
 
     tank.direction = direction;
     this.moveIntents.set(ownerId, this.tick + MOVE_INTENT_TTL_TICKS);
@@ -4876,8 +5298,13 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** Whether a tank may fire: cooldown elapsed, and (enemies) no shell in flight. */
   private readyToShoot(tank: Tank, cooldownMs: number): boolean {
+    // Autoloader shortens the player's reload; enemies are unaffected.
+    const effective = tank.isEnemy
+      ? cooldownMs
+      : cooldownMs * Math.pow(0.85, this.upgradeCount(tank.ownerId, "rate"));
+
     const lastShot = this.lastShotAtMs.get(tank.ownerId);
-    if (lastShot !== undefined && this.elapsedMs - lastShot < cooldownMs) return false;
+    if (lastShot !== undefined && this.elapsedMs - lastShot < effective) return false;
     if (tank.isEnemy) return !this.state.bullets.some((bullet) => bullet.ownerId === tank.ownerId);
     return true;
   }
@@ -4901,9 +5328,17 @@ export class CampaignRoom extends Room<CampaignState> {
     const heading = DIRECTION_VECTORS[tank.direction];
     const across = { x: -heading.y, y: heading.x };
 
-    const bulletSpeed = !tank.isEnemy && this.state.currentLevel > 10
+    // Hot Loads stack on top of the late-campaign shell boost. Capped below the
+    // tile size: a shell that crosses a whole tile in one tick can jump a wall.
+    const boosted = !tank.isEnemy && this.state.currentLevel > 10
       ? profile.bulletSpeed * 1.20
       : profile.bulletSpeed;
+    const bulletSpeed = tank.isEnemy
+      ? boosted
+      : Math.min(
+          TILE_SIZE - 1,
+          boosted * (1 + 0.2 * this.upgradeCount(tank.ownerId, "shell")),
+        );
 
     for (const offset of volleyOffsets(profile.volley)) {
       this.state.bullets.push(

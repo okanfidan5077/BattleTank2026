@@ -20,7 +20,8 @@
     "dev:client": "npm run dev --workspace @battletank/client",
     "watch:shared": "npm run dev --workspace @battletank/shared",
     "typecheck": "tsc -b --force",
-    "start:server": "npm run start --workspace @battletank/server"
+    "start:server": "npm run start --workspace @battletank/server",
+    "test:smoke": "node scripts/smoke-campaign.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.2"

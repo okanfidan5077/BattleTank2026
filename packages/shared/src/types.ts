@@ -41,6 +41,8 @@ export const ServerMessage = {
   DecoyChanged: "decoy_changed",
   /** A Lurcher's grapple connected — drives the tether effect and the yank. */
   GrappleHit: "grapple_hit",
+  /** The upgrade cards this player may pick from after a level. */
+  UpgradeOffer: "upgrade_offer",
 } as const;
 export type ServerMessage = (typeof ServerMessage)[keyof typeof ServerMessage];
 
@@ -187,6 +189,14 @@ export interface GrappleHitMessage {
   /** Where the player was yanked to, in world units. */
   toX: number;
   toY: number;
+}
+
+/** Sent to one player with the upgrades they may choose between levels. */
+export interface UpgradeOfferMessage {
+  /** Upgrade ids on offer, or empty once the choice has been spent. */
+  ids: string[];
+  /** What the player already owns, as id -> stacks, for the card subtitles. */
+  owned: Record<string, number>;
 }
 
 /** Broadcast when the player blinks, or when a blink charge returns. */

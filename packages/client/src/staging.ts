@@ -1,8 +1,8 @@
 import { getStateCallbacks } from "colyseus.js";
 
-import { ClientMessage, MatchStatus } from "@battletank/shared";
+import { CampaignMessage, CampaignPhase, ClientMessage, MatchStatus } from "@battletank/shared";
 
-import type { BattleRoom } from "./network.js";
+import type { BattleRoom, CampaignRoom } from "./network.js";
 import { formatBestTime, loadProgression } from "./progression.js";
 import type { PlayerView } from "./state.js";
 
@@ -146,6 +146,132 @@ export function runStaging(room: BattleRoom): Promise<void> {
         startButton.disabled = true;
         hint.textContent = "Starting...";
         room.send(ClientMessage.StartGame);
+      },
+      { signal: controller.signal },
+    );
+
+    render();
+  });
+}
+
+/**
+ * Runs the campaign's staging lobby.
+ *
+ * The same panel and the same shape as {@link runStaging}, keyed on the
+ * campaign's own `phase` rather than `matchState`. The campaign seats up to
+ * four now, so it needs the identical "gather, then start together" step —
+ * without it the host's run begins the moment they press the button and anyone
+ * they invite arrives partway through a level.
+ *
+ * @returns a promise that settles once the run has left staging. It settles
+ *   immediately for a room already under way, so someone joining a live game by
+ *   link drops straight in without ever seeing the panel.
+ */
+export function runCampaignStaging(room: CampaignRoom): Promise<void> {
+  const panel = element("staging");
+  const roomLabel = element("staging-room");
+  const roster = element<HTMLUListElement>("staging-players");
+  const startButton = element<HTMLButtonElement>("start-match");
+  const hint = element("staging-hint");
+  const bestTimeStat = element("stat-best-time");
+  const totalKillsStat = element("stat-total-kills");
+
+  const progression = loadProgression();
+  bestTimeStat.textContent = formatBestTime(progression.bestTime);
+  totalKillsStat.textContent = String(progression.totalKills);
+
+  roomLabel.textContent = room.roomId;
+  startButton.disabled = false;
+  startButton.textContent = "Start Campaign";
+
+  return new Promise<void>((resolve) => {
+    const cleanups: Array<() => void> = [];
+    const controller = new AbortController();
+
+    const isHost = () => room.state.hostId === room.sessionId;
+
+    const render = () => {
+      if (!room.state?.players) return;
+
+      roster.replaceChildren();
+
+      for (const [sessionId, player] of room.state.players) {
+        const row = document.createElement("li");
+
+        const swatch = document.createElement("span");
+        swatch.className = "swatch";
+        swatch.style.background = `#${player.color.toString(16).padStart(6, "0")}`;
+
+        const name = document.createElement("span");
+        name.textContent = player.name;
+
+        row.append(swatch, name);
+
+        const tags = [
+          sessionId === room.state.hostId ? "host" : "",
+          sessionId === room.sessionId ? "you" : "",
+        ].filter(Boolean);
+
+        if (tags.length > 0) {
+          const tag = document.createElement("span");
+          tag.className = "tag";
+          tag.textContent = tags.join(" · ");
+          row.append(tag);
+        }
+
+        roster.append(row);
+      }
+
+      const hostName = room.state.players.get(room.state.hostId)?.name;
+
+      startButton.hidden = !isHost();
+      hint.textContent = isHost()
+        ? "Share the link in the corner to play co-op, or just start alone."
+        : `Waiting for ${hostName ?? "the host"} to start the campaign...`;
+    };
+
+    const $ = getStateCallbacks(room);
+
+    cleanups.push(
+      $(room.state).players.onAdd((player: PlayerView) => {
+        render();
+        $(player).onChange(render);
+      }),
+    );
+    cleanups.push($(room.state).players.onRemove(render));
+    cleanups.push($(room.state).listen("hostId", render));
+
+    const finish = (): void => {
+      controller.abort();
+      for (const detach of cleanups) detach();
+      panel.hidden = true;
+      // Leave the button as the battle rooms expect to find it.
+      startButton.textContent = "Start Match";
+      resolve();
+    };
+
+    cleanups.push(
+      $(room.state).listen("phase", (phase: CampaignPhase) => {
+        const staging = phase === CampaignPhase.Staging;
+        panel.hidden = !staging;
+
+        if (staging) {
+          render();
+          return;
+        }
+
+        finish();
+      }),
+    );
+
+    startButton.addEventListener(
+      "click",
+      () => {
+        if (!isHost()) return;
+
+        startButton.disabled = true;
+        hint.textContent = "Starting...";
+        room.send(CampaignMessage.StartCampaign);
       },
       { signal: controller.signal },
     );

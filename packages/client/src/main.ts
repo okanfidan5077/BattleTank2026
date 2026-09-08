@@ -6,7 +6,7 @@ import { CAMPAIGN_ROOM, MatchStatus, PROTOCOL_VERSION } from "@battletank/shared
 import { BASE_HEIGHT, BASE_WIDTH, GameScene } from "./GameScene.js";
 import { hideLobby, reflectRoomInUrl, runLobby, showShareLink } from "./lobby.js";
 import { tryResume, type BattleRoom, type CampaignRoom, type GameRoom } from "./network.js";
-import { runStaging } from "./staging.js";
+import { runCampaignStaging, runStaging } from "./staging.js";
 import "./style.css";
 
 /** The div Phaser renders its canvas into; hidden while in the staging lobby. */
@@ -113,9 +113,10 @@ function runMatch(room: BattleRoom): Promise<void> {
 /**
  * Runs a campaign playthrough: boots Phaser once and holds until the room ends.
  *
- * The single-player campaign has no staging lobby and no reset-to-lobby cycle —
- * the scene drives the whole thing off the replicated `phase`, so this just
- * keeps Phaser alive until the room is left.
+ * Staging has already resolved by the time this runs, so Phaser boots straight
+ * into the briefing. There is no reset-to-lobby cycle — the scene drives the
+ * whole thing off the replicated `phase` — so this just keeps Phaser alive
+ * until the room is left.
  */
 function runCampaign(room: CampaignRoom): Promise<void> {
   const container = gameContainer();
@@ -142,9 +143,19 @@ async function boot(): Promise<void> {
 
   hideLobby();
 
-  // The campaign is its own flow — no staging, no share link, no match loop.
+  // The campaign is its own flow: a staging lobby, then one continuous run with
+  // no match loop. It gets the invite link now that it seats up to four — co-op
+  // is opt-in, so the only way into someone's run is the code they hand you.
   if (room.name === CAMPAIGN_ROOM) {
-    await runCampaign(room as CampaignRoom);
+    const campaign = room as CampaignRoom;
+    reflectRoomInUrl(campaign as unknown as BattleRoom);
+    showShareLink(campaign as unknown as BattleRoom);
+
+    // Gather first, then play. Resolves immediately for someone joining a run
+    // already under way, so a late invite drops straight into the level.
+    await runCampaignStaging(campaign);
+
+    await runCampaign(campaign);
     return;
   }
 
