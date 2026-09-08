@@ -34,6 +34,7 @@ import {
   TELEPORT_UNLOCK_LEVEL,
   UPGRADE_CHOICES,
   findUpgrade,
+  isUpgradeOfferable,
   surviveSecondsForLevel,
   ZONE_CONTROL_DURATION_SECONDS,
   ServerMessage,
@@ -3614,14 +3615,19 @@ export class CampaignRoom extends Room<CampaignState> {
    *
    * Hands are rolled per player, so in co-op two people building the same run
    * still end up with different tanks. Anything already at its stack ceiling is
-   * left out rather than offered as a dead pick.
+   * left out rather than offered as a dead pick, and so is any upgrade to an
+   * ability the run has not unlocked yet — a "+1.5s shield duration" card in
+   * front of a player with no shield buys nothing and invites them to read it
+   * as the thing that grants one.
    */
   private offerUpgrades(): void {
     this.upgradeOffers.clear();
 
     for (const [sessionId] of this.state.players) {
       const pool = CAMPAIGN_UPGRADES.filter(
-        (upgrade) => this.upgradeCount(sessionId, upgrade.id) < upgrade.maxStacks,
+        (upgrade) =>
+          this.upgradeCount(sessionId, upgrade.id) < upgrade.maxStacks &&
+          isUpgradeOfferable(upgrade, this.state.currentLevel),
       );
 
       // Fisher-Yates over a copy, then take the first few.

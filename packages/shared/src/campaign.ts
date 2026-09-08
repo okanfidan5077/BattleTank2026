@@ -202,6 +202,16 @@ export interface CampaignUpgrade {
   readonly detail: string;
   /** How many times it may be taken. */
   readonly maxStacks: number;
+  /**
+   * The (1-based) level the ability this upgrade sharpens unlocks on.
+   *
+   * Omitted means "always offerable" — the plain stat upgrades, which do
+   * something for any tank. An upgrade naming an ability the player has not
+   * been handed yet buys nothing, and reads as though taking it were what
+   * grants the ability, so those cards stay out of the hand until the ability
+   * itself is in play. See {@link isUpgradeOfferable}.
+   */
+  readonly requiresLevel?: number;
 }
 
 /** How many choices are offered after each level. */
@@ -215,18 +225,68 @@ export const CAMPAIGN_UPGRADES: readonly CampaignUpgrade[] = [
   { id: "speed", name: "Overdrive", detail: "+12% movement speed", maxStacks: 3 },
   { id: "shell", name: "Hot Loads", detail: "+20% shell velocity", maxStacks: 3 },
   { id: "life", name: "Spare Crew", detail: "+1 team life, right now", maxStacks: 99 },
-  // Rule-changers.
-  { id: "blink", name: "Phase Capacitor", detail: "+1 blink charge", maxStacks: 2 },
-  { id: "shieldup", name: "Hardened Deflector", detail: "+1.5s shield duration", maxStacks: 3 },
-  { id: "blastup", name: "Wide Payload", detail: "+2 tiles blast radius", maxStacks: 3 },
-  { id: "ramup", name: "Ablative Prow", detail: "+60% ram duration", maxStacks: 2 },
-  { id: "decoyup", name: "Loud Beacon", detail: "+4s decoy duration", maxStacks: 2 },
-  { id: "cool", name: "Coolant Loop", detail: "-20% all ability cooldowns", maxStacks: 3 },
+  // Rule-changers, each gated on the ability it sharpens.
+  {
+    id: "blink",
+    name: "Phase Capacitor",
+    detail: "+1 blink charge",
+    maxStacks: 2,
+    requiresLevel: TELEPORT_UNLOCK_LEVEL,
+  },
+  {
+    id: "shieldup",
+    name: "Hardened Deflector",
+    detail: "+1.5s shield duration",
+    maxStacks: 3,
+    requiresLevel: SHIELD_UNLOCK_LEVEL,
+  },
+  {
+    id: "blastup",
+    name: "Wide Payload",
+    detail: "+2 tiles blast radius",
+    maxStacks: 3,
+    requiresLevel: BLAST_UNLOCK_LEVEL,
+  },
+  {
+    id: "ramup",
+    name: "Ablative Prow",
+    detail: "+60% ram duration",
+    maxStacks: 2,
+    requiresLevel: RAM_UNLOCK_LEVEL,
+  },
+  {
+    id: "decoyup",
+    name: "Loud Beacon",
+    detail: "+4s decoy duration",
+    maxStacks: 2,
+    requiresLevel: DECOY_UNLOCK_LEVEL,
+  },
+  {
+    // Cuts every ability cooldown, so it starts paying the moment the earliest
+    // cooldown ability — the shield — is in hand.
+    id: "cool",
+    name: "Coolant Loop",
+    detail: "-20% all ability cooldowns",
+    maxStacks: 3,
+    requiresLevel: SHIELD_UNLOCK_LEVEL,
+  },
 ];
 
 /** Looks an upgrade up by id. */
 export function findUpgrade(id: string): CampaignUpgrade | undefined {
   return CAMPAIGN_UPGRADES.find((upgrade) => upgrade.id === id);
+}
+
+/**
+ * Whether `upgrade` may be dealt to a player who has reached `level`.
+ *
+ * `level` is the level just cleared, which is the same level the ability
+ * unlocks are tested against while it is being played — so an ability upgrade
+ * first shows up in the hand dealt at the end of the level that ability arrived
+ * on, and never while the card would be dead weight.
+ */
+export function isUpgradeOfferable(upgrade: CampaignUpgrade, level: number): boolean {
+  return upgrade.requiresLevel === undefined || level >= upgrade.requiresLevel;
 }
 
 /** Default seconds the player must hold out on a `survive_time` level. */
