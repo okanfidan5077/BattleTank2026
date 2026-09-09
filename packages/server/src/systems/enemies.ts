@@ -11,7 +11,7 @@ import {
 } from "../gameplay.js";
 import { type GameState, type Tank, isInsideGrid, tileIndex } from "../schema/index.js";
 import type { FlowField } from "../world/FlowField.js";
-import { moveTank } from "./tanks.js";
+import { isBlocked, moveTank } from "./tanks.js";
 
 /** The four cardinal facings, for iterating candidate directions. */
 const DIRECTIONS: readonly Direction[] = [
@@ -149,6 +149,18 @@ export interface EnemyContext {
   canShoot(tank: Tank): boolean;
   /** Spawns the bullet and starts the cooldown. */
   shoot(tank: Tank): void;
+  /**
+   * How often this tank abandons its route for a random direction, 0 to 1.
+   *
+   * Defaults to {@link ENEMY_CHAOS_CHANCE}, which is what stops ordinary tanks
+   * reading as tram cars. It is wrong for the units whose whole design is a
+   * committed straight line: a rusher crosses a tile roughly every fifth of a
+   * second, so a one-in-ten chance per boundary had it taking a random detour
+   * every couple of seconds. From outside that looks exactly like a suicide
+   * unit wandering off toward the edge of the map for no reason and then
+   * remembering the player — which is what it was.
+   */
+  chaosFor?(tank: Tank): number;
   /** Injectable for deterministic tests; defaults to `Math.random`. */
   random?: () => number;
 }
@@ -165,7 +177,60 @@ export interface EnemyContext {
  * Where the field has no direction — a pocket sealed off by steel — the enemy
  * holds position rather than wandering.
  */
-function steer(state: GameState, tank: Tank, flowField: FlowField, random: () => number): void {
+/**
+ * How far off the lattice a tank may drift and still be pulled back, in px.
+ *
+ * Sized to cover what the world can push a tank by in one tick: the separation
+ * pass contributes up to 2px per relaxation pass over three passes, and the
+ * traffic-jam jitter adds a few more on top.
+ */
+const CROSS_AXIS_SNAP_PX = TILE_SIZE / 3;
+
+/**
+ * Pulls a tank back onto the lattice across its direction of travel.
+ *
+ * Steering only ever turns a tank standing exactly on a tile boundary, and the
+ * step function guarantees that along the axis a tank is *moving* on. The other
+ * axis has no such guarantee: the separation pass and the anti-gridlock jitter
+ * both shove tanks sideways by a few pixels, and once a hull is a pixel or two
+ * off across its travel it can never satisfy the alignment test again.
+ *
+ * The symptom is unmistakable once you know it: a fast enemy — a rusher, most
+ * visibly — stops being able to turn and simply drives in a straight line to
+ * the far wall, sits there until the anti-stuck pass frees it, and only then
+ * resumes hunting. It looks like the unit deciding to visit the edge of the map
+ * for no reason. It is really a tank that has been unable to turn since the
+ * moment something brushed past it.
+ *
+ * Only the cross axis is corrected. Snapping the travel axis as well would drag
+ * a moving tank backward to the tile boundary it just left.
+ */
+function snapCrossAxis(state: GameState, tank: Tank): void {
+  const heading = DIRECTION_VECTORS[tank.direction];
+  const movingHorizontally = heading.x !== 0;
+  const value = movingHorizontally ? tank.y : tank.x;
+
+  const snapped = Math.round(value / TILE_SIZE) * TILE_SIZE;
+  const drift = Math.abs(snapped - value);
+  if (drift === 0 || drift > CROSS_AXIS_SNAP_PX) return;
+
+  const nextX = movingHorizontally ? tank.x : snapped;
+  const nextY = movingHorizontally ? snapped : tank.y;
+  if (isBlocked(state, nextX, nextY, tank.width, tank.height)) return;
+
+  tank.x = nextX;
+  tank.y = nextY;
+}
+
+function steer(
+  state: GameState,
+  tank: Tank,
+  flowField: FlowField,
+  random: () => number,
+  chaosChance: number,
+): void {
+  snapCrossAxis(state, tank);
+
   const alignedToGrid = tank.x % TILE_SIZE === 0 && tank.y % TILE_SIZE === 0;
 
   if (alignedToGrid) {
@@ -176,7 +241,7 @@ function steer(state: GameState, tank: Tank, flowField: FlowField, random: () =>
     // route for a random passable direction. Falls back to the field when no
     // chaotic option exists (walled in on every side but the route).
     let desired: Direction | null;
-    if (random() < ENEMY_CHAOS_CHANCE) {
+    if (random() < chaosChance) {
       const options = passableDirections(state, tileX, tileY);
       desired =
         options.length > 0
@@ -252,7 +317,7 @@ export function updateEnemies(state: GameState, ctx: EnemyContext): void {
     if (!tank.isEnemy) continue;
 
     const field = ctx.fieldFor(tank);
-    if (field) steer(state, tank, field, random);
+    if (field) steer(state, tank, field, random, ctx.chaosFor?.(tank) ?? ENEMY_CHAOS_CHANCE);
 
     if (!ctx.canShoot(tank)) continue;
 

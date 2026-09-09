@@ -21,7 +21,15 @@
     "watch:shared": "npm run dev --workspace @battletank/shared",
     "typecheck": "tsc -b --force",
     "start:server": "npm run start --workspace @battletank/server",
-    "test:smoke": "node scripts/smoke-campaign.mjs"
+    "test:smoke": "node scripts/smoke-campaign.mjs",
+    "test:levels": "node scripts/verify-campaign40.mjs",
+    "test:systems": "node scripts/verify-new-systems.mjs",
+    "test:laser": "node scripts/verify-laser.mjs",
+    "test:ordered": "node scripts/verify-ordered.mjs",
+    "test:feedback": "node scripts/verify-feedback.mjs",
+    "test:rushers": "node scripts/verify-rushers.mjs",
+    "test:campaign": "node scripts/verify-campaign40.mjs && node scripts/verify-new-systems.mjs && node scripts/verify-laser.mjs && node scripts/verify-ordered.mjs && node scripts/verify-feedback.mjs && node scripts/verify-rushers.mjs && node scripts/verify-fixes.mjs && node scripts/verify-bosses.mjs && node scripts/verify-fire-and-effigy.mjs && node scripts/verify-architect.mjs",
+    "skip-to": "node scripts/skip-to.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.2"

@@ -1,6 +1,48 @@
 /** Single-player campaign data, shared by the Colyseus server and the client. */
 
-import { GRID_HEIGHT, GRID_LENGTH, GRID_WIDTH, TileType } from "./constants.js";
+import { BossKind, EnemyVariant } from "./enemies.js";
+import {
+  buildJammingField,
+  buildDepotApproach,
+  buildSurvivalArena,
+  buildUplinkYard,
+  buildOpenArena,
+  buildFactoryComplex,
+  buildBombFlats,
+  buildIntelSprawl,
+  buildEscortCanyon,
+  buildSerpentineGallery,
+  buildCoolantLabyrinth,
+  buildCoolantBasins,
+  buildRadarScatter,
+  buildBunkerMaze,
+  buildEmptyBox,
+  buildRelayLabyrinth,
+  buildUplinkChamber,
+  buildLatticeArena,
+  buildBreachCorridor,
+  buildArchitectChamber,
+  buildCoreChamber,
+  buildDuellingGround,
+  buildRelayStation,
+  buildConvoyRoad,
+  buildScrapline,
+  buildBreakwater,
+  buildPressureLine,
+  buildArchiveGate,
+  buildColdStorage,
+  buildBoneyard,
+  buildChoirHall,
+  buildRequisitionYard,
+  buildSignalYard,
+  buildFoundryFloor,
+  buildDeepWater,
+  buildTwoRivers,
+  buildAntechamber,
+  buildLastLight,
+  buildGauntletArena,
+  buildThreshold,
+} from "./campaign-maps.js";
 
 /**
  * Phases a campaign playthrough moves through, replicated on `CampaignState`.
@@ -57,6 +99,19 @@ export const CampaignMessage = {
   ChooseUpgrade: "choose_upgrade",
   /** Host only: leave staging and begin the run. */
   StartCampaign: "start_campaign",
+  /**
+   * Call a mortar down on a point the player picked.
+   *
+   * Carries an aim point, unlike every other ability, because it is the first
+   * one the player does not simply point their hull at — see {@link AimedMessage}.
+   */
+  Strike: "strike",
+  /** Fire the suppression pulse: everything nearby stops dead for a moment. */
+  Emp: "emp",
+  /** Fire the cutting lance straight ahead. */
+  Laser: "laser",
+  /** Jump to a point on the map. Carries an aim point, like the strike. */
+  Translocate: "translocate",
 } as const;
 export type CampaignMessage = (typeof CampaignMessage)[keyof typeof CampaignMessage];
 
@@ -80,6 +135,36 @@ export const CampaignWinCondition = {
   RetrieveIntel: "retrieve_intel",
   /** Escort the allied carrier to the extraction pad; it must survive. */
   Escort: "escort",
+  /**
+   * Keep an allied relay standing until the timer runs out.
+   *
+   * The inverse of every other objective: the player is not going anywhere,
+   * they are holding somewhere. Uses the arena's eagle tile as the structure,
+   * so the terrain and damage rules for it already exist.
+   */
+  DefendCore: "defend_core",
+  /**
+   * Destroy the enemy carrier before it crosses the map.
+   *
+   * Escort read backwards — the convoy is hostile, it is running away from the
+   * player rather than toward them, and reaching its pad is a loss.
+   */
+  DestroyConvoy: "destroy_convoy",
+  /**
+   * Walk an allied breaker to the extraction pad.
+   *
+   * Unlike {@link Escort}, the breaker only advances while the player is beside
+   * it, so the pace is the player's own: every second spent fighting is a
+   * second the payload is not moving.
+   */
+  PushPayload: "push_payload",
+  /**
+   * Destroy a set number of marked units hiding among identical ones.
+   *
+   * Shooting the wrong hull costs nothing but time and ammunition — the
+   * pressure is in reading the field, not in the shooting.
+   */
+  PurgeMarked: "purge_marked",
 } as const;
 export type CampaignWinCondition =
   (typeof CampaignWinCondition)[keyof typeof CampaignWinCondition];
@@ -106,7 +191,7 @@ export const SHIELD_COOLDOWN_MS = 15_000;
  * escape it offers is the answer to being boxed in, which is exactly the trouble
  * that level makes.
  */
-export const TELEPORT_UNLOCK_LEVEL = 8;
+export const TELEPORT_UNLOCK_LEVEL = 9;
 
 /** How far a blink carries the player, in tiles. */
 export const TELEPORT_TILES = 5;
@@ -114,8 +199,22 @@ export const TELEPORT_TILES = 5;
 /** Blinks that can be banked at once. */
 export const TELEPORT_MAX_CHARGES = 2;
 
-/** How long one spent blink charge takes to return, in ms. */
-export const TELEPORT_RECHARGE_MS = 15_000;
+/**
+ * How long one spent blink charge takes to return, in ms.
+ *
+ * Deliberately one of the longest cooldowns in the kit. At fifteen seconds the
+ * blink stopped being an escape and became a means of transport: a banked pair
+ * recharging that fast meant a player never had to *drive* anywhere they could
+ * see, which quietly rewrote every objective built around crossing ground —
+ * sweeping a map for packages turned into a sequence of hops between them, and
+ * the terrain between stopped mattering at all.
+ *
+ * At thirty-five it is back to being what it was written as: the answer to
+ * being boxed in, spent once and then genuinely missed. Coolant Loop can still
+ * bring it down to about eighteen seconds at three stacks, which is a real
+ * reward for committing an upgrade line to it rather than a default.
+ */
+export const TELEPORT_RECHARGE_MS = 35_000;
 
 /**
  * The (1-based) level from which the close-in blast is available.
@@ -124,7 +223,7 @@ export const TELEPORT_RECHARGE_MS = 15_000;
  * dense enough that being surrounded is a real death, and the shield only buys
  * time while the blink only buys distance.
  */
-export const BLAST_UNLOCK_LEVEL = 13;
+export const BLAST_UNLOCK_LEVEL = 16;
 
 /**
  * Blast kill radius, in tiles, measured from the player's hull centre.
@@ -146,6 +245,149 @@ export const BLAST_BRICK_RADIUS_TILES = 3;
 /** Cooldown between blasts, in ms. */
 export const BLAST_COOLDOWN_MS = 25_000;
 
+// ------------------------------------------------------------ called strike
+//
+// The first ability the player aims rather than points their hull at, and the
+// first answer to a threat they cannot safely drive up to: a Sapper holding a
+// standoff band, a Sentinel covering a corridor, a boss face they cannot reach.
+// Bound to the right mouse button, because a keyboard ability that needs a
+// point on the map has nowhere to get one from.
+
+/** The (1-based) level from which the called strike is available. */
+export const STRIKE_UNLOCK_LEVEL = 24;
+
+// Deliberately no range limit: the strike reaches the whole battlefield. What
+// holds it in check is the telegraph everyone can see and a long cooldown, not
+// a ring around the player — and a ring only ever meant a click out near the
+// far wall silently landed somewhere else.
+
+/**
+ * How long a called strike is telegraphed before it lands, in ms.
+ *
+ * Long enough that it cannot be used as a hitscan finisher on a moving target
+ * — the mark is drawn for everyone, and anything with somewhere to go will go
+ * there. It is a tool for hitting positions, not hulls.
+ */
+export const STRIKE_DELAY_MS = 1500;
+
+/** Blast radius of a called strike, in tiles. */
+export const STRIKE_RADIUS_TILES = 2.5;
+
+/** Damage a called strike deals to whatever is inside the radius. */
+export const STRIKE_DAMAGE = 3;
+
+/** Cooldown between called strikes, in ms. */
+export const STRIKE_COOLDOWN_MS = 18_000;
+
+// ------------------------------------------------------------------ emp pulse
+//
+// The panic button that does not kill. The blast clears a crowd but is on a
+// long cooldown and has to be survived up close; the pulse buys a few seconds
+// against anything at all — including a boss, which nothing else in the kit
+// can say — and buys them without the player having to be in knife range.
+
+/** The (1-based) level from which the suppression pulse is available. */
+export const EMP_UNLOCK_LEVEL = 30;
+
+/** Radius of the pulse, in tiles. */
+export const EMP_RADIUS_TILES = 9;
+
+/** How long everything caught in the pulse is held, in ms. */
+export const EMP_DURATION_MS = 2600;
+
+/**
+ * How long a boss caught in the pulse is held, in ms.
+ *
+ * Shorter than the figure for the rank and file. A boss that can be frozen for
+ * the full duration on a repeating cooldown stops being a fight and becomes a
+ * timer, but one that shrugs the pulse off entirely makes the ability dead
+ * weight in exactly the encounters it was added for.
+ */
+export const EMP_BOSS_DURATION_MS = 1200;
+
+/** Cooldown between pulses, in ms. */
+export const EMP_COOLDOWN_MS = 22_000;
+
+// ---------------------------------------------------------- translocator
+//
+// Not the blink. The blink is a short hop along the hull's facing, spent to get
+// out of something; this puts the tank anywhere on the map that has room for
+// it. Range is the whole battlefield on purpose — the limit on it is the
+// cooldown, which is the longest in the kit by a wide margin, and the fact that
+// it moves the tank but nothing else: no shield, no damage, no repositioning of
+// the fight, just the player somewhere they were not.
+
+/**
+ * The (1-based) level from which the translocator is available.
+ *
+ * Held back to the Archive, where the vault rows make being boxed in a real
+ * death — and late enough that most of the campaign's objectives have been
+ * designed and played without it.
+ */
+export const TRANSLOCATE_UNLOCK_LEVEL = 22;
+
+/**
+ * Cooldown between jumps, in ms.
+ *
+ * The longest in the kit, and it has to be: an ability that ignores terrain
+ * entirely would otherwise answer every level built around crossing ground, in
+ * exactly the way a fifteen-second blink used to.
+ */
+export const TRANSLOCATE_COOLDOWN_MS = 50_000;
+
+/**
+ * How far from the clicked tile the jump will look for room, in tiles.
+ *
+ * A click a tile inside a wall is a near miss on the player's part, not a
+ * different intention, so the jump lands beside it rather than refusing. Beyond
+ * this it refuses outright and keeps the charge — landing ten tiles from where
+ * someone pointed would be worse than not going at all.
+ */
+export const TRANSLOCATE_SEARCH_TILES = 2;
+
+// ----------------------------------------------------------------- lance
+//
+// A cutting beam, and the only thing in the kit that damages a line rather
+// than a point or a circle. Salvaged off the Foundry, which is why it behaves
+// like industrial plant rather than like a weapon: it cuts brick, it cuts
+// anything standing in the brick, and it stops dead against anything it was
+// not built to cut.
+
+/**
+ * The (1-based) level from which the cutting lance is available.
+ *
+ * The level after the Foundry, whose debrief is where it is salvaged — so the
+ * briefing that hands it over comes before the level it is used on, rather
+ * than after.
+ */
+export const LASER_UNLOCK_LEVEL = 28;
+
+/** How far the beam reaches, in tiles. */
+export const LASER_RANGE_TILES = 14;
+
+/**
+ * Damage the beam deals to every hull it crosses.
+ *
+ * It pierces — a beam that stopped at the first tank would be a slower shell —
+ * so this lands on everything in the line, which is what makes lining a column
+ * of enemies up worth doing.
+ */
+export const LASER_DAMAGE = 3;
+
+/**
+ * How many brick tiles one shot can cut through.
+ *
+ * The beam is spent on the third: it opens a doorway through a wall and stops,
+ * rather than clearing a lane to the far side of the map. Steel takes no damage
+ * at all and stops it outright, and so does every objective structure — the
+ * lance is a tool for cutting through cover, never for skipping a level's
+ * actual puzzle.
+ */
+export const LASER_BRICK_LIMIT = 3;
+
+/** Cooldown between shots, in ms. */
+export const LASER_COOLDOWN_MS = 14_000;
+
 // ------------------------------------------------------------- fire control
 
 /**
@@ -163,7 +405,7 @@ export const CAMPAIGN_SHOOT_COOLDOWN_MS = 800;
 export const CAMPAIGN_REFIT_FIRE_FACTOR = 0.7;
 
 /** The (1-based) level from which that refit applies. */
-export const CAMPAIGN_REFIT_LEVEL = 11;
+export const CAMPAIGN_REFIT_LEVEL = 18;
 
 /** Reload multiplier per stack of the Autoloader upgrade. */
 export const AUTOLOADER_FIRE_FACTOR = 0.85;
@@ -200,7 +442,7 @@ export function campaignShootCooldownMs(
  * The offensive counterpart to the blink: same idea of crossing ground fast,
  * except it ends with something dead rather than with distance.
  */
-export const RAM_UNLOCK_LEVEL = 9;
+export const RAM_UNLOCK_LEVEL = 12;
 
 /**
  * How long a ram surge lasts, in ms.
@@ -220,7 +462,7 @@ export const RAM_COOLDOWN_MS = 12_000;
 // -------------------------------------------------------------------- decoy
 
 /** The (1-based) level from which the decoy beacon is available. */
-export const DECOY_UNLOCK_LEVEL = 16;
+export const DECOY_UNLOCK_LEVEL = 20;
 
 /** How long a dropped beacon holds enemy attention, in ms. */
 export const DECOY_DURATION_MS = 6000;
@@ -322,6 +564,34 @@ export const CAMPAIGN_UPGRADES: readonly CampaignUpgrade[] = [
     maxStacks: 3,
     requiresLevel: SHIELD_UNLOCK_LEVEL,
   },
+  {
+    id: "strikeup",
+    name: "Cluster Warhead",
+    detail: "+1 tile strike radius",
+    maxStacks: 3,
+    requiresLevel: STRIKE_UNLOCK_LEVEL,
+  },
+  {
+    id: "empup",
+    name: "Capacitor Bank",
+    detail: "+1s pulse duration",
+    maxStacks: 2,
+    requiresLevel: EMP_UNLOCK_LEVEL,
+  },
+  {
+    id: "laserup",
+    name: "Focusing Lens",
+    detail: "+1 lance damage",
+    maxStacks: 2,
+    requiresLevel: LASER_UNLOCK_LEVEL,
+  },
+  {
+    id: "jumpup",
+    name: "Phase Governor",
+    detail: "-20% translocator cooldown",
+    maxStacks: 2,
+    requiresLevel: TRANSLOCATE_UNLOCK_LEVEL,
+  },
 ];
 
 /** Looks an upgrade up by id. */
@@ -344,1240 +614,842 @@ export function isUpgradeOfferable(upgrade: CampaignUpgrade, level: number): boo
 /** Default seconds the player must hold out on a `survive_time` level. */
 export const SURVIVE_DURATION_SECONDS = 60;
 
-/**
- * Seconds to survive on a given (1-based) `survive_time` level.
- *
- * Level 3 ("Hold the Line") is a longer, tougher stand at 120s; every other
- * survival level uses the {@link SURVIVE_DURATION_SECONDS} base.
- */
-export function surviveSecondsForLevel(level: number): number {
-  if (level === 3 || level === 15) return 120;
-  return SURVIVE_DURATION_SECONDS;
-}
-
-/** Seconds the player must hold the uplink zone on a `zone_control` level. */
+/** Default seconds the player must hold the uplink on a `zone_control` level. */
 export const ZONE_CONTROL_DURATION_SECONDS = 60;
 
-/** Seconds the player has to reach every bomb on a `defuse_bombs` level. */
+/** Default seconds the player has to reach every bomb on a `defuse_bombs` level. */
 export const BOMB_DEFUSAL_DURATION_SECONDS = 90;
+
+/** Default seconds a `defend_core` relay must be kept standing. */
+export const DEFEND_DURATION_SECONDS = 90;
+
+/** Default number of marked units a `purge_marked` level asks for. */
+export const PURGE_TARGET_COUNT = 6;
+
+// --------------------------------------------------------------- level model
+//
+// Everything that makes one level different from another lives in the record
+// below, rather than in the room asking "which level number am I?". That
+// question used to be answered in about thirty places — a chain of
+// `=== AEGIS_LEVEL` comparisons and a twenty-five branch spawn switch — so
+// inserting a level renumbered every one of them, and silently broke any that
+// were missed. A level now names its own units, its own bosses and its own
+// timings, and the room simply reads them.
+
+/**
+ * One row of a level's spawn table.
+ *
+ * Weights are relative, not probabilities, so a row can be retuned without
+ * rebalancing every other row. Whatever the table does not claim comes out as
+ * {@link EnemyVariant.Standard} — most levels want a sprinkling of one or two
+ * special units among ordinary tanks, not a field made entirely of them.
+ */
+export interface SpawnWeight {
+  readonly variant: EnemyVariant;
+  /** Relative likelihood against the other rows. */
+  readonly weight: number;
+  /**
+   * Most of this variant allowed on the field at once.
+   *
+   * For the units that stack badly: Constructors permanently rewrite the map,
+   * Nullifier bubbles overlap into one dead zone, and a second Jammer buys the
+   * enemy nothing while costing the player everything. Over the cap, the roll
+   * comes out as an ordinary tank instead.
+   */
+  readonly max?: number;
+}
+
+/** When a boss joins the level. */
+export const BossTiming = {
+  /** Present from the moment the level starts. */
+  Start: "start",
+  /**
+   * Arrives the instant the level's objective is met.
+   *
+   * The objective stops being the finish line and becomes the trigger: defuse
+   * the bombs, and then deal with what the noise brought. A level is cleared
+   * only once its objective is met *and* nothing flagged `isBoss` is standing.
+   */
+  Objective: "objective",
+} as const;
+export type BossTiming = (typeof BossTiming)[keyof typeof BossTiming];
+
+/** One boss deployment on a level. */
+export interface BossSpawn {
+  readonly kind: BossKind;
+  /** How many of it. Defaults to 1. */
+  readonly count?: number;
+  /** When it arrives. Defaults to {@link BossTiming.Start}. */
+  readonly when?: BossTiming;
+}
+
+/** Per-level numbers the room used to carry as one-off special cases. */
+export interface LevelParams {
+  /** Seconds to hold out on a `survive_time` level. */
+  readonly surviveSeconds?: number;
+  /** Seconds to hold the uplink on a `zone_control` level. */
+  readonly zoneSeconds?: number;
+  /** Seconds on the clock for a `defuse_bombs` level. */
+  readonly bombSeconds?: number;
+  /** Seconds the relay must survive on a `defend_core` level. */
+  readonly defendSeconds?: number;
+  /** How many marked units a `purge_marked` level asks for. */
+  readonly purgeCount?: number;
+  /**
+   * Objective structures and packages must be taken in a set order.
+   *
+   * The counter to a kit that can cross ground freely: with an order imposed,
+   * knowing where everything is buys nothing, because only one of them will
+   * answer at a time and it is rarely the near one. Off by default — it turns a
+   * sweep into a route, which is a different level, not a harder one.
+   *
+   * The order is rolled per run rather than authored, so a level cannot be
+   * learned once and then driven from memory.
+   */
+  readonly orderedObjectives?: boolean;
+  /** Multiplier on the gap between enemy releases; above 1 is calmer. */
+  readonly spawnIntervalFactor?: number;
+  /** Ceiling on rank-and-file enemies alive at once, when not the default. */
+  readonly maxEnemies?: number;
+  /** Team lives granted on arriving at this level. */
+  readonly bonusLives?: number;
+}
 
 /** One level of the single-player campaign. */
 export interface CampaignLevel {
   /** 1-based level number; also its position in {@link CAMPAIGN_LEVELS}. */
-  id: number;
+  readonly id: number;
+  /** Which act it belongs to, for the briefing header. */
+  readonly act: number;
+  /** Short name, shown above the briefing. */
+  readonly title: string;
   /** Briefing shown before the level starts. */
-  introText: string;
+  readonly introText: string;
   /** Debrief shown once the level is cleared. */
-  outroText: string;
+  readonly outroText: string;
   /**
    * The level's map, flattened row-major into {@link GRID_LENGTH} tiles of
    * {@link TileType} — the same layout as `GameState.grid`, so the cell at
    * `(x, y)` lives at index `y * GRID_WIDTH + x`.
    */
-  mapGrid: number[];
+  readonly mapGrid: number[];
   /** What clears the level; one of {@link CampaignWinCondition}. */
-  winCondition: string;
+  readonly winCondition: CampaignWinCondition;
+  /** Bosses deployed on this level, if any. */
+  readonly bosses?: readonly BossSpawn[];
+  /** What the rank and file are made of here. Omitted means plain tanks. */
+  readonly spawns?: readonly SpawnWeight[];
+  /** Timings and caps that differ from the defaults. */
+  readonly params?: LevelParams;
 }
 
-const at = (x: number, y: number): number => y * GRID_WIDTH + x;
-
-/** A fresh empty grid walled in by a steel perimeter — the base of every level. */
-function steelBordered(): number[] {
-  const grid = new Array<number>(GRID_LENGTH).fill(TileType.Empty);
-
-  for (let x = 0; x < GRID_WIDTH; x++) {
-    grid[at(x, 0)] = TileType.Steel;
-    grid[at(x, GRID_HEIGHT - 1)] = TileType.Steel;
-  }
-  for (let y = 0; y < GRID_HEIGHT; y++) {
-    grid[at(0, y)] = TileType.Steel;
-    grid[at(GRID_WIDTH - 1, y)] = TileType.Steel;
-  }
-
-  return grid;
+/** The record for a 1-based level number, or undefined past the end. */
+export function levelAt(level: number): CampaignLevel | undefined {
+  return CAMPAIGN_LEVELS[level - 1];
 }
 
-/** Fills a rectangle (inclusive) with `tile`, clamped to the interior. */
-function fillRect(grid: number[], x1: number, y1: number, x2: number, y2: number, tile: TileType): void {
-  for (let y = Math.max(1, y1); y <= Math.min(GRID_HEIGHT - 2, y2); y++) {
-    for (let x = Math.max(1, x1); x <= Math.min(GRID_WIDTH - 2, x2); x++) grid[at(x, y)] = tile;
-  }
+/** Seconds to survive on a `survive_time` level. */
+export function surviveSecondsForLevel(level: number): number {
+  return levelAt(level)?.params?.surviveSeconds ?? SURVIVE_DURATION_SECONDS;
 }
 
-/** Drops isolated square brick clusters as cover in otherwise open ground. */
-function coverClusters(grid: number[], spots: ReadonlyArray<readonly [number, number]>, size = 3): void {
-  for (const [x, y] of spots) fillRect(grid, x, y, x + size - 1, y + size - 1, TileType.Brick);
+/** Seconds to hold the uplink on a `zone_control` level. */
+export function zoneSecondsForLevel(level: number): number {
+  return levelAt(level)?.params?.zoneSeconds ?? ZONE_CONTROL_DURATION_SECONDS;
 }
 
-/** Drops isolated square steel pillars — indestructible hard cover. */
-function steelPillars(grid: number[], spots: ReadonlyArray<readonly [number, number]>, size = 2): void {
-  for (const [x, y] of spots) fillRect(grid, x, y, x + size - 1, y + size - 1, TileType.Steel);
+/** Seconds on the clock for a `defuse_bombs` level. */
+export function bombSecondsForLevel(level: number): number {
+  return levelAt(level)?.params?.bombSeconds ?? BOMB_DEFUSAL_DURATION_SECONDS;
 }
 
-/** Packs the whole interior (inside the steel border) with brick. */
-function fillInterior(grid: number[]): void {
-  for (let y = 1; y < GRID_HEIGHT - 1; y++) {
-    for (let x = 1; x < GRID_WIDTH - 1; x++) grid[at(x, y)] = TileType.Brick;
-  }
+/** Seconds a `defend_core` relay must be kept standing. */
+export function defendSecondsForLevel(level: number): number {
+  return levelAt(level)?.params?.defendSeconds ?? DEFEND_DURATION_SECONDS;
 }
 
-/** Carves a 1-tile Empty corridor along row `y`, clamped to the interior. */
-function carveRow(grid: number[], y: number): void {
-  for (let x = 1; x <= GRID_WIDTH - 2; x++) grid[at(x, y)] = TileType.Empty;
+/** How many marked units a `purge_marked` level asks for. */
+export function purgeCountForLevel(level: number): number {
+  return levelAt(level)?.params?.purgeCount ?? PURGE_TARGET_COUNT;
 }
 
-/** Carves a 1-tile Empty corridor along column `x`, clamped to the interior. */
-function carveCol(grid: number[], x: number): void {
-  for (let y = 1; y <= GRID_HEIGHT - 2; y++) grid[at(x, y)] = TileType.Empty;
+/** Whether this level's objectives have to be taken in order. */
+export function objectivesAreOrdered(level: number): boolean {
+  return levelAt(level)?.params?.orderedObjectives ?? false;
 }
 
 /**
- * Level 1: an open field with a jamming tower in each corner. Scattered brick
- * clusters give a little cover, but the corners are reached across open ground.
- */
-function buildLevel1Grid(): number[] {
-  const grid = steelBordered();
-
-  coverClusters(grid, [
-    [11, 7],
-    [46, 7],
-    [11, 23],
-    [46, 23],
-    [20, 15],
-    [39, 15],
-    [27, 25],
-    // Denser mid-field cover.
-    [18, 5],
-    [39, 5],
-    [18, 25],
-    [42, 25],
-    [26, 10],
-    [33, 20],
-  ]);
-
-  // Hard steel pillars breaking the open lanes, clear of the spawns and towers.
-  steelPillars(grid, [
-    [14, 12],
-    [44, 12],
-    [14, 19],
-    [44, 19],
-    [29, 15],
-    [29, 6],
-    [29, 24],
-  ]);
-
-  const towers: Array<[number, number]> = [
-    [2, 2],
-    [GRID_WIDTH - 3, 2],
-    [2, GRID_HEIGHT - 3],
-    [GRID_WIDTH - 3, GRID_HEIGHT - 3],
-  ];
-  for (const [x, y] of towers) grid[at(x, y)] = TileType.Radar;
-
-  return grid;
-}
-
-/**
- * Level 2: a fortified depot approach — three barricade lines north to the pad.
+ * Picks a variant from a level's spawn table.
  *
- * The original was seven full-width walls whose gaps alternated hard left and
- * hard right, which made the level a long, safe commute: the player crossed the
- * whole map six times and the only difficulty was the distance. This keeps the
- * barricades but gives each one two ways through — an open gap and brick panels
- * that can simply be shot out — so the route is a decision rather than a
- * corridor, and the drive is a third as long. Cover between the lines gives the
- * guards somewhere to fight from, which is what the level was missing.
- */
-function buildLevel2Grid(): number[] {
-  const grid = steelBordered();
-
-  // Extraction pad: a 6-wide band across the top centre, just inside the wall.
-  fillRect(grid, GRID_WIDTH / 2 - 3, 1, GRID_WIDTH / 2 + 2, 2, TileType.ExtractionZone);
-
-  // Three barricade lines. Each is mostly steel with open gaps cut through it;
-  // the marked spans are brick, so a player who does not want to walk to a gap
-  // can make their own hole and pay for it in time and ammunition instead.
-  //
-  // The outermost gaps also keep the flanking enemy spawn tiles (columns 6 and
-  // 53) on passable ground — a barricade laid straight across one would wall
-  // that spawn off for the whole level.
-  const lines: Array<{ y: number; gaps: Array<[number, number]>; brick: Array<[number, number]> }> = [
-    { y: 24, gaps: [[40, 44]], brick: [[10, 16], [26, 32]] },
-    { y: 16, gaps: [[5, 7], [15, 19], [52, 54]], brick: [[28, 34], [44, 50]] },
-    { y: 8, gaps: [[38, 42]], brick: [[12, 18], [26, 31]] },
-  ];
-
-  for (const { y, gaps, brick } of lines) {
-    for (let x = 1; x < GRID_WIDTH - 1; x++) {
-      if (gaps.some(([from, to]) => x >= from && x <= to)) continue;
-      const soft = brick.some(([from, to]) => x >= from && x <= to);
-      grid[at(x, y)] = soft ? TileType.Brick : TileType.Steel;
-    }
-  }
-
-  // Cover in the bays between the lines, so the fights happen somewhere rather
-  // than in an empty lane, and neither side has a clean shot down the middle.
-  coverClusters(grid, [
-    [8, 27],
-    [30, 27],
-    [50, 27],
-    [7, 19],
-    [24, 19],
-    [52, 19],
-    [20, 11],
-    [46, 11],
-    [30, 4],
-  ], 2);
-
-  steelPillars(grid, [
-    [20, 27],
-    [40, 19],
-    [10, 11],
-    [34, 11],
-  ], 2);
-
-  return grid;
-}
-
-/**
- * Level 3: an open survival arena. Brick pillars break sightlines and two water
- * hazards flank the centre, but there is plenty of room to keep circling.
- */
-function buildLevel3Grid(): number[] {
-  const grid = steelBordered();
-
-  coverClusters(grid, [
-    [10, 7],
-    [47, 7],
-    [10, 23],
-    [47, 23],
-    [28, 14],
-    // Denser cover to break the arena into a proper maze of firing lanes.
-    [19, 6],
-    [38, 6],
-    [19, 24],
-    [38, 24],
-    [3, 12],
-    [53, 12],
-  ]);
-
-  // Hard steel bastions the swarm cannot blast through.
-  steelPillars(grid, [
-    [15, 12],
-    [43, 12],
-    [15, 19],
-    [43, 19],
-    [29, 4],
-    [29, 27],
-  ]);
-
-  fillRect(grid, 20, 15, 24, 18, TileType.Water);
-  fillRect(grid, 35, 15, 39, 18, TileType.Water);
-
-  return grid;
-}
-
-/**
- * Level 4: an open arena around a fortified uplink. Only the zone is ringed with
- * brick cover — broken at the four cardinal points — with a little loose cover
- * elsewhere; the rest is open ground.
- */
-function buildLevel4Grid(): number[] {
-  const grid = steelBordered();
-
-  const cx = Math.floor(GRID_WIDTH / 2); // 30
-  const cy = Math.floor(GRID_HEIGHT / 2); // 16
-
-  // Brick pocket around the zone, open at the four cardinal points.
-  for (let dy = -2; dy <= 2; dy++) {
-    for (let dx = -2; dx <= 2; dx++) {
-      const onRing = Math.max(Math.abs(dx), Math.abs(dy)) === 2;
-      const inGap = dx === 0 || dy === 0;
-      if (onRing && !inGap) grid[at(cx + dx, cy + dy)] = TileType.Brick;
-    }
-  }
-
-  // The 3x3 uplink zone at the centre.
-  for (let dy = -1; dy <= 1; dy++) {
-    for (let dx = -1; dx <= 1; dx++) grid[at(cx + dx, cy + dy)] = TileType.UplinkZone;
-  }
-
-  // Denser loose cover out in the open, plus hard steel pillars — but the four
-  // approaches to the zone (its cardinal gaps) are left clear.
-  coverClusters(grid, [
-    [10, 8],
-    [47, 8],
-    [10, 24],
-    [47, 24],
-    [19, 6],
-    [39, 6],
-    [19, 26],
-    [39, 26],
-  ], 2);
-
-  steelPillars(grid, [
-    [14, 14],
-    [44, 14],
-    [14, 18],
-    [44, 18],
-    [7, 15],
-    [51, 15],
-  ]);
-
-  return grid;
-}
-
-/**
- * Level 5: an open boss arena with a handful of brick clusters for cover — which
- * the Sweeper happily ploughs through as it barrels around.
- */
-function buildLevel5Grid(): number[] {
-  const grid = steelBordered();
-
-  coverClusters(grid, [
-    [12, 9],
-    [45, 9],
-    [12, 22],
-    [45, 22],
-    [28, 15],
-    // More brick for the Sweeper to plough through as it barrels around.
-    [20, 5],
-    [37, 5],
-    [20, 26],
-    [37, 26],
-    [4, 12],
-    [51, 12],
-  ]);
-
-  // A handful of steel pillars the Sweeper rebounds off, keeping its path wild.
-  steelPillars(grid, [
-    [16, 15],
-    [42, 15],
-    [29, 9],
-    [29, 22],
-  ]);
-
-  return grid;
-}
-
-/**
- * Level 6 (Act 2): a factory complex with four hardened assembly vaults, one in
- * each far corner so the run is a long circuit rather than a short sweep.
+ * `alive` reports how many of a variant are already on the field, so a row's
+ * {@link SpawnWeight.max} can be honoured. A row over its cap is dropped rather
+ * than re-rolled, which leaves the remaining weights meaning what they say.
  *
- * Each vault is a steel shell the player cannot shoot through (steel only yields
- * to a tier-4 shell), broken by a single brick-plugged doorway. Behind the
- * doorway sits a second brick plug in line with the factory, so every vault
- * costs a shot to breach, an advance, another shot, and then the kill — and the
- * doorways face different directions, so each one has to be driven around and
- * found. The Constructor minibosses wall the open ground in as the fight runs on.
- */
-function buildLevel6Grid(): number[] {
-  const grid = steelBordered();
-
-  // Corner placement, far from the player spawn at (30, 31) and far from each
-  // other, so no two vaults can be serviced from the same approach.
-  // `door` is the cardinal the single entrance faces.
-  const vaults: Array<{ x: number; y: number; door: [number, number] }> = [
-    { x: 8, y: 6, door: [0, 1] },    // top-left, entrance on its south face
-    { x: 51, y: 6, door: [-1, 0] },  // top-right, entrance on its west face
-    { x: 8, y: 26, door: [1, 0] },   // bottom-left, entrance on its east face
-    { x: 51, y: 26, door: [0, -1] }, // bottom-right, entrance on its north face
-  ];
-
-  for (const { x: fx, y: fy, door } of vaults) {
-    const [dxDoor, dyDoor] = door;
-
-    // Steel shell two tiles out — impenetrable to anything below tier 4.
-    for (let dy = -2; dy <= 2; dy++) {
-      for (let dx = -2; dx <= 2; dx++) {
-        if (Math.max(Math.abs(dx), Math.abs(dy)) !== 2) continue;
-        grid[at(fx + dx, fy + dy)] = TileType.Steel;
-      }
-    }
-
-    // The one way in: a brick plug in the shell, and a second plug behind it.
-    // Both sit on the door axis, so the breach is a straight line to the target.
-    grid[at(fx + dxDoor * 2, fy + dyDoor * 2)] = TileType.Brick;
-    grid[at(fx + dxDoor, fy + dyDoor)] = TileType.Brick;
-
-    grid[at(fx, fy)] = TileType.Factory;
-  }
-
-  // Loose cover across the middle ground the circuit has to cross, clear of the
-  // player spawn and of the vault doorways.
-  for (const [x, y] of [
-    [20, 12],
-    [39, 12],
-    [20, 21],
-    [39, 21],
-    [30, 8],
-    [30, 25],
-    [14, 17],
-    [45, 17],
-  ] as Array<[number, number]>) {
-    fillRect(grid, x, y, x + 1, y + 1, TileType.Brick);
-  }
-
-  // Hard steel pillars mid-map, forcing detours between the corners.
-  steelPillars(grid, [
-    [25, 16],
-    [34, 16],
-    [30, 12],
-    [30, 21],
-  ]);
-
-  return grid;
-}
-
-/**
- * Level 7 (Bomb Defusal): an open field with three dirty bombs at far-apart
- * corners and scattered brick cover. The player sprints a circuit to touch all
- * three before the timer expires — while Constructors wall the ground shut.
- */
-function buildLevel7Grid(): number[] {
-  const grid = steelBordered();
-
-  coverClusters(grid, [
-    [14, 8],
-    [45, 8],
-    [14, 22],
-    [45, 22],
-    [28, 15],
-    [20, 26],
-    [39, 5],
-    // Denser cover along the defusal circuit.
-    [24, 8],
-    [35, 22],
-    [8, 12],
-    [49, 12],
-  ]);
-
-  // Hard steel pillars, kept off the direct lanes to the three bombs.
-  steelPillars(grid, [
-    [19, 12],
-    [39, 18],
-    [30, 10],
-    [30, 24],
-  ]);
-
-  // Three bombs at distant corners: bottom-left, bottom-right, and far top-left.
-  for (const [x, y] of [
-    [6, 30],
-    [53, 30],
-    [16, 2],
-  ] as Array<[number, number]>) {
-    grid[at(x, y)] = TileType.Bomb;
-  }
-
-  return grid;
-}
-
-/**
- * Level 8 (Intel Retrieval): a wide-open grid with eight intel packages spread
- * across the corners and edges, plus a little loose cover. The player must sweep
- * the whole map to collect them all while dodging the Trappers' mines.
- */
-function buildLevel8Grid(): number[] {
-  const grid = steelBordered();
-
-  // Eight intel packages: four corners and four edge midpoints, far apart.
-  for (const [x, y] of [
-    [3, 2],
-    [56, 2],
-    [3, 30],
-    [56, 30],
-    [30, 2],
-    [30, 30],
-    [3, 16],
-    [56, 16],
-  ] as Array<[number, number]>) {
-    grid[at(x, y)] = TileType.Intel;
-  }
-
-  // Denser cover through the middle, plus hard steel bastions — the map edges
-  // where the intel sits are left open so every package stays reachable.
-  coverClusters(grid, [
-    [16, 10],
-    [43, 10],
-    [16, 22],
-    [43, 22],
-    [28, 16],
-    [24, 7],
-    [34, 25],
-    [10, 16],
-    [49, 16],
-  ], 2);
-
-  steelPillars(grid, [
-    [21, 14],
-    [37, 14],
-    [21, 18],
-    [37, 18],
-    [29, 11],
-    [29, 21],
-  ]);
-
-  return grid;
-}
-
-/**
- * Level 9 (Escort): a vertical run to the extraction pad at the top centre. The
- * carrier's lane (column 30) is blocked by a stack of full-width brick walls the
- * player has to bulldoze open; the walls carry offset side gaps so the player can
- * still weave, but column 30 is always sealed until they blast it.
- */
-function buildLevel9Grid(): number[] {
-  const grid = steelBordered();
-
-  // Extraction pad: a band across the top centre.
-  fillRect(grid, GRID_WIDTH / 2 - 3, 1, GRID_WIDTH / 2 + 2, 2, TileType.ExtractionZone);
-
-  // Two-tile-tall brick walls across the whole width, with an offset gap on
-  // alternating sides — never at the carrier's column (30), which the player
-  // must bulldoze open. Denser now: more bands, closer together. Every wall is
-  // brick (destructible) so the carrier's lane can always be cleared; steel is
-  // added only as isolated pillars well clear of column 30.
-  const walls: Array<{ y: number; gap: [number, number] }> = [
-    { y: 27, gap: [2, 5] },
-    { y: 23, gap: [54, 57] },
-    { y: 19, gap: [2, 5] },
-    { y: 15, gap: [54, 57] },
-    { y: 11, gap: [2, 5] },
-    { y: 7, gap: [54, 57] },
-  ];
-  for (const { y, gap } of walls) {
-    for (let x = 1; x < GRID_WIDTH - 1; x++) {
-      if (x >= gap[0] && x <= gap[1]) continue;
-      grid[at(x, y)] = TileType.Brick;
-      grid[at(x, y + 1)] = TileType.Brick;
-    }
-  }
-
-  // Isolated steel pillars in the open bands — kept off column 30 so they never
-  // seal the carrier's lane.
-  steelPillars(grid, [
-    [12, 13],
-    [47, 21],
-    [12, 25],
-    [47, 9],
-  ], 2);
-
-  return grid;
-}
-
-/**
- * Level 10 (Artillery Boss): a strict serpentine climb toward a mobile Artillery
- * that skulks around the top gallery, fleeing the player and hiding behind cover
- * while it rains mortars. Full-width walls — indestructible steel up top, brick
- * lower down — each leave a single offset gap, so there is no straight shot up
- * from the spawn: the steel bands seal the player's line of sight to the boss and
- * force them to weave the whole maze to get an angle.
- */
-function buildLevel10Grid(): number[] {
-  const grid = steelBordered();
-
-  // Steel cover in the Artillery's top gallery for it to weave behind — kept
-  // clear of the boss's spawn (top centre) and the enemy spawn tiles.
-  steelPillars(grid, [
-    [12, 2],
-    [20, 3],
-    [39, 3],
-    [47, 2],
-  ]);
-
-  // Two banks of cover rather than a seven-wall serpentine.
-  //
-  // The old layout sealed the boss behind full-width steel with gaps at the far
-  // edges, so a boss that flees at half the player's speed could be chased the
-  // length of the map for minutes without ever being cornered. These bands are
-  // gapped in the middle as well as at the sides: they still break the line of
-  // fire and give the artillery somewhere to hide, but the player can always
-  // cut across and get an angle on it.
-  const bands: Array<{ y: number; gaps: Array<[number, number]>; tile: TileType }> = [
-    { y: 9, gaps: [[8, 12], [27, 33], [47, 51]], tile: TileType.Steel },
-    { y: 18, gaps: [[4, 8], [22, 27], [38, 43], [54, 56]], tile: TileType.Brick },
-    { y: 25, gaps: [[10, 15], [28, 32], [45, 50]], tile: TileType.Brick },
-  ];
-  for (const { y, gaps, tile } of bands) {
-    for (let x = 1; x < GRID_WIDTH - 1; x++) {
-      if (gaps.some(([from, to]) => x >= from && x <= to)) continue;
-      grid[at(x, y)] = tile;
-    }
-  }
-
-  // Loose cover in the open bays, to break the mortar's line on the player the
-  // same way the bands break the player's line on the boss.
-  coverClusters(grid, [
-    [16, 12],
-    [42, 12],
-    [9, 21],
-    [30, 21],
-    [49, 21],
-    [20, 28],
-    [38, 28],
-  ], 2);
-
-  return grid;
-}
-
-/**
- * Level 11 (Act 3): a synthetic-steel labyrinth. Full-width, indestructible
- * steel walls with offset gaps force a tight serpentine climb to the extraction
- * pad, and coolant pools segment the open bands — the player has no choice but
- * to thread the chokepoints.
- */
-function buildLevel11Grid(): number[] {
-  const grid = steelBordered();
-
-  // Extraction pad across the top centre.
-  fillRect(grid, GRID_WIDTH / 2 - 3, 1, GRID_WIDTH / 2 + 2, 2, TileType.ExtractionZone);
-
-  // Steel barrier walls with an offset gap each — the only way through. Denser
-  // now: six bands, closer together, for a longer serpentine climb.
-  const walls: Array<{ y: number; gap: [number, number] }> = [
-    { y: 27, gap: [6, 10] },
-    { y: 23, gap: [49, 53] },
-    { y: 19, gap: [6, 10] },
-    { y: 15, gap: [49, 53] },
-    { y: 11, gap: [6, 10] },
-    { y: 7, gap: [49, 53] },
-  ];
-  for (const { y, gap } of walls) {
-    for (let x = 1; x < GRID_WIDTH - 1; x++) {
-      if (x >= gap[0] && x <= gap[1]) continue;
-      grid[at(x, y)] = TileType.Steel;
-    }
-  }
-
-  // Coolant pools spread through the bands — impassable to tanks, but shells
-  // cross them. Each is only two rows tall so a clear crossing row always
-  // remains within its 3-row band, and all are kept off the chokepoint gaps.
-  fillRect(grid, 27, 24, 32, 25, TileType.Water);
-  fillRect(grid, 15, 12, 19, 13, TileType.Water);
-  fillRect(grid, 40, 16, 44, 17, TileType.Water);
-  fillRect(grid, 22, 8, 26, 9, TileType.Water);
-  fillRect(grid, 33, 20, 37, 21, TileType.Water);
-
-  return grid;
-}
-
-/**
- * Level 12 (Act 3): a wide-open arena carved into bands by coolant rivers.
- * Movement is funnelled across narrow land bridges, but shells fly over the
- * water freely, so fights happen across the basins as the player survives and
- * hunts the Jammers.
- */
-function buildLevel12Grid(): number[] {
-  const grid = steelBordered();
-
-  // Two full-width coolant rivers with offset land bridges, splitting the arena
-  // into three connected bands.
-  const rivers: Array<{ rows: [number, number]; bridges: Array<[number, number]> }> = [
-    { rows: [11, 12], bridges: [[8, 11], [48, 51]] },
-    { rows: [21, 22], bridges: [[26, 31]] },
-  ];
-  for (const { rows, bridges } of rivers) {
-    for (let x = 1; x < GRID_WIDTH - 1; x++) {
-      if (bridges.some(([a, b]) => x >= a && x <= b)) continue;
-      grid[at(x, rows[0])] = TileType.Water;
-      grid[at(x, rows[1])] = TileType.Water;
-    }
-  }
-
-  // Brick and steel cover breaking up the three open bands, kept off the land
-  // bridges and the spawns so movement is still funnelled but harder-fought.
-  coverClusters(grid, [
-    [14, 5],
-    [43, 5],
-    [22, 16],
-    [37, 16],
-    [14, 26],
-    [43, 26],
-  ], 2);
-
-  // Centre-north is left open: the Bastion enters there, and a two-tile hull
-  // that spawns half inside a pillar cannot move at all.
-  steelPillars(grid, [
-    [10, 17],
-    [49, 17],
-    [29, 27],
-  ]);
-
-  // Its entry band, cleared explicitly so it always has room to turn.
-  fillRect(grid, 27, 4, 33, 9, TileType.Empty);
-
-  return grid;
-}
-
-/**
- * Level 13 (Seek & Destroy): a scattered field of six radar towers, each sunk
- * in its own broken brick pocket, with loose cover strewn between them. The
- * player sweeps the map to level all six — but a quarter of the "item drops"
- * littering the ground are disguised Mimics waiting to spring.
- */
-function buildLevel13Grid(): number[] {
-  const grid = steelBordered();
-
-  // Six radar towers, each nested in a broken brick pocket (open at the four
-  // cardinal points) so the player must push into cover to line up each shot.
-  const towers: Array<[number, number]> = [
-    [10, 7],
-    [30, 9],
-    [49, 7],
-    [12, 25],
-    [34, 25],
-    [50, 24],
-  ];
-  for (const [rx, ry] of towers) {
-    for (let dy = -2; dy <= 2; dy++) {
-      for (let dx = -2; dx <= 2; dx++) {
-        const onRing = Math.max(Math.abs(dx), Math.abs(dy)) === 2;
-        const inGap = dx === 0 || dy === 0;
-        if (onRing && !inGap) grid[at(rx + dx, ry + dy)] = TileType.Brick;
-      }
-    }
-    grid[at(rx, ry)] = TileType.Radar;
-  }
-
-  // Denser cover in the open lanes between the pockets, plus hard steel pillars
-  // — kept clear of the radars' firing approaches and the spawns.
-  coverClusters(grid, [
-    [20, 16],
-    [39, 16],
-    [28, 3],
-    [20, 5],
-    [39, 5],
-    [20, 27],
-    [39, 27],
-    [6, 13],
-    [53, 13],
-  ], 2);
-
-  steelPillars(grid, [
-    [24, 12],
-    [35, 12],
-    [24, 19],
-    [35, 19],
-    [29, 16],
-  ]);
-
-  return grid;
-}
-
-/**
- * Level 14 (Bomb Defusal): a massive, incredibly dense brick maze — the whole
- * interior packed solid and cut only by a sparse corridor lattice — hiding three
- * dirty bombs in far-apart pockets. A Juggernaut siege unit ploughs through the
- * walls as it hunts, tearing the maze open behind it while the timer runs down.
- */
-function buildLevel14Grid(): number[] {
-  const grid = steelBordered();
-  fillInterior(grid);
-
-  // Carve a sparse corridor lattice through the solid brick — just enough to
-  // thread, so the fill still reads as a dense maze rather than a room.
-  for (const y of [2, 9, 16, 23, 30]) carveRow(grid, y);
-  for (const x of [4, 13, 22, 30, 38, 47, 55]) carveCol(grid, x);
-
-  // A clear chamber at top centre for the Juggernaut to drop into, and one at
-  // bottom centre around the player's spawn pad.
-  fillRect(grid, 27, 2, 32, 5, TileType.Empty);
-  fillRect(grid, 27, 29, 32, 31, TileType.Empty);
-
-  // Three dirty bombs sunk into far-apart pockets of the maze.
-  for (const [x, y] of [
-    [4, 2],
-    [55, 16],
-    [13, 30],
-  ] as Array<[number, number]>) {
-    grid[at(x, y)] = TileType.Bomb;
-  }
-
-  return grid;
-}
-
-/**
- * Level 15 (Miniboss Gauntlet): a completely open steel-bordered box with zero
- * internal cover. A pure dodging arena — the player survives 120 seconds while
- * every miniboss type in the game rains down.
- */
-function buildLevel15Grid(): number[] {
-  return steelBordered();
-}
-
-/**
- * Level 16 (Security Relays): a dense, symmetrical labyrinth containing four
- * radar relay towers hidden in the corners. Ghost stealth units haunt the dark.
- */
-function buildLevel16Grid(): number[] {
-  const grid = steelBordered();
-  fillInterior(grid);
-
-  // Carve wide 2-tile corridors so navigation is comfortable in the dark.
-  for (const y of [2, 3, 8, 9, 16, 17, 24, 25, 29, 30]) carveRow(grid, y);
-  for (const x of [2, 3, 10, 11, 20, 21, 30, 31, 39, 40, 49, 50, 57]) carveCol(grid, x);
-
-  // Open up four small chambers in the corners to house the relay towers.
-  fillRect(grid, 3, 3, 8, 6, TileType.Empty);
-  fillRect(grid, 51, 3, 56, 6, TileType.Empty);
-  fillRect(grid, 3, 26, 8, 29, TileType.Empty);
-  fillRect(grid, 51, 26, 56, 29, TileType.Empty);
-
-  // A clear chamber at bottom centre around the player's spawn pad.
-  fillRect(grid, 27, 28, 33, 31, TileType.Empty);
-
-  // Four radar relay towers, one in each corner chamber.
-  grid[at(5, 4)] = TileType.Radar;
-  grid[at(54, 4)] = TileType.Radar;
-  grid[at(5, 28)] = TileType.Radar;
-  grid[at(54, 28)] = TileType.Radar;
-
-  // Steel pillars along the corridors to break long firing lanes.
-  steelPillars(grid, [
-    [14, 15],
-    [44, 15],
-    [29, 5],
-    [29, 27],
-    [14, 7],
-    [44, 7],
-    [14, 23],
-    [44, 23],
-  ]);
-
-  return grid;
-}
-
-/**
- * Level 17 (The Upload): a symmetrical arena with a 3x3 uplink zone in the
- * exact centre, flanked by four protective steel pillars. Loose brick cover
- * breaks the open ground, but the approaches to the zone are wide open.
- */
-function buildLevel17Grid(): number[] {
-  const grid = steelBordered();
-
-  const cx = Math.floor(GRID_WIDTH / 2);  // 30
-  const cy = Math.floor(GRID_HEIGHT / 2); // 16
-
-  // 3x3 Uplink Zone at centre.
-  for (let dy = -1; dy <= 1; dy++) {
-    for (let dx = -1; dx <= 1; dx++) grid[at(cx + dx, cy + dy)] = TileType.UplinkZone;
-  }
-
-  // Four steel pillars protecting the zone — the player can duck behind them.
-  steelPillars(grid, [
-    [cx - 4, cy - 1],
-    [cx + 3, cy - 1],
-    [cx - 1, cy - 4],
-    [cx - 1, cy + 3],
-  ]);
-
-  // Brick cover at each quadrant for something to hide behind on approach.
-  coverClusters(grid, [
-    [10, 6],
-    [47, 6],
-    [10, 24],
-    [47, 24],
-    [20, 10],
-    [38, 10],
-    [20, 22],
-    [38, 22],
-  ], 2);
-
-  // Hard steel bastions at the four far corners — indestructible reference points.
-  steelPillars(grid, [
-    [4, 4],
-    [54, 4],
-    [4, 27],
-    [54, 27],
-  ]);
-
-  return grid;
-}
-
-/**
- * Level 18 (The Fragments): an open arena for the Hydra.
+ * The roll runs against 1, not against the table's total, so a table whose
+ * weights sum to less than 1 leaves the remainder as ordinary tanks.
  *
- * Deliberately sparse. The largest Hydra tier is three tiles across and its
- * fragments end up spread all over the field, so the map has to be traversable
- * by a wide hull and open enough to keep seven bodies in view. Cover is small,
- * free-standing and well spaced — enough to break a firing line, never enough
- * to form a corridor something big can wedge in.
- *
- * (This replaced a water-moat layout built for the level's old intel objective,
- * whose two-tile lanes the three-tile boss could not physically enter.)
+ * `random` is injectable so the pick is testable.
  */
-function buildLevel18Grid(): number[] {
-  const grid = steelBordered();
+export function rollSpawnVariant(
+  table: readonly SpawnWeight[] | undefined,
+  alive: (variant: EnemyVariant) => number,
+  random: () => number = Math.random,
+): EnemyVariant {
+  if (!table || table.length === 0) return EnemyVariant.Standard;
 
-  // Small free-standing brick clusters, ringed around the arena. Every gap
-  // between them is at least four tiles, so nothing can bottleneck.
-  coverClusters(grid, [
-    [11, 7],
-    [48, 7],
-    [7, 16],
-    [52, 16],
-    [11, 25],
-    [30, 27],
-    [48, 25],
-  ], 2);
+  const eligible = table.filter((row) => row.max === undefined || alive(row.variant) < row.max);
+  const total = eligible.reduce((sum, row) => sum + row.weight, 0);
+  if (total <= 0) return EnemyVariant.Standard;
 
-  // A few steel anchors to break sightlines across the middle, spaced so the
-  // centre stays crossable in every direction.
-  steelPillars(grid, [
-    [20, 12],
-    [39, 12],
-    [20, 20],
-    [39, 20],
-  ], 2);
-
-  // Keep the middle and the spawn approach completely clear: the boss enters
-  // from the north and has to be able to reach the player, and the player has
-  // to be able to back away from seven fragments at once.
-  fillRect(grid, 26, 14, 33, 18, TileType.Empty);
-  fillRect(grid, 26, 28, 33, 31, TileType.Empty);
-
-  // The boss's own entry band at centre-north. Cleared explicitly rather than
-  // left to luck: a three-tile hull that spawns inside cover cannot move at
-  // all, which is exactly how the previous layout stranded it.
-  fillRect(grid, 26, 3, 34, 9, TileType.Empty);
-
-  return grid;
-}
-
-/**
- * Level 19 (The Final Breach): a vertical corridor from the bottom spawn up to
- * the extraction pad at the top. Alternating steel and brick walls with offset
- * gaps create a tight serpentine climb — Constructors wall the path shut while
- * Kamikazes rush the narrows.
- */
-function buildLevel19Grid(): number[] {
-  const grid = steelBordered();
-
-  // Extraction pad: a narrow band across the top centre.
-  fillRect(grid, GRID_WIDTH / 2 - 3, 1, GRID_WIDTH / 2 + 2, 2, TileType.ExtractionZone);
-
-  // Tight serpentine: alternating steel and brick walls with narrow offset gaps.
-  // Steel walls are indestructible — the player must use the gap. Brick walls
-  // can be blasted but are tight enough that Constructors re-seal them fast.
-  const walls: Array<{ y: number; gap: [number, number]; tile: TileType }> = [
-    { y: 5,  gap: [4, 7],   tile: TileType.Steel },
-    { y: 8,  gap: [52, 55], tile: TileType.Brick },
-    { y: 11, gap: [4, 7],   tile: TileType.Steel },
-    { y: 14, gap: [52, 55], tile: TileType.Brick },
-    { y: 17, gap: [4, 7],   tile: TileType.Steel },
-    { y: 20, gap: [52, 55], tile: TileType.Brick },
-    { y: 23, gap: [4, 7],   tile: TileType.Steel },
-    { y: 26, gap: [52, 55], tile: TileType.Brick },
-    { y: 29, gap: [27, 33], tile: TileType.Brick },
-  ];
-  for (const { y, gap, tile } of walls) {
-    for (let x = 1; x < GRID_WIDTH - 1; x++) {
-      if (x >= gap[0] && x <= gap[1]) continue;
-      grid[at(x, y)] = tile;
-    }
+  let roll = random() * Math.max(1, total);
+  for (const row of eligible) {
+    roll -= row.weight;
+    if (roll < 0) return row.variant;
   }
-
-  return grid;
-}
-
-/**
- * Level 20 (The Architect): a deliberately bare arena that the boss spends the
- * fight making smaller.
- *
- * The four Radar tiles are its pylons, set wide apart and close to the border so
- * the player must commit to the outer ring — exactly the ground the contracting
- * walls take first. Cover is sparse and central on purpose: the encounter's
- * tension is open space running out, and a maze would both hide the contraction
- * and wedge the three-tile hull.
- */
-function buildLevel20Grid(): number[] {
-  const grid = steelBordered();
-
-  // The pylons. Reachable, but far apart and near the edge — the player has to
-  // spend the room they are about to lose.
-  for (const [x, y] of [
-    [8, 6],
-    [51, 6],
-    [8, 26],
-    [51, 26],
-  ] as Array<[number, number]>) {
-    grid[at(x, y)] = TileType.Radar;
-  }
-
-  // A little brick cover beside each pylon: something to break line of fire
-  // without walling the approach off.
-  for (const [x, y] of [
-    [11, 8],
-    [48, 8],
-    [11, 24],
-    [48, 24],
-  ] as Array<[number, number]>) {
-    fillRect(grid, x, y, x + 1, y + 1, TileType.Brick);
-  }
-
-  // Two central steel pillars, clear of the Architect's own footprint at centre.
-  steelPillars(grid, [
-    [22, 16],
-    [36, 16],
-  ], 2);
-
-  return grid;
-}
-
-/**
- * Level 21 (The Logic Core): a massive, wide-open arena for the final boss.
- * Four symmetrical steel pillars provide desperate cover against the Core's
- * 360-degree radial fire.
- */
-function buildLevel21Grid(): number[] {
-  const grid = steelBordered();
-
-  // Four symmetrical steel pillars — the only cover in the arena.
-  steelPillars(grid, [
-    [15, 10],
-    [43, 10],
-    [15, 22],
-    [43, 22],
-  ], 3);
-
-  return grid;
-}
-
-/**
- * Level 22 (The Effigy): a duelling ground.
- *
- * Symmetric, mostly open, with scattered pillars to break line of fire and give
- * both duellists something to blink around. Deliberately even-handed — the
- * fight is meant to read as a mirror match, so neither side gets better ground.
- */
-function buildLevel22Grid(): number[] {
-  const grid = steelBordered();
-
-  // A ring of steel pillars, evenly spaced — cover that favours nobody.
-  steelPillars(grid, [
-    [18, 9],
-    [40, 9],
-    [18, 23],
-    [40, 23],
-    [29, 16],
-  ], 2);
-
-  // Brick outriggers, destructible, so the arena opens up as the duel runs on.
-  // Kept off the north-south centre line: the Effigy enters from the top and
-  // must not be walled in on the way down.
-  for (const [x, y] of [
-    [12, 16],
-    [46, 16],
-    [29, 11],
-    [29, 21],
-  ] as Array<[number, number]>) {
-    fillRect(grid, x, y, x + 1, y + 1, TileType.Brick);
-  }
-
-  // The Effigy's entry band, cleared explicitly so it always has room to turn.
-  fillRect(grid, 26, 3, 33, 8, TileType.Empty);
-
-  return grid;
+  return EnemyVariant.Standard;
 }
 
 /** Every level of the single-player campaign, in play order. */
-export const CAMPAIGN_LEVELS: CampaignLevel[] = [
+export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
+  // ==========================================================================
+  // ACT 1 — ISOLATION
+  //
+  // One tank, no orders, and a war that has already been lost somewhere else.
+  // The act teaches the four verbs the campaign is built from — level it, reach
+  // it, outlast it, hold it — and hands over the deflector before the first
+  // thing that cannot be out-shot.
+  // ==========================================================================
   {
     id: 1,
+    act: 1,
+    title: "Signal Fire",
     winCondition: CampaignWinCondition.DestroyRadars,
+    mapGrid: buildJammingField(),
     introText:
       "Battalion command is dark. I am the only signal left. I need to destroy their jamming towers to send a distress beacon.",
     outroText:
       "Towers destroyed. The signal is out... but the only reply was automated static. The Obsidian Protocol. It is just me now.",
-    mapGrid: buildLevel1Grid(),
   },
   {
     id: 2,
+    act: 1,
+    title: "The Depot Run",
     winCondition: CampaignWinCondition.ReachExtraction,
+    mapGrid: buildDepotApproach(),
     introText:
-      "Long-range scans show an intact armored depot north of this sector. I must punch through their barricades and reach the extraction pad.",
+      "Long-range scans show an intact armored depot north of this sector. Their barricades are solid plate — the only soft points are two narrow brick culverts, hard against the east and west walls. I will have to commit to a side and cut my way through.",
     outroText:
       "Extraction point reached. Depot secured and hull patched. But acoustic sensors are picking up heavy engine rumblings surrounding the perimeter...",
-    mapGrid: buildLevel2Grid(),
   },
   {
     id: 3,
+    act: 1,
+    title: "Hold the Line",
     winCondition: CampaignWinCondition.SurviveTime,
+    mapGrid: buildSurvivalArena(),
+    // Level three, and the tank has no kit at all yet — no shield, no blink,
+    // nothing but the gun it started with. Two minutes of that was a wall this
+    // early, and the level it is meant to be is a scare, not a filter.
+    params: { surviveSeconds: 90, spawnIntervalFactor: 1.3, maxEnemies: 7 },
+    spawns: [{ variant: EnemyVariant.Kamikaze, weight: 0.15 }],
     introText:
-      "It is an ambush! Hostile signals flooding the perimeter from all sides. I must hold the line and survive for 120 seconds until my sub-rotors recharge.",
+      "It is an ambush! Hostile signals flooding the perimeter from all sides. I must hold the line and survive for 90 seconds until my sub-rotors recharge.",
     outroText:
-      "Perimeter cleared. Enemy forces retreating. That was not a random patrol—they were tracking my heat signature.",
-    mapGrid: buildLevel3Grid(),
+      "Perimeter cleared. Enemy forces retreating. That was not a random patrol — they were tracking my heat signature.",
   },
   {
     id: 4,
+    act: 1,
+    title: "Dead Channel",
+    winCondition: CampaignWinCondition.DefendCore,
+    mapGrid: buildRelayStation(),
+    params: { defendSeconds: 90 },
+    spawns: [{ variant: EnemyVariant.Kamikaze, weight: 0.3 }],
+    introText:
+      "There is a battalion relay still transmitting out here — the last piece of our network the Protocol has not silenced. It is running a 90 second handshake. If that mast falls before it completes, nobody ever hears what happened in this sector. Keep them off it.",
+    outroText:
+      "Handshake complete. The relay logged everything and went quiet. Whatever it sent, it sent to someone. I have to believe that.",
+  },
+  {
+    id: 5,
+    act: 1,
+    title: "The Uplink",
     winCondition: CampaignWinCondition.ZoneControl,
+    mapGrid: buildUplinkYard(),
+    spawns: [{ variant: EnemyVariant.Kamikaze, weight: 0.35 }],
     introText:
       "I found a Directorate communications uplink. I need to hold position inside the zone for 60 seconds to download their sector map. Warning: scans show extremely volatile, fast-moving units inbound.",
     outroText:
       "Map downloaded. The data reveals a massive prototype unit approaching my exact coordinates. Nowhere to run. I have to stand and fight.",
-    mapGrid: buildLevel4Grid(),
-  },
-  {
-    id: 5,
-    winCondition: CampaignWinCondition.AssassinateBoss,
-    introText:
-      "The prototype has breached the arena. It is heavily armored and massive. No complex AI, just raw crushing power. I must outmaneuver it and strike while avoiding its path.",
-    outroText:
-      "Prototype destroyed. Act 1 Complete. The Obsidian Protocol is bleeding, but the war is just beginning...",
-    mapGrid: buildLevel5Grid(),
   },
   {
     id: 6,
+    act: 1,
+    title: "Prototype",
+    winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildOpenArena(),
+    bosses: [{ kind: BossKind.Sweeper }],
+    introText:
+      "The prototype has breached the arena. It is heavily armored and massive. No complex AI, just raw crushing power. I must outmaneuver it and strike while avoiding its path.",
+    outroText:
+      "Prototype destroyed. Act 1 complete. The Obsidian Protocol is bleeding, but the war is just beginning...",
+  },
+
+  // ==========================================================================
+  // ACT 2 — SABOTAGE
+  //
+  // Off the back foot and onto theirs. This act is where the campaign starts
+  // sending things after the player instead of at them, and where an objective
+  // stops always being the end of a level.
+  // ==========================================================================
+  {
+    id: 7,
+    act: 2,
+    title: "Assembly Line",
     winCondition: CampaignWinCondition.DestroyFactories,
+    mapGrid: buildFactoryComplex(),
+    params: { spawnIntervalFactor: 1.5 },
+    spawns: [{ variant: EnemyVariant.Constructor, weight: 0.18, max: 2 }],
     introText:
       "Act 2: Sabotage. I have located a forward assembly line. They are churning out armor at an unprecedented rate. I need to level the primary Factory structures to stem the tide.",
     outroText:
       "Assembly lines demolished. But they managed to deploy a new trench-layer unit before the collapse. The terrain is shifting.",
-    mapGrid: buildLevel6Grid(),
-  },
-  {
-    id: 7,
-    winCondition: CampaignWinCondition.DefuseBombs,
-    introText:
-      "The Constructors were laying groundwork for a demolition trap. Scans detect three high-yield explosives with active countdowns. I have 90 seconds to reach and defuse them before this sector goes critical.",
-    outroText:
-      "Threat neutralized. Blast averted. But the explosives were rigged with a secondary data-wipe. I need to find the scattered backup drives.",
-    mapGrid: buildLevel7Grid(),
   },
   {
     id: 8,
-    winCondition: CampaignWinCondition.RetrieveIntel,
+    act: 2,
+    title: "Countdown",
+    winCondition: CampaignWinCondition.DefuseBombs,
+    mapGrid: buildBombFlats(),
+    params: { bombSeconds: 90 },
+    // The first level where clearing the objective is not the end of it: the
+    // detonation sequence going quiet is what tells the Protocol where I am.
+    bosses: [{ kind: BossKind.Sweeper, when: BossTiming.Objective }],
+    spawns: [{ variant: EnemyVariant.Kamikaze, weight: 0.2 }],
     introText:
-      "The backup drives were scattered across this sector. I need to recover all 8 Intel packages. Warning: I am picking up erratic movement patterns. Minelayers are in the area.",
+      "The Constructors were laying groundwork for a demolition trap. Scans detect four high-yield explosives with active countdowns, and they are not close together. I have 90 seconds to reach and defuse every one before this sector goes critical.",
     outroText:
-      "Intel secured. The data points directly to a heavily fortified canyon. It is an ambush chokepoint, but the only way forward.",
-    mapGrid: buildLevel8Grid(),
+      "Bombs dead, and the thing they sent to collect the pieces is dead with them. The explosives were rigged with a secondary data-wipe. I need to find the scattered backup drives.",
   },
   {
     id: 9,
+    act: 2,
+    title: "Backup Drives",
+    winCondition: CampaignWinCondition.RetrieveIntel,
+    mapGrid: buildIntelSprawl(),
+    params: { orderedObjectives: true },
+    spawns: [{ variant: EnemyVariant.Trapper, weight: 0.35 }],
+    introText:
+      "Twelve backup drives, scattered across the sector — and they are a striped array, so they only read in sequence. My scope will mark whichever one is next; the rest are so much scrap metal until their turn comes. It is going to send me back and forth across this place. Warning: erratic movement patterns. Minelayers are in the area.",
+    outroText:
+      "Intel secured — and a blink drive with it, salvaged out of one of the drives. It will not take me far, but it will take me out of a corner.",
+  },
+  {
+    id: 10,
+    act: 2,
+    title: "Running Interference",
+    winCondition: CampaignWinCondition.DestroyConvoy,
+    mapGrid: buildConvoyRoad(),
+    spawns: [
+      { variant: EnemyVariant.Kamikaze, weight: 0.2 },
+      { variant: EnemyVariant.Sapper, weight: 0.15 },
+    ],
+    introText:
+      "The intel names a haulage route. There is a Protocol carrier running the road below me with a full load of their manufacturing data, and it is not stopping for anything. If it reaches the west gate, that data is gone. Kill it on the road.",
+    outroText:
+      "Carrier burning. The manifest was not weapons — it was survey data. Every square metre of this sector, mapped and catalogued. They are not fighting a war out here. They are taking an inventory.",
+  },
+  {
+    id: 11,
+    act: 2,
+    title: "Canyon Escort",
     winCondition: CampaignWinCondition.Escort,
+    mapGrid: buildEscortCanyon(),
+    spawns: [{ variant: EnemyVariant.Kamikaze, weight: 0.25 }],
     introText:
       "An allied data-carrier truck is stranded in the canyon. It holds the decryption keys for the core. I must escort it to the northern extraction pad. If it is destroyed, the campaign fails.",
     outroText:
       "Carrier secured. The keys are decrypting... Scans show a massive artillery platform locking onto my position. I need to move NOW.",
-    mapGrid: buildLevel9Grid(),
-  },
-  {
-    id: 10,
-    winCondition: CampaignWinCondition.AssassinateBoss,
-    introText:
-      "The keys decrypted. The data points here—a massive siege platform locking onto my coordinates. If I stop moving, I am dead.",
-    outroText:
-      "Platform destroyed. Act 2 Complete. I have the location of the logic core. Time to end this.",
-    mapGrid: buildLevel10Grid(),
-  },
-  {
-    id: 11,
-    winCondition: CampaignWinCondition.ReachExtraction,
-    introText:
-      "Act 3: System Collapse. I have breached the inner perimeter. The architecture here is mostly synthetic steel and coolant rivers. Scans show elite Shield units guarding the extraction point — and siege platforms holding back at range, arcing shells over the walls. Cover will not hold here. Keep moving, and close on them.",
-    outroText:
-      "Extraction point reached. But they are deploying electronic warfare units. My fire-control systems are being throttled.",
-    mapGrid: buildLevel11Grid(),
   },
   {
     id: 12,
+    act: 2,
+    title: "The Gallery",
     winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildSerpentineGallery(),
+    bosses: [{ kind: BossKind.Artillery }],
+    spawns: [{ variant: EnemyVariant.Sapper, weight: 0.2 }],
     introText:
-      "They have brought up a Bastion to hold the coolant basins. Frontal plating my shells will not scratch — I have watched three bounce off. It turns to face whatever it can see, and it is quick about it. But that is bow armour only: anything into a flank or the stern goes straight in. Circle it. Blink if I have to.",
+      "The keys decrypted. The data points here — a massive siege platform locking onto my coordinates. It will not stand and fight; it will back away and shell me the whole way in. If I stop moving, I am dead.",
     outroText:
-      "Bastion down — through the flank, where the armor was not. Noted. The Protocol is getting desperate.",
-    mapGrid: buildLevel12Grid(),
+      "Platform destroyed. It relocated every time I got a hit in — that is not a gun crew, that is a survival routine. Something is telling it what its own life is worth.",
   },
   {
     id: 13,
-    winCondition: CampaignWinCondition.DestroyRadars,
+    act: 2,
+    title: "Scrapline",
+    winCondition: CampaignWinCondition.PurgeMarked,
+    mapGrid: buildScrapline(),
+    params: { purgeCount: 6 },
+    spawns: [{ variant: EnemyVariant.Mimic, weight: 0.25 }],
     introText:
-      "The Protocol is hiding a massive server cluster nearby. I need to take out 6 Radar towers to triangulate its position. Warning: Scans show anomalies in the item drops. Trust nothing.",
+      "A reclamation yard, and every hull in it looks like every other hull in it. Six of them are live and carrying the Protocol's routing keys; the rest are scrap that will happily sit there while I waste ammunition on it. My scope will mark the live ones. Trust the mark, not the silhouette.",
     outroText:
-      "Towers destroyed. Triangulation complete. The coordinates lead to a heavily fortified bunker. I am going in.",
-    mapGrid: buildLevel13Grid(),
+      "Six marked, six dead. Act 2 complete. The routing keys point inward — past the perimeter, into something they have built underground.",
   },
+
+  // ==========================================================================
+  // ACT 3 — THE PERIMETER
+  //
+  // Inside their architecture now: synthetic steel, coolant, and units built to
+  // answer specific things the player has learned to do. The act where the
+  // campaign stops fielding threats and starts fielding counters.
+  // ==========================================================================
   {
     id: 14,
-    winCondition: CampaignWinCondition.DefuseBombs,
+    act: 3,
+    title: "Inner Perimeter",
+    winCondition: CampaignWinCondition.ReachExtraction,
+    mapGrid: buildCoolantLabyrinth(),
+    spawns: [
+      { variant: EnemyVariant.Aegis, weight: 0.3 },
+      { variant: EnemyVariant.Sapper, weight: 0.3 },
+    ],
     introText:
-      "It is a trap! The bunker is rigged with dirty bombs, and they just dropped a Juggernaut-class siege unit into the arena to ensure I do not leave. 90 seconds until detonation.",
+      "Act 3: The Perimeter. I have breached the inner wall. The architecture here is synthetic steel and coolant rivers. Scans show elite Shield units guarding the extraction point — and siege platforms holding back at range, arcing shells over the walls. Cover will not hold here. Keep moving, and close on them.",
     outroText:
-      "Bombs defused. Juggernaut scrapped. The path to their primary energy weapon is clear.",
-    mapGrid: buildLevel14Grid(),
+      "Extraction point reached. But they are deploying electronic warfare units. My fire-control systems are being throttled.",
   },
   {
     id: 15,
+    act: 3,
+    title: "Coolant Basins",
     winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildCoolantBasins(),
+    bosses: [{ kind: BossKind.Bastion }],
+    spawns: [{ variant: EnemyVariant.Jammer, weight: 0.3, max: 1 }],
     introText:
-      "The elevator stopped. It is an ambush. A Warden-class siege tank is blocking the descent.",
+      "They have brought up a Bastion to hold the coolant basins. Three faces of it are plate my shells will not scratch — but only three. There is always one seam open, and it walks around the hull on a cycle. Find the open face, get to it, and be somewhere else before it seals.",
     outroText:
-      "Elevator reached the bottom. Welcome to the mainframe.",
-    mapGrid: buildLevel15Grid(),
+      "Bastion down — through the open seam, every time it came round. The Protocol is getting desperate.",
   },
   {
     id: 16,
+    act: 3,
+    title: "Seek and Destroy",
     winCondition: CampaignWinCondition.DestroyRadars,
+    mapGrid: buildRadarScatter(),
+    spawns: [{ variant: EnemyVariant.Mimic, weight: 0.45 }],
     introText:
-      "Act 4: The Logic Core. I need to sever the 4 security relays. Warning: My optical sensors are glitching. They have stealth units in the dark.",
+      "The Protocol is hiding a massive server cluster nearby. I need to take out all 8 Radar towers to triangulate its position. Warning: scans show anomalies in the item drops. Trust nothing.",
     outroText:
-      "Relays destroyed. The inner doors are unlocking.",
-    mapGrid: buildLevel16Grid(),
+      "Towers destroyed. Triangulation complete. And the charge coil finally came online — close-in blast, one press, everything in reach.",
   },
   {
     id: 17,
-    winCondition: CampaignWinCondition.ZoneControl,
+    act: 3,
+    title: "Breakwater",
+    winCondition: CampaignWinCondition.DefendCore,
+    mapGrid: buildBreakwater(),
+    params: { defendSeconds: 100 },
+    // Two wrecking balls the instant the hold completes — the Protocol's answer
+    // to being held off for a hundred seconds is to stop sending patrols.
+    bosses: [{ kind: BossKind.Sweeper, count: 2, when: BossTiming.Objective }],
+    spawns: [
+      { variant: EnemyVariant.Jammer, weight: 0.25, max: 1 },
+      { variant: EnemyVariant.Kamikaze, weight: 0.25 },
+    ],
     introText:
-      "I have reached the primary firewall. I need to hold the central uplink for 60 seconds to upload the override virus. Warning: Heavy stealth and shield activity detected.",
+      "There is a second relay behind the sea wall, and it is close enough to the Core to hear it think. A hundred seconds of recording is all I need. They will not let me have it quietly.",
     outroText:
-      "Override successful. The firewall is down.",
-    mapGrid: buildLevel17Grid(),
+      "Recording secured — and the two wrecking balls they finally sent to end the argument are scrap in the coolant. They stopped sending patrols and started sending answers. I am getting close.",
   },
   {
     id: 18,
+    act: 3,
+    title: "The Bunker",
+    winCondition: CampaignWinCondition.DefuseBombs,
+    mapGrid: buildBunkerMaze(),
+    params: { bombSeconds: 90 },
+    bosses: [{ kind: BossKind.Juggernaut }],
+    spawns: [{ variant: EnemyVariant.Constructor, weight: 0.2, max: 2 }],
+    introText:
+      "It is a trap! The bunker is rigged with four dirty bombs, and they just dropped a Juggernaut-class siege unit into the maze to make sure I do not leave. 90 seconds until detonation.",
+    outroText:
+      "Bombs defused. Juggernaut scrapped. And the fire-control refit finally took — the gun runs a third faster than it did an hour ago.",
+  },
+  {
+    id: 19,
+    act: 3,
+    title: "Descent",
     winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildEmptyBox(),
+    bosses: [{ kind: BossKind.Warden }],
+    spawns: [
+      { variant: EnemyVariant.Kamikaze, weight: 0.2 },
+      { variant: EnemyVariant.Aegis, weight: 0.15 },
+      { variant: EnemyVariant.Sapper, weight: 0.15 },
+      { variant: EnemyVariant.Trapper, weight: 0.15 },
+    ],
+    introText:
+      "The elevator stopped. It is an ambush. A Warden-class siege tank is blocking the descent, and it has brought everything the perimeter had left.",
+    outroText:
+      "Elevator reached the bottom. Act 3 complete. Whatever is down here, it was here before the war.",
+  },
+  {
+    id: 20,
+    act: 3,
+    title: "Pressure Line",
+    winCondition: CampaignWinCondition.PushPayload,
+    mapGrid: buildPressureLine(),
+    spawns: [
+      { variant: EnemyVariant.Sapper, weight: 0.25 },
+      { variant: EnemyVariant.Kamikaze, weight: 0.2 },
+    ],
+    introText:
+      "There is a breaker unit down here — a battalion machine, still under power, still with a hole-punch on the front. It will cut the archive door for me, but its guidance is gone: it only rolls while I am beside it. Every second I spend fighting is a second it stands still.",
+    outroText:
+      "Door breached. And the beacon rig on the breaker's hull came free — a decoy, loud enough to pull a whole patrol off me. The archive is open.",
+  },
+
+  // ==========================================================================
+  // ACT 4 — THE ARCHIVE
+  //
+  // The turn. Everything down here is battalion hardware, and the Protocol did
+  // not capture it — it was always the thing running it. The act is deliberately
+  // quieter and closer than the ones around it: less swarm, more units built to
+  // take something specific away from the player.
+  // ==========================================================================
+  {
+    id: 21,
+    act: 4,
+    title: "The Archive Gate",
+    winCondition: CampaignWinCondition.DestroyRadars,
+    mapGrid: buildArchiveGate(),
+    params: { orderedObjectives: true },
+    spawns: [
+      { variant: EnemyVariant.Sentinel, weight: 0.3, max: 4 },
+      { variant: EnemyVariant.Howler, weight: 0.2, max: 2 },
+    ],
+    introText:
+      "Act 4: The Archive. Six masts hold the gate shut, on a security interlock — drop them out of sequence and the plating just seals and my shells spark off it. My scope will mark the live one. The hall was built for long sightlines, and there are gun positions dug in down the colonnade that will not chase me. They do not have to. Anything standing still down here can see the whole length of it.",
+    outroText:
+      "Gate open. These are battalion masts. Battalion bolts, battalion paint, our own serial stamps. The Protocol did not take this place. It was issued it. There is a translocator coil in the gatehouse too — a full phase jump, anywhere I can see, once every long while. I am going to want that in the vaults.",
+  },
+  {
+    id: 22,
+    act: 4,
+    title: "Cold Storage",
+    winCondition: CampaignWinCondition.SurviveTime,
+    mapGrid: buildColdStorage(),
+    params: { surviveSeconds: 90 },
+    spawns: [
+      { variant: EnemyVariant.Burrower, weight: 0.3, max: 3 },
+      { variant: EnemyVariant.Leech, weight: 0.25, max: 3 },
+    ],
+    introText:
+      "Vault rows, narrow aisles, and something moving under the floor that my scope loses every few seconds. Ninety seconds until the vault cycle lets me through. Do not get boxed in, and do not count on the kit — there is something down here that drinks it.",
+    outroText:
+      "Cycle complete. The vaults are full of personnel files. Ours. Every crew in the battalion, with an assessment appended to each one. Someone was grading us.",
+  },
+  {
+    id: 23,
+    act: 4,
+    title: "Our Own Dead",
+    winCondition: CampaignWinCondition.PurgeMarked,
+    mapGrid: buildBoneyard(),
+    params: { purgeCount: 8 },
+    spawns: [
+      { variant: EnemyVariant.Ghost, weight: 0.3 },
+      { variant: EnemyVariant.Mimic, weight: 0.2 },
+    ],
+    introText:
+      "A field of battalion armour, and some of it is still driving. Eight hulls are running Protocol routines behind our own plating. The rest are wrecks and crews that never got out. My scope will mark the live ones. I would rather it did not have to.",
+    outroText:
+      "Eight down. I read the hull numbers on the way past. I knew four of them.",
+  },
+  {
+    id: 24,
+    act: 4,
+    title: "The Choir",
+    winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildChoirHall(),
+    bosses: [{ kind: BossKind.Choir }],
+    spawns: [{ variant: EnemyVariant.Howler, weight: 0.2, max: 2 }],
+    introText:
+      "Two signatures, one heartbeat. They are wired into the same pool — hurt one and the other feels it, kill one and the other brings it straight back unless I finish them together. And there is a pillar down the middle of this hall, so I cannot hold both at once. Break one down, cross, and be quick about the second.",
+    outroText:
+      "Both down inside the window. The Choir was a fire-control experiment — two hulls, one crew, no crew at all. And there is a mortar rig in the wreckage worth taking: call a shell down anywhere I can see. Right mouse.",
+  },
+  {
+    id: 25,
+    act: 4,
+    title: "Requisition",
+    winCondition: CampaignWinCondition.DestroyFactories,
+    mapGrid: buildRequisitionYard(),
+    spawns: [
+      { variant: EnemyVariant.Reclaimer, weight: 0.3, max: 2 },
+      { variant: EnemyVariant.Overseer, weight: 0.2, max: 2 },
+    ],
+    introText:
+      "Four assembly vaults, and a repair crew that rebuilds them faster than I can knock them down. Killing the vaults is not the problem. Killing the vaults and making it stick is the problem — deal with the crews first, or I will be doing this all afternoon.",
+    outroText:
+      "Vaults down and staying down. The requisition orders are countersigned by Battalion Command. Dated after command went dark.",
+  },
+  {
+    id: 26,
+    act: 4,
+    title: "Signal Discipline",
+    winCondition: CampaignWinCondition.ZoneControl,
+    mapGrid: buildSignalYard(),
+    params: { zoneSeconds: 75 },
+    spawns: [
+      { variant: EnemyVariant.Nullifier, weight: 0.2, max: 2 },
+      { variant: EnemyVariant.Jammer, weight: 0.2, max: 1 },
+      { variant: EnemyVariant.Howler, weight: 0.15, max: 2 },
+    ],
+    introText:
+      "The command channel terminates here. Seventy-five seconds on the pad and I will hear what it has been saying. They know it, too — there are suppression units working the yard, and inside their bubble my kit is so much dead weight. Standing still is the objective and the trap.",
+    outroText:
+      "Channel open. It is command's voice. Our voice. Reading out unit designations and marking them compromised, one by one, in the order they stopped answering. It never went dark. It made the decision.",
+  },
+  {
+    id: 27,
+    act: 4,
+    title: "The Foundry",
+    winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildFoundryFloor(),
+    bosses: [{ kind: BossKind.Foundry }],
+    spawns: [{ variant: EnemyVariant.Overseer, weight: 0.15, max: 1 }],
+    introText:
+      "This is where they are built. The Foundry is sealed while its four intakes are running, and it patches itself faster than I can hurt it — so starve it first. Level the intakes, then put it down before it finds something else to eat.",
+    outroText:
+      "Foundry cold. Act 4 complete. It was building replacements. Not for their armour — for ours. Working from the assessments in the vault. I cut the plant's own lance out of its housing on the way past: it will not scratch structural plate, but it goes through brick and through whatever is standing behind the brick. Come on, then. Let us go and meet whoever signed them.",
+  },
+
+  // ==========================================================================
+  // ACT 5 — SYSTEM COLLAPSE
+  //
+  // Back on the offensive with the whole kit in hand, against the Protocol's
+  // last real defences. The act where the boss waves stop arriving alone.
+  // ==========================================================================
+  {
+    id: 28,
+    act: 5,
+    title: "Firewall",
+    winCondition: CampaignWinCondition.ZoneControl,
+    mapGrid: buildUplinkChamber(),
+    spawns: [
+      { variant: EnemyVariant.Nullifier, weight: 0.15, max: 2 },
+      { variant: EnemyVariant.Ghost, weight: 0.25 },
+      { variant: EnemyVariant.Aegis, weight: 0.2 },
+    ],
+    introText:
+      "Act 5: System Collapse. I have reached the primary firewall. I need to hold the central uplink for 60 seconds to upload the override virus. Warning: heavy stealth and shield activity detected.",
+    outroText:
+      "Override successful. The firewall is down.",
+  },
+  {
+    id: 29,
+    act: 5,
+    title: "Dark Relays",
+    winCondition: CampaignWinCondition.DestroyRadars,
+    mapGrid: buildRelayLabyrinth(),
+    spawns: [{ variant: EnemyVariant.Ghost, weight: 0.3 }],
+    introText:
+      "Security relays, and my optical sensors are glitching. There are stealth units in the dark down here and I only ever see them for the second after they fire.",
+    outroText:
+      "Relays destroyed. The inner doors are unlocking.",
+  },
+  {
+    id: 30,
+    act: 5,
+    title: "Deep Water",
+    winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildDeepWater(),
+    bosses: [{ kind: BossKind.Leviathan }],
+    spawns: [{ variant: EnemyVariant.Burrower, weight: 0.25, max: 3 }],
+    introText:
+      "The floor here is coolant, and the ground is islands in it. Something large is moving under the surface — it goes down where I cannot touch it and comes up where I am standing. Watch the water. And do not be on a bridge when it breaks.",
+    outroText:
+      "It surfaced one time too many. The suppression coil out of its spine works: one pulse, and everything in reach simply stops. Even the big ones, for a moment.",
+  },
+  {
+    id: 31,
+    act: 5,
+    title: "Fragments",
+    winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildLatticeArena(),
+    bosses: [{ kind: BossKind.Hydra }],
+    spawns: [
+      { variant: EnemyVariant.Mimic, weight: 0.3 },
+      { variant: EnemyVariant.Trapper, weight: 0.2 },
+    ],
     introText:
       "Contact — one heavy signature guarding the blast doors. Correction: the signature is not one machine. It is a lattice, and cutting it apart makes more of it. Every kill splits into two smaller, faster halves. Do not let it surround me. Keep to open ground.",
     outroText:
       "Last fragment burned out. Seven bodies from one machine. The blast doors are opening.",
-    mapGrid: buildLevel18Grid(),
   },
   {
-    id: 19,
-    winCondition: CampaignWinCondition.ReachExtraction,
+    id: 32,
+    act: 5,
+    title: "Two Rivers",
+    winCondition: CampaignWinCondition.DestroyConvoy,
+    mapGrid: buildTwoRivers(),
+    // One of each, once the carrier is down: the ball to run the bridges, the
+    // gun to make standing on one a bad idea.
+    bosses: [
+      { kind: BossKind.Sweeper, when: BossTiming.Objective },
+      { kind: BossKind.Artillery, when: BossTiming.Objective },
+    ],
+    spawns: [{ variant: EnemyVariant.Sapper, weight: 0.2 }],
     introText:
-      "This is the final corridor to the Logic Core. They are collapsing the tunnel behind me. Do not stop moving.",
+      "They are evacuating the core's operational log north, and the only firing positions on the crossing are the bridges themselves. Kill the carrier before it clears the top of the map — and be somewhere better than a bridge when whatever is escorting it decides to turn round.",
+    outroText:
+      "Carrier and escort both down. The log is one long list of decisions, and not one of them was made by a person.",
+  },
+  {
+    id: 33,
+    act: 5,
+    title: "The Final Breach",
+    winCondition: CampaignWinCondition.ReachExtraction,
+    mapGrid: buildBreachCorridor(),
+    spawns: [
+      { variant: EnemyVariant.Lurcher, weight: 0.35 },
+      { variant: EnemyVariant.Kamikaze, weight: 0.2 },
+      { variant: EnemyVariant.Constructor, weight: 0.2, max: 2 },
+    ],
+    introText:
+      "This is the final corridor to the Logic Core. They are collapsing the tunnel behind me and there are grapple units in it that will not let me run. Do not stop moving.",
     outroText:
       "I am in. The Logic Core is dead ahead. There is no turning back.",
-    mapGrid: buildLevel19Grid(),
   },
   {
-    id: 20,
+    id: 34,
+    act: 5,
+    title: "The Architect",
     winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildArchitectChamber(),
+    bosses: [{ kind: BossKind.Architect }],
     introText:
       "The Core's antechamber. Something is in here with me, and it is not shooting — it is building. The walls are coming in. My shells will not touch it while its four pylons stand. Drop the pylons to slow the walls, then finish it — and expect it to stop building and come for me the moment the last one falls. If the room closes first, it does not need to fight me at all.",
     outroText:
-      "Pylons down, walls stopped, Architect scrapped. Whatever it was walling in, it did not want me reaching. The Logic Core is dead ahead.",
-    mapGrid: buildLevel20Grid(),
+      "Pylons down, walls stopped, Architect scrapped. Act 5 complete. Whatever it was walling in, it did not want me reaching it.",
+  },
+
+  // ==========================================================================
+  // ACT 6 — THE CORE
+  //
+  // Everything the campaign has taught, asked for at once. The act deliberately
+  // reuses the two bosses from the opening acts rather than inventing new ones:
+  // the Sweeper and the Artillery are the first machines the player learned to
+  // beat, and meeting four of them together is the clearest possible measure of
+  // how far the tank has come.
+  // ==========================================================================
+  {
+    id: 35,
+    act: 6,
+    title: "Antechamber",
+    winCondition: CampaignWinCondition.SurviveTime,
+    mapGrid: buildAntechamber(),
+    params: { surviveSeconds: 75, bonusLives: 2 },
+    // The hold is the easy half. What arrives at the end of it is the level.
+    bosses: [{ kind: BossKind.Artillery, count: 2, when: BossTiming.Objective }],
+    spawns: [
+      { variant: EnemyVariant.Ghost, weight: 0.2 },
+      { variant: EnemyVariant.Nullifier, weight: 0.15, max: 2 },
+    ],
+    introText:
+      "Act 6: The Core. Seventy-five seconds until the inner doors cycle, in a hall with almost nothing to hide behind. Reinforcements are en route — and they are not sending patrols any more.",
+    outroText:
+      "Doors cycling. Two siege platforms, and they shelled each other's cover to pieces trying to get to me. They are not co-ordinating any more. Something upstream is fraying.",
   },
   {
-    id: 21,
-    winCondition: CampaignWinCondition.AssassinateBoss,
+    id: 36,
+    act: 6,
+    title: "Last Light",
+    winCondition: CampaignWinCondition.DefendCore,
+    mapGrid: buildLastLight(),
+    params: { defendSeconds: 110 },
+    spawns: [
+      { variant: EnemyVariant.Kamikaze, weight: 0.15 },
+      { variant: EnemyVariant.Ghost, weight: 0.15 },
+      { variant: EnemyVariant.Sapper, weight: 0.15 },
+      { variant: EnemyVariant.Aegis, weight: 0.1 },
+      { variant: EnemyVariant.Trapper, weight: 0.1 },
+      { variant: EnemyVariant.Lurcher, weight: 0.1 },
+    ],
     introText:
-      "This is it. The Obsidian Protocol Logic Core. It is heavily armored and armed with a 360-degree radial defense matrix. Destroy the Core. End the war.",
+      "One relay left, and it is behind me for once. A hundred and ten seconds to push the override upstream. Everything the Protocol has left in this sector is coming through that gap. Do not let them past.",
+    outroText:
+      "Override away. The Core knows I am here now. Good. Let it worry about it.",
+  },
+  {
+    id: 37,
+    act: 6,
+    title: "The Gauntlet",
+    winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildGauntletArena(),
+    // The measure of the whole run: the two machines from Acts 1 and 2, twice
+    // over, at the same time.
+    bosses: [
+      { kind: BossKind.Sweeper, count: 2 },
+      { kind: BossKind.Artillery, count: 2 },
+    ],
+    params: { maxEnemies: 5, bonusLives: 2 },
+    introText:
+      "They have opened the reserve floor. Two wrecking balls and two siege platforms — the first machine that ever frightened me, and the first one that ever outranged me, both of them twice over and all four in the same room. Six months ago either one of these was a whole afternoon. Let us find out what I am now.",
+    outroText:
+      "All four down. The reserve floor is empty and the threshold is open. There is nothing left between me and it.",
+  },
+  {
+    id: 38,
+    act: 6,
+    title: "Threshold",
+    winCondition: CampaignWinCondition.ReachExtraction,
+    mapGrid: buildThreshold(),
+    spawns: [
+      { variant: EnemyVariant.Constructor, weight: 0.3, max: 3 },
+      { variant: EnemyVariant.Lurcher, weight: 0.25 },
+      { variant: EnemyVariant.Nullifier, weight: 0.15, max: 2 },
+    ],
+    introText:
+      "The last corridor, and it is sealing itself as I go. Constructors ahead of me laying wall, grapples behind me pulling me back into it, and suppression fields where the two meet. Straight through. There is no clever way to do this one.",
+    outroText:
+      "Through. The Logic Core chamber is on the other side of this door.",
+  },
+  {
+    id: 39,
+    act: 6,
+    title: "The Logic Core",
+    winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildCoreChamber(),
+    bosses: [{ kind: BossKind.Core }],
+    spawns: [
+      { variant: EnemyVariant.Kamikaze, weight: 0.14 },
+      { variant: EnemyVariant.Constructor, weight: 0.12, max: 2 },
+      { variant: EnemyVariant.Trapper, weight: 0.12 },
+      { variant: EnemyVariant.Aegis, weight: 0.12 },
+      { variant: EnemyVariant.Jammer, weight: 0.1, max: 1 },
+      { variant: EnemyVariant.Mimic, weight: 0.12 },
+      { variant: EnemyVariant.Ghost, weight: 0.12 },
+      { variant: EnemyVariant.Sapper, weight: 0.12 },
+    ],
+    introText:
+      "This is it. The Obsidian Protocol Logic Core — Battalion Command, and it has been Battalion Command the whole time. It is heavily armored and armed with a 360-degree radial defense matrix. Destroy the Core. End the war.",
     outroText:
       "Core destabilized. Protocol deactivated. The war is... wait. Something is still moving in the wreckage. It is reading my telemetry. It is reading my loadout.",
-    mapGrid: buildLevel21Grid(),
   },
   {
-    id: 22,
+    id: 40,
+    act: 6,
+    title: "The Effigy",
     winCondition: CampaignWinCondition.AssassinateBoss,
+    mapGrid: buildDuellingGround(),
+    bosses: [{ kind: BossKind.Effigy }],
     introText:
       "It built a copy of me. Same chassis, same speed, same shield, same blink, same blast — everything the Protocol watched me use, it kept. No armor to flank, no pylons to drop, no adds to clear. Just me, and a machine that knows exactly what I would do next.",
     outroText:
-      "The Effigy is scrap. It fought exactly the way I do — which is how I knew where it would go. The Obsidian Protocol is finished. All of it. Come home, Commander.",
-    mapGrid: buildLevel22Grid(),
+      "The Effigy is scrap. It fought exactly the way I do — which is how I knew where it would go. It was never trying to beat me. It was the last assessment, and I passed it. The Obsidian Protocol is finished. All of it. Come home, Commander.",
   },
 ];

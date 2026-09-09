@@ -35,6 +35,7 @@ function resolveTileCollision(
     eagle: boolean;
     steelHits: { x: number; y: number }[];
   },
+  hardens?: (index: number) => boolean,
 ): boolean {
   const minTileX = Math.floor(bullet.x / TILE_SIZE);
   const maxTileX = Math.floor((bullet.x + bullet.width - 1) / TILE_SIZE);
@@ -79,18 +80,26 @@ function resolveTileCollision(
           // player's objectives, and enemy shells flying loose across the map
           // would otherwise demolish them and win the level unaided. An enemy
           // shell is still stopped, so the tower doubles as cover.
-          if (!bullet.isEnemy) {
+          //
+          // `hardens` is how an ordered level says "not this one yet": the shell
+          // is spent and sparks off, exactly as it would against steel, so the
+          // refusal reads as armour rather than as the game ignoring the shot.
+          if (!bullet.isEnemy && !hardens?.(index)) {
             state.grid[index] = TileType.Empty;
             destroyed.radars++;
+          } else if (!bullet.isEnemy) {
+            struckSteel = true;
           }
           consumed = true;
           break;
 
         case TileType.Factory:
           // A campaign factory: player-only, for the same reason as Radar.
-          if (!bullet.isEnemy) {
+          if (!bullet.isEnemy && !hardens?.(index)) {
             state.grid[index] = TileType.Empty;
             destroyed.factories++;
+          } else if (!bullet.isEnemy) {
+            struckSteel = true;
           }
           consumed = true;
           break;
@@ -225,6 +234,14 @@ export interface BulletOptions {
    * consumed but deals no damage. Used by the campaign's Aegis aura.
    */
   shieldsTarget?: (target: Tank, bullet: Bullet) => boolean;
+  /**
+   * Returns true if the objective structure at `index` refuses damage for now.
+   *
+   * Used by the campaign's ordered levels, where only one radar mast or factory
+   * vault at a time is the live target and the rest are sealed. A hardened tile
+   * still stops the shell and throws the same sparks steel does.
+   */
+  hardensTile?: (index: number) => boolean;
 }
 
 export function updateBullets(state: GameState, options?: BulletOptions): BulletOutcome {
@@ -285,7 +302,7 @@ export function updateBullets(state: GameState, options?: BulletOptions): Bullet
       continue;
     }
 
-    if (resolveTileCollision(state, bullet, destroyed)) {
+    if (resolveTileCollision(state, bullet, destroyed, options?.hardensTile)) {
       state.bullets.splice(i, 1);
     }
   }

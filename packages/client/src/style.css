@@ -513,15 +513,30 @@ body {
 
 /* ------------------------------------------------------------- shield readout */
 
-.shield-hud {
+/*
+ * The readouts used to position themselves individually, stacked bottom-left in
+ * a column that grew every time an ability was added. At nine of them it stood
+ * over three hundred pixels tall and buried the bottom-left corner of the
+ * battlefield — which is exactly where the sweep levels put their objectives.
+ * They live in a wrapping bar now, so adding a tenth costs nothing.
+ */
+.ability-bar {
   position: fixed;
   bottom: 16px;
   left: 16px;
   z-index: 14;
+  display: flex;
+  flex-wrap: wrap-reverse;
+  gap: 6px;
+  max-width: min(660px, 52vw);
+  pointer-events: none;
+}
+
+.shield-hud {
   padding: 7px 14px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: rgb(11 13 16 / 90%);
+  background: rgb(11 13 16 / 60%);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
   font-weight: 700;
@@ -554,14 +569,10 @@ body {
 /* ------------------------------------------------------------ blink readout */
 
 .teleport-hud {
-  position: fixed;
-  bottom: 52px;
-  left: 16px;
-  z-index: 14;
   padding: 7px 14px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: rgb(11 13 16 / 90%);
+  background: rgb(11 13 16 / 60%);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
   font-weight: 700;
@@ -587,14 +598,10 @@ body {
 /* ------------------------------------------------------------ blast readout */
 
 .blast-hud {
-  position: fixed;
-  bottom: 88px;
-  left: 16px;
-  z-index: 14;
   padding: 7px 14px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: rgb(11 13 16 / 90%);
+  background: rgb(11 13 16 / 60%);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
   font-weight: 700;
@@ -617,17 +624,18 @@ body {
   color: #6b7785;
 }
 
-/* ------------------------------------------------ ram & decoy readouts */
+/* --------------------------------- ram, decoy, strike & pulse readouts */
 
 .ram-hud,
-.decoy-hud {
-  position: fixed;
-  left: 16px;
-  z-index: 14;
+.decoy-hud,
+.strike-hud,
+.emp-hud,
+.laser-hud,
+.jump-hud {
   padding: 7px 14px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: rgb(11 13 16 / 90%);
+  background: rgb(11 13 16 / 60%);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
   font-weight: 700;
@@ -636,16 +644,12 @@ body {
   pointer-events: none;
 }
 
-.ram-hud {
-  bottom: 124px;
-}
-
-.decoy-hud {
-  bottom: 160px;
-}
-
 .ram-hud[hidden],
-.decoy-hud[hidden] {
+.decoy-hud[hidden],
+.strike-hud[hidden],
+.emp-hud[hidden],
+.laser-hud[hidden],
+.jump-hud[hidden] {
   display: none;
 }
 
@@ -659,10 +663,47 @@ body {
   color: #7dffcf;
 }
 
+.strike-hud.strike-ready {
+  border-color: #a86a2a;
+  color: #ffb066;
+}
+
+.emp-hud.emp-ready {
+  border-color: #2a6aa8;
+  color: #76c8ff;
+}
+
+.laser-hud.laser-ready {
+  border-color: #a83a2a;
+  color: #ff8a5c;
+}
+
+.jump-hud.jump-ready {
+  border-color: #6a3aa8;
+  color: #c8a2ff;
+}
+
 .ram-hud.ram-cooling,
-.decoy-hud.decoy-cooling {
+.decoy-hud.decoy-cooling,
+.strike-hud.strike-cooling,
+.emp-hud.emp-cooling,
+.laser-hud.laser-cooling,
+.jump-hud.jump-cooling {
   border-color: var(--line);
   color: #6b7785;
+}
+
+.campaign-heading {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: #5c6b7a;
+  text-transform: uppercase;
+}
+
+.campaign-heading[hidden] {
+  display: none;
 }
 
 /* ------------------------------------------------------- upgrade choices */

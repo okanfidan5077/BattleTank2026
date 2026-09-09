@@ -45,6 +45,10 @@ export interface TankView extends EntityView {
   isCloaked: boolean;
   /** True while the player's deflector shield is up — the client rings the hull. */
   isShielded: boolean;
+  /** The Bastion's one unarmoured face, as a cardinal. Ignored on other tanks. */
+  weakSide: Direction;
+  /** A live target on a purge level — the client rings it. */
+  isMarked: boolean;
 }
 
 export interface BulletView extends EntityView {
@@ -115,6 +119,8 @@ export interface CampaignStateView extends WorldStateView {
   objectiveText: string;
   /** The objective's raw number (radars left, or seconds remaining). */
   objectiveValue: number;
+  /** Grid index of the next objective tile on an ordered level, or -1. */
+  objectiveTargetTile: number;
 }
 
 export interface BattleStateView extends WorldStateView {

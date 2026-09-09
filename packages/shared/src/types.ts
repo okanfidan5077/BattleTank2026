@@ -43,6 +43,18 @@ export const ServerMessage = {
   GrappleHit: "grapple_hit",
   /** The upgrade cards this player may pick from after a level. */
   UpgradeOffer: "upgrade_offer",
+  /** The player's called strike fired, or came off cooldown. */
+  StrikeChanged: "strike_changed",
+  /** The player's suppression pulse came off cooldown. */
+  EmpChanged: "emp_changed",
+  /** A suppression pulse went off — drives the expanding ring effect. */
+  EmpFired: "emp_fired",
+  /** The player's cutting lance came off cooldown. */
+  LaserChanged: "laser_changed",
+  /** A lance was fired — drives the beam effect. */
+  LaserFired: "laser_fired",
+  /** The player's translocator fired, or came off cooldown. */
+  TranslocateChanged: "translocate_changed",
 } as const;
 export type ServerMessage = (typeof ServerMessage)[keyof typeof ServerMessage];
 
@@ -120,6 +132,80 @@ export interface MortarWarningMessage {
    * so the two threats stay tellable apart at a glance.
    */
   radius?: number;
+  /**
+   * The player called this one down themselves.
+   *
+   * Drawn in the player's own colour rather than the hostile red, because a
+   * telegraph that reads as incoming fire is actively misleading when it is the
+   * thing you just asked for.
+   */
+  friendly?: boolean;
+}
+
+/**
+ * An aim point in world units, sent with the abilities the player points at
+ * something rather than driving into.
+ *
+ * Attacker-controlled like every other payload, so the server clamps it to the
+ * ability's range instead of trusting it — see `readAimPoint`.
+ */
+export interface AimedMessage {
+  x: number;
+  y: number;
+}
+
+/** Narrows an untrusted payload to an {@link AimedMessage}. */
+export function isAimedMessage(value: unknown): value is AimedMessage {
+  if (typeof value !== "object" || value === null) return false;
+  const { x, y } = value as { x?: unknown; y?: unknown };
+  return typeof x === "number" && Number.isFinite(x) && typeof y === "number" && Number.isFinite(y);
+}
+
+/** Sent to one player when their called strike fires or comes back. */
+export interface StrikeChangedMessage {
+  /** ms until another strike may be called; 0 when ready. */
+  cooldownMs: number;
+}
+
+/** Sent to one player when their suppression pulse comes back. */
+export interface EmpChangedMessage {
+  /** ms until the pulse may be fired again; 0 when ready. */
+  cooldownMs: number;
+}
+
+/** Broadcast when a suppression pulse goes off. */
+export interface EmpFiredMessage {
+  /** Pulse centre, in world units. */
+  x: number;
+  y: number;
+  /** Pulse radius, in world units. */
+  radius: number;
+  /** How long the units it caught are held, in ms. */
+  durationMs: number;
+}
+
+/** Sent to one player when their translocator fires or comes back. */
+export interface TranslocateChangedMessage {
+  /** ms until another jump may be taken; 0 when ready. */
+  cooldownMs: number;
+}
+
+/** Sent to one player when their cutting lance fires or comes back. */
+export interface LaserChangedMessage {
+  /** ms until the lance may be fired again; 0 when ready. */
+  cooldownMs: number;
+}
+
+/** Broadcast when a cutting lance is fired. */
+export interface LaserFiredMessage {
+  /** The muzzle, in world units. */
+  fromX: number;
+  fromY: number;
+  /** Where the beam stopped — a wall, its brick budget, or its range. */
+  toX: number;
+  toY: number;
+  /** True when the beam was stopped by terrain rather than running out. */
+  blocked: boolean;
 }
 
 /** Broadcast when the player's deflector shield changes state. */

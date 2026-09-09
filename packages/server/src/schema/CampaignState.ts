@@ -41,4 +41,14 @@ export class CampaignState extends GameState {
    * seconds left on a survival timer. Zero when the objective has no count.
    */
   @type("uint16") objectiveValue = 0;
+
+  /**
+   * Grid index of the one objective tile that will answer right now, or -1.
+   *
+   * Only set on a level whose objectives are ordered. The client draws a mark
+   * on it, because an order the player cannot see is not a route, it is a
+   * guessing game — every other tile of the same kind looks identical and would
+   * simply refuse to be collected with no explanation.
+   */
+  @type("int32") objectiveTargetTile = -1;
 }

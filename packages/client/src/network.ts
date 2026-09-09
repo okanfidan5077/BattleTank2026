@@ -76,18 +76,46 @@ export async function joinCampaign(options: JoinOptions): Promise<CampaignRoom> 
 }
 
 /**
+ * Longest a resume attempt may hold the lobby, in ms.
+ *
+ * A token for a room that is gone does not fail fast — the reconnect sits on
+ * the transport's own timeout, and the lobby cannot be shown until it settles,
+ * so the whole app looks hung on the way back in. A seat that is genuinely
+ * still held answers in well under this.
+ */
+const RESUME_TIMEOUT_MS = 2500;
+
+/**
  * Resumes the previous session if this page load is a refresh.
  *
  * This is the client half of the anti-refresh fix: the server holds the seat,
  * but only a client offering the token back can claim it. Returns `null` when
  * there is nothing to resume, in which case the lobby is shown.
+ *
+ * Bounded by {@link RESUME_TIMEOUT_MS}: giving up early only costs a seat that
+ * was probably not there, while waiting costs the player a blank screen.
  */
 export async function tryResume(): Promise<BattleRoom | null> {
   const token = sessionStorage.getItem(TOKEN_KEY);
   if (!token) return null;
 
+  const attempt = colyseus.reconnect<BattleStateView>(token);
+
+  const timeout = new Promise<null>((resolve) => {
+    window.setTimeout(() => resolve(null), RESUME_TIMEOUT_MS);
+  });
+
   try {
-    const resumed = await colyseus.reconnect<BattleStateView>(token);
+    const resumed = await Promise.race([attempt, timeout]);
+    if (!resumed) {
+      console.log("[client] resume timed out — starting fresh");
+      sessionStorage.removeItem(TOKEN_KEY);
+      // A room that turns up after we have given up on it is nobody's seat any
+      // more: release it rather than leaving it held until the server expires it.
+      void attempt.then((late) => void late.leave(true).catch(() => {})).catch(() => {});
+      return null;
+    }
+
     console.log("[client] resumed previous session");
     return remember(resumed);
   } catch (error) {
@@ -130,6 +158,43 @@ export async function leaveRoom(room: GameRoom): Promise<void> {
   } catch {
     // Already disconnected or disposed — the token is cleared either way.
   }
+}
+
+/**
+ * Longest the UI will wait on a leave before reloading anyway, in ms.
+ *
+ * `room.leave()` only settles once the *server* closes the socket, which can
+ * take seconds — long enough that pressing MENU looked like it had hung. The
+ * frame itself goes out synchronously, so a short grace is all that is actually
+ * needed to get it onto the wire.
+ */
+const LEAVE_FLUSH_TIMEOUT_MS = 250;
+
+/**
+ * Drops the seat and reloads into a fresh lobby, without waiting on the server.
+ *
+ * The reload happens as soon as the leave settles or {@link
+ * LEAVE_FLUSH_TIMEOUT_MS} elapses, whichever comes first. Reloading early is
+ * safe because {@link forgetSession} has already run inside {@link leaveRoom}:
+ * with no token there is nothing to auto-resume, so the worst case is that the
+ * server sees an unconsented drop and releases the seat on its own timer.
+ */
+export function leaveRoomAndReload(room: GameRoom | undefined): void {
+  const reload = () => window.location.reload();
+  if (!room) {
+    reload();
+    return;
+  }
+
+  let done = false;
+  const once = () => {
+    if (done) return;
+    done = true;
+    reload();
+  };
+
+  window.setTimeout(once, LEAVE_FLUSH_TIMEOUT_MS);
+  void leaveRoom(room).finally(once);
 }
 
 /**

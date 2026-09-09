@@ -28,6 +28,10 @@ export interface TankInit extends EntityInit {
   isCloaked?: boolean;
   /** True while the player's deflector shield is up; defaults to false. */
   isShielded?: boolean;
+  /** The Bastion's currently unarmoured face; defaults to Up. */
+  weakSide?: Direction;
+  /** A live target on a purge level; defaults to false. */
+  isMarked?: boolean;
 }
 
 /** A player- or AI-controlled tank. */
@@ -75,6 +79,28 @@ export class Tank extends Entity<TankInit> {
    * `CampaignRoom.resolveSweeperContact`. The client rings a shielded tank.
    */
   @type("boolean") isShielded: boolean = false;
+
+  /**
+   * The one face of the Bastion that shells can get through, as a cardinal.
+   *
+   * Deliberately its own field rather than something derived from
+   * {@link direction}: the Bastion keeps its gun pointed at the player, so an
+   * armour scheme tied to facing put the weak face wherever the player was not
+   * — which is the version that could not be beaten. This turns on its own
+   * timer instead, and the client draws it so the opening is visible.
+   *
+   * Meaningless for every other tank.
+   */
+  @type("uint8") weakSide: Direction = Direction.Up;
+
+  /**
+   * A live target on a `purge_marked` level.
+   *
+   * Replicated because the whole level is the player being able to tell one
+   * identical hull from another: the mark has to be on screen, and the server
+   * is the only thing that knows which hulls carry it.
+   */
+  @type("boolean") isMarked: boolean = false;
 
   constructor(init?: TankInit) {
     super();

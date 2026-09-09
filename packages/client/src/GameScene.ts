@@ -22,6 +22,10 @@ import {
   DECOY_UNLOCK_LEVEL,
   NULLIFIER_RADIUS_TILES,
   RAM_UNLOCK_LEVEL,
+  STRIKE_UNLOCK_LEVEL,
+  EMP_UNLOCK_LEVEL,
+  LASER_UNLOCK_LEVEL,
+  TRANSLOCATE_UNLOCK_LEVEL,
   SHIELD_UNLOCK_LEVEL,
   TELEPORT_MAX_CHARGES,
   TELEPORT_UNLOCK_LEVEL,
@@ -42,6 +46,13 @@ import {
   type MineDetonatedMessage,
   type MortarWarningMessage,
   type ShieldChangedMessage,
+  type AimedMessage,
+  type EmpChangedMessage,
+  type EmpFiredMessage,
+  type LaserChangedMessage,
+  type LaserFiredMessage,
+  type StrikeChangedMessage,
+  type TranslocateChangedMessage,
   type UpgradeOfferMessage,
   type TeleportChangedMessage,
   type MatchStatsRow,
@@ -50,7 +61,13 @@ import {
   type TankDestroyedMessage,
 } from "@battletank/shared";
 
-import { forgetSession, leaveRoom, type BattleRoom, type CampaignRoom, type GameRoom } from "./network.js";
+import {
+  forgetSession,
+  leaveRoomAndReload,
+  type BattleRoom,
+  type CampaignRoom,
+  type GameRoom,
+} from "./network.js";
 import { recordMatch } from "./progression.js";
 import type {
   BattleStateView,
@@ -184,6 +201,7 @@ export class GameScene extends Phaser.Scene {
 
   /** Full-screen DOM briefing overlay, built lazily for campaign runs. */
   private campaignOverlay?: HTMLDivElement;
+  private campaignHeadingEl?: HTMLDivElement;
   private campaignTextEl?: HTMLDivElement;
   private campaignPromptEl?: HTMLDivElement;
 
@@ -205,6 +223,15 @@ export class GameScene extends Phaser.Scene {
 
   /** The id taken from the current hand, so the row can show what was picked. */
   private pickedUpgradeId: string | null = null;
+
+  /**
+   * True while this seat has been dealt upgrade cards it has not taken one of.
+   *
+   * The server refuses to advance the level until every hand is spent, so the
+   * debrief must not offer a "press SPACE" it would ignore — arming it anyway
+   * would eat the keypress and leave the player on a screen nothing answers.
+   */
+  private awaitingUpgradePick = false;
 
   /** Pending typewriter tick, so a phase change can cancel a half-typed line. */
   private typewriterTimer?: number;
@@ -248,6 +275,25 @@ export class GameScene extends Phaser.Scene {
   /** Ram and decoy readouts, shown from their unlock levels on. */
   private ramHudEl?: HTMLDivElement;
   private decoyHudEl?: HTMLDivElement;
+  private strikeHudEl?: HTMLDivElement;
+  private empHudEl?: HTMLDivElement;
+  private laserHudEl?: HTMLDivElement;
+  private jumpHudEl?: HTMLDivElement;
+
+  /** The wrapping bar every ability readout is laid out in. */
+  private abilityBarEl?: HTMLDivElement;
+
+  /** Wall-clock ms at which the called strike is available again; 0 when ready. */
+  private strikeReadyAt = 0;
+
+  /** Wall-clock ms at which the suppression pulse is available again. */
+  private empReadyAt = 0;
+
+  /** Wall-clock ms at which the cutting lance is available again; 0 when ready. */
+  private laserReadyAt = 0;
+
+  /** Wall-clock ms at which the translocator is available again; 0 when ready. */
+  private jumpReadyAt = 0;
 
   /** Wall-clock ms at which each comes off cooldown; 0 when ready. */
   private ramReadyAt = 0;
@@ -329,6 +375,12 @@ export class GameScene extends Phaser.Scene {
 
   /** Cyan aura circles drawn around Aegis miniboss tanks. */
   private aegisAuras = new Map<TankView, Phaser.GameObjects.Graphics>();
+
+  /** Purge-level target rings, keyed by the hull they follow. */
+  private markers = new Map<TankView, Phaser.GameObjects.Graphics>();
+
+  /** The bracket drawn on the next objective, on an ordered level. */
+  private objectiveMarker?: Phaser.GameObjects.Graphics;
 
   /** Armour/weak-point markers drawn over each Bastion. */
   private bastionPlates = new Map<TankView, Phaser.GameObjects.Graphics>();
@@ -671,6 +723,7 @@ export class GameScene extends Phaser.Scene {
     this.disarmCampaignAdvance();
     this.campaignOverlay?.remove();
     this.campaignOverlay = undefined;
+    this.campaignHeadingEl = undefined;
     this.campaignTextEl = undefined;
     this.campaignPromptEl = undefined;
     this.campaignCardsEl = undefined;
@@ -700,6 +753,16 @@ export class GameScene extends Phaser.Scene {
     this.ramHudEl = undefined;
     this.decoyHudEl?.remove();
     this.decoyHudEl = undefined;
+    this.strikeHudEl?.remove();
+    this.strikeHudEl = undefined;
+    this.empHudEl?.remove();
+    this.empHudEl = undefined;
+    this.laserHudEl?.remove();
+    this.laserHudEl = undefined;
+    this.jumpHudEl?.remove();
+    this.jumpHudEl = undefined;
+    this.abilityBarEl?.remove();
+    this.abilityBarEl = undefined;
 
     // Release the audio handle; browsers cap how many contexts can be open.
     void this.audioCtx?.close().catch(() => {});
@@ -857,6 +920,107 @@ export class GameScene extends Phaser.Scene {
       x: this.world.x + x * this.world.scaleX,
       y: this.world.y + y * this.world.scaleY,
     };
+  }
+
+  /**
+   * A pointer position in the server's world coordinates.
+   *
+   * The inverse of {@link worldToScene}. Phaser reports the pointer in scene
+   * space, which is the 1920x1080 authored canvas after the FIT scale has been
+   * undone for us — so only the battlefield container's own offset and scale
+   * have to be taken back out.
+   */
+  private sceneToWorld(x: number, y: number): { x: number; y: number } {
+    return {
+      x: (x - this.world.x) / this.world.scaleX,
+      y: (y - this.world.y) / this.world.scaleY,
+    };
+  }
+
+  /**
+   * Binds the two abilities that are aimed rather than pointed.
+   *
+   * Left click blinks toward the cursor, right click calls a strike down on it.
+   * Both are the same abilities the keyboard already has — the mouse only
+   * changes where they go, and the blink still costs a charge either way.
+   *
+   * The context menu is suppressed on the canvas only, so right-clicking the
+   * page furniture around it still behaves like a web page.
+   */
+  private bindPointerAbilities(room: CampaignRoom): void {
+    const canvas = this.game.canvas;
+
+    const suppressMenu = (event: MouseEvent) => event.preventDefault();
+    canvas.addEventListener("contextmenu", suppressMenu);
+    this.roomCleanups.push(() => canvas.removeEventListener("contextmenu", suppressMenu));
+
+    const onDown = (pointer: Phaser.Input.Pointer) => {
+      if (this.isDead) return;
+      if (room.state?.phase !== CampaignPhase.Playing) return;
+
+      const aim = this.sceneToWorld(pointer.worldX, pointer.worldY);
+      if (pointer.rightButtonDown()) {
+        room.send(CampaignMessage.Strike, aim satisfies AimedMessage);
+      } else if (pointer.leftButtonDown()) {
+        room.send(CampaignMessage.Translocate, aim satisfies AimedMessage);
+      }
+    };
+
+    this.input.on("pointerdown", onDown);
+    this.roomCleanups.push(() => this.input.off("pointerdown", onDown));
+  }
+
+  /**
+   * Draws the cutting lance: a white-hot core inside a wider glow, both fading.
+   *
+   * Two strokes rather than one because a single line at this length reads as a
+   * UI element rather than as something that just happened — the bloom around
+   * it is what makes it look like it cut.
+   */
+  private spawnLaserBeam(msg: LaserFiredMessage): void {
+    if (this.isDead) return;
+
+    const beam = this.add.graphics().setDepth(6);
+    beam.lineStyle(10, 0xff5c2a, 0.35).lineBetween(msg.fromX, msg.fromY, msg.toX, msg.toY);
+    beam.lineStyle(3, 0xfff0d0, 0.95).lineBetween(msg.fromX, msg.fromY, msg.toX, msg.toY);
+    this.world.add(beam);
+
+    this.tweens.add({
+      targets: beam,
+      alpha: 0,
+      duration: 260,
+      onComplete: () => beam.destroy(),
+    });
+
+    // A beam stopped by plate throws sparks off it; one that simply ran out of
+    // brick budget does not, so the two endings are tellable apart.
+    if (msg.blocked) {
+      const at = this.worldToScene(msg.toX, msg.toY);
+      if (this.isLive(this.sparkEmitter)) this.sparkEmitter.explode(10, at.x, at.y);
+    }
+  }
+
+  /** Draws the suppression pulse: a hard ring that expands and fades out. */
+  private spawnPulseRing(x: number, y: number, radius: number): void {
+    if (this.isDead) return;
+
+    const ring = this.add.graphics().setDepth(6);
+    ring.lineStyle(4, 0x76c8ff, 0.9).strokeCircle(x, y, radius * 0.2);
+    this.world.add(ring);
+
+    this.tweens.add({
+      targets: ring,
+      scaleX: 5,
+      scaleY: 5,
+      alpha: 0,
+      duration: 380,
+      onComplete: () => ring.destroy(),
+    });
+    // Phaser scales a Graphics object about its own origin, so the circle has
+    // to be centred there and the object moved into place.
+    ring.setPosition(x, y);
+    ring.clear();
+    ring.lineStyle(4, 0x76c8ff, 0.9).strokeCircle(0, 0, radius * 0.2);
   }
 
   /** Explodes a tank and shakes the camera to match what was destroyed. */
@@ -1109,14 +1273,9 @@ export class GameScene extends Phaser.Scene {
     this.tweens.killTweensOf(button);
     button.disableInteractive().setAlpha(1).setColor("#8fa1b3").setText("returning to lobby...");
 
-    const room = this.room;
-    if (!room) {
-      window.location.reload();
-      return;
-    }
-
-    // `leaveRoom` clears the token first, so even a hung leave cannot auto-resume.
-    void leaveRoom(room).finally(() => window.location.reload());
+    // The reload does not wait on the server: the token is dropped first, so a
+    // slow (or hung) leave cannot hold the player on a dead screen.
+    leaveRoomAndReload(this.room);
   }
 
   // -------------------------------------------------------------------- input
@@ -1298,6 +1457,54 @@ export class GameScene extends Phaser.Scene {
     this.input.keyboard?.on("keydown-F", decoy);
     this.roomCleanups.push(() => this.input.keyboard?.off("keydown-F", decoy));
 
+    // X fires the suppression pulse (unlocked from EMP_UNLOCK_LEVEL).
+    const pulse = () => room.send(CampaignMessage.Emp);
+    this.input.keyboard?.on("keydown-X", pulse);
+    this.roomCleanups.push(() => this.input.keyboard?.off("keydown-X", pulse));
+
+    // C fires the cutting lance (unlocked from LASER_UNLOCK_LEVEL).
+    const lance = () => room.send(CampaignMessage.Laser);
+    this.input.keyboard?.on("keydown-C", lance);
+    this.roomCleanups.push(() => this.input.keyboard?.off("keydown-C", lance));
+
+    room.onMessage(ServerMessage.LaserChanged, (msg: LaserChangedMessage) => {
+      if (this.isDead) return;
+      this.laserReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+      this.refreshLaserHud();
+    });
+
+    room.onMessage(ServerMessage.TranslocateChanged, (msg: TranslocateChangedMessage) => {
+      if (this.isDead) return;
+      this.jumpReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+      this.refreshJumpHud();
+    });
+
+    room.onMessage(ServerMessage.LaserFired, (msg: LaserFiredMessage) => {
+      if (this.isDead) return;
+      this.spawnLaserBeam(msg);
+      this.tone({ type: "sawtooth", startHz: 1600, endHz: 700, duration: 0.22, volume: 0.11 });
+    });
+
+    room.onMessage(ServerMessage.StrikeChanged, (msg: StrikeChangedMessage) => {
+      if (this.isDead) return;
+      this.strikeReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+      this.refreshStrikeHud();
+    });
+
+    room.onMessage(ServerMessage.EmpChanged, (msg: EmpChangedMessage) => {
+      if (this.isDead) return;
+      this.empReadyAt = msg.cooldownMs > 0 ? Date.now() + msg.cooldownMs : 0;
+      this.refreshEmpHud();
+    });
+
+    room.onMessage(ServerMessage.EmpFired, (msg: EmpFiredMessage) => {
+      if (this.isDead) return;
+      this.spawnPulseRing(msg.x, msg.y, msg.radius);
+      this.tone({ type: "sine", startHz: 1200, endHz: 90, duration: 0.4, volume: 0.12 });
+    });
+
+    this.bindPointerAbilities(room);
+
     room.onMessage(ServerMessage.RamChanged, (msg: RamChangedMessage) => {
       if (this.isDead) return;
       // A surge somebody else is running — the mirror boss's — is drawn and
@@ -1354,6 +1561,12 @@ export class GameScene extends Phaser.Scene {
         break;
 
       case CampaignPhase.Intro:
+        // Forty levels is long enough that "which one is this?" is a real
+        // question, so the briefing names the act and the level rather than
+        // opening straight into the voice.
+        this.setBriefingHeading(
+          level ? `ACT ${level.act}  ·  ${level.id}. ${level.title.toUpperCase()}` : "",
+        );
         this.showBriefing(level?.introText ?? "", "Press SPACE to Start");
         this.armCampaignAdvance(CampaignMessage.StartLevel);
         break;
@@ -1363,8 +1576,11 @@ export class GameScene extends Phaser.Scene {
         break;
 
       case CampaignPhase.Outro:
-        this.showBriefing(level?.outroText ?? "", "Press SPACE to Continue");
-        this.armCampaignAdvance(CampaignMessage.NextLevel);
+        this.setBriefingHeading("");
+        // The offer message and this phase change race, so the prompt is
+        // decided from the flag rather than from their arrival order.
+        this.showBriefing(level?.outroText ?? "", this.outroPrompt());
+        if (!this.awaitingUpgradePick) this.armCampaignAdvance(CampaignMessage.NextLevel);
         break;
 
       case CampaignPhase.GameOver:
@@ -1394,7 +1610,7 @@ export class GameScene extends Phaser.Scene {
       if (!room) return;
       // Clear the token first (there is none for campaign, but stay consistent
       // with the battle path), then leave and reload into a fresh lobby.
-      void leaveRoom(room).finally(() => window.location.reload());
+      leaveRoomAndReload(room);
     };
 
     this.campaignAdvance = handler;
@@ -1409,6 +1625,12 @@ export class GameScene extends Phaser.Scene {
     overlay.className = "campaign-overlay";
     overlay.hidden = true;
 
+    // Names the act and the level above the voice. Forty levels in, "which
+    // one is this?" is a question the briefing should not make anyone ask.
+    const heading = document.createElement("div");
+    heading.className = "campaign-heading";
+    heading.hidden = true;
+
     const text = document.createElement("div");
     text.className = "campaign-text";
 
@@ -1421,10 +1643,11 @@ export class GameScene extends Phaser.Scene {
     const prompt = document.createElement("div");
     prompt.className = "campaign-prompt";
 
-    overlay.append(text, cards, prompt);
+    overlay.append(heading, text, cards, prompt);
     document.body.appendChild(overlay);
 
     this.campaignOverlay = overlay;
+    this.campaignHeadingEl = heading;
     this.campaignTextEl = text;
     this.campaignCardsEl = cards;
     this.campaignPromptEl = prompt;
@@ -1441,6 +1664,8 @@ export class GameScene extends Phaser.Scene {
     if (!cards || this.isDead) return;
 
     this.ownedUpgrades = msg.owned;
+    this.awaitingUpgradePick = msg.ids.length > 0;
+    this.syncOutroPrompt();
 
     if (this.upgradeKeyHandler) {
       window.removeEventListener("keydown", this.upgradeKeyHandler);
@@ -1508,6 +1733,27 @@ export class GameScene extends Phaser.Scene {
     window.addEventListener("keydown", this.upgradeKeyHandler);
   }
 
+  /** What the debrief asks for: a card first, then the keypress. */
+  private outroPrompt(): string {
+    return this.awaitingUpgradePick ? "Choose an upgrade to continue" : "Press SPACE to Continue";
+  }
+
+  /**
+   * Re-reads the debrief prompt and arms (or holds back) the advance key.
+   *
+   * Called whenever the outstanding offer changes, which is the only thing that
+   * moves the debrief between its two states.
+   */
+  private syncOutroPrompt(): void {
+    if (this.campaignRoom?.state?.phase !== CampaignPhase.Outro) return;
+
+    const promptEl = this.campaignPromptEl;
+    if (promptEl) promptEl.textContent = this.outroPrompt();
+
+    if (this.awaitingUpgradePick) this.disarmCampaignAdvance();
+    else this.armCampaignAdvance(CampaignMessage.NextLevel);
+  }
+
   /** Sends a pick and disarms the hand so it cannot be spent twice. */
   private pickUpgrade(id: string): void {
     const room = this.campaignRoom;
@@ -1554,6 +1800,16 @@ export class GameScene extends Phaser.Scene {
     this.typeBriefing(body, () => {
       if (!this.isDead && promptEl && prompt) promptEl.style.visibility = "visible";
     });
+  }
+
+  /** Sets (or clears) the act-and-level line above the briefing. */
+  private setBriefingHeading(heading: string): void {
+    this.buildCampaignOverlay();
+    const el = this.campaignHeadingEl;
+    if (!el) return;
+
+    el.textContent = heading;
+    el.hidden = heading.length === 0;
   }
 
   /** Reveals `full` one character at a time, then calls `onDone`. */
@@ -1647,35 +1903,64 @@ export class GameScene extends Phaser.Scene {
   private buildShieldHud(): void {
     if (this.shieldHudEl) return;
 
+    const bar = document.createElement("div");
+    bar.className = "ability-bar";
+    document.body.appendChild(bar);
+    this.abilityBarEl = bar;
+
     const el = document.createElement("div");
     el.className = "shield-hud";
     el.hidden = true;
-    document.body.appendChild(el);
+    bar.appendChild(el);
     this.shieldHudEl = el;
 
     const tp = document.createElement("div");
     tp.className = "teleport-hud";
     tp.hidden = true;
-    document.body.appendChild(tp);
+    bar.appendChild(tp);
     this.teleportHudEl = tp;
 
     const bl = document.createElement("div");
     bl.className = "blast-hud";
     bl.hidden = true;
-    document.body.appendChild(bl);
+    bar.appendChild(bl);
     this.blastHudEl = bl;
 
     const rm = document.createElement("div");
     rm.className = "ram-hud";
     rm.hidden = true;
-    document.body.appendChild(rm);
+    bar.appendChild(rm);
     this.ramHudEl = rm;
 
     const dc = document.createElement("div");
     dc.className = "decoy-hud";
     dc.hidden = true;
-    document.body.appendChild(dc);
+    bar.appendChild(dc);
     this.decoyHudEl = dc;
+
+    const st = document.createElement("div");
+    st.className = "strike-hud";
+    st.hidden = true;
+    bar.appendChild(st);
+    this.strikeHudEl = st;
+
+    const ep = document.createElement("div");
+    ep.className = "emp-hud";
+    ep.hidden = true;
+    bar.appendChild(ep);
+    this.empHudEl = ep;
+
+    const lz = document.createElement("div");
+    lz.className = "laser-hud";
+    lz.hidden = true;
+    bar.appendChild(lz);
+    this.laserHudEl = lz;
+
+    const jp = document.createElement("div");
+    jp.className = "jump-hud";
+    jp.hidden = true;
+    bar.appendChild(jp);
+    this.jumpHudEl = jp;
 
     // Driven on a timer rather than per-frame: the text only changes by whole
     // tenths, and this keeps it off the render path.
@@ -1685,6 +1970,10 @@ export class GameScene extends Phaser.Scene {
       this.refreshBlastHud();
       this.refreshRamHud();
       this.refreshDecoyHud();
+      this.refreshStrikeHud();
+      this.refreshEmpHud();
+      this.refreshLaserHud();
+      this.refreshJumpHud();
     }, 100);
     this.roomCleanups.push(() => window.clearInterval(this.shieldHudTimer));
 
@@ -1693,6 +1982,99 @@ export class GameScene extends Phaser.Scene {
     this.refreshBlastHud();
     this.refreshRamHud();
     this.refreshDecoyHud();
+    this.refreshStrikeHud();
+    this.refreshEmpHud();
+    this.refreshLaserHud();
+    this.refreshJumpHud();
+  }
+
+  /** Repaints the translocator readout. */
+  private refreshJumpHud(): void {
+    this.refreshCooldownHud(
+      this.jumpHudEl,
+      "jump",
+      TRANSLOCATE_UNLOCK_LEVEL,
+      this.jumpReadyAt,
+      "JUMP",
+      "[LEFT CLICK]",
+    );
+  }
+
+  /** Repaints the cutting-lance readout. */
+  private refreshLaserHud(): void {
+    this.refreshCooldownHud(
+      this.laserHudEl,
+      "laser",
+      LASER_UNLOCK_LEVEL,
+      this.laserReadyAt,
+      "LANCE",
+      "[C]",
+    );
+  }
+
+  /** Repaints the called-strike readout. */
+  private refreshStrikeHud(): void {
+    this.refreshCooldownHud(
+      this.strikeHudEl,
+      "strike",
+      STRIKE_UNLOCK_LEVEL,
+      this.strikeReadyAt,
+      "STRIKE",
+      "[RIGHT CLICK]",
+    );
+  }
+
+  /** Repaints the suppression-pulse readout. */
+  private refreshEmpHud(): void {
+    this.refreshCooldownHud(
+      this.empHudEl,
+      "emp",
+      EMP_UNLOCK_LEVEL,
+      this.empReadyAt,
+      "PULSE",
+      "[X]",
+    );
+  }
+
+  /**
+   * The shared shape of a cooldown readout: hidden until unlocked, greyed while
+   * suppressed, counting down while cooling, and naming its key when ready.
+   *
+   * The four earlier readouts each spell this out themselves. Rather than
+   * rewrite those — they carry per-ability wording the shared version would
+   * flatten — the two new ones start from the common shape.
+   */
+  private refreshCooldownHud(
+    el: HTMLDivElement | undefined,
+    kind: string,
+    unlockLevel: number,
+    readyAt: number,
+    label: string,
+    key: string,
+  ): void {
+    if (!el || this.isDead) return;
+
+    const level = this.campaignRoom?.state?.currentLevel ?? 1;
+    if (level < unlockLevel) {
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+
+    if (this.abilitiesSuppressed()) {
+      el.className = `${kind}-hud ability-suppressed`;
+      el.textContent = `${label} JAMMED`;
+      return;
+    }
+
+    const now = Date.now();
+    if (readyAt > now) {
+      el.className = `${kind}-hud ${kind}-cooling`;
+      el.textContent = `${label} ${Math.ceil((readyAt - now) / 1000)}s`;
+    } else {
+      el.className = `${kind}-hud ${kind}-ready`;
+      el.textContent = `${label} READY ${key}`;
+    }
   }
 
   /**
@@ -2054,9 +2436,7 @@ export class GameScene extends Phaser.Scene {
     btn.addEventListener("click", () => {
       btn.disabled = true;
       btn.textContent = "...";
-      const room = this.room ?? this.campaignRoom;
-      if (!room) { window.location.reload(); return; }
-      void leaveRoom(room).finally(() => window.location.reload());
+      leaveRoomAndReload(this.room ?? this.campaignRoom);
     });
     document.body.appendChild(btn);
     this.menuBtnEl = btn;
@@ -2077,6 +2457,12 @@ export class GameScene extends Phaser.Scene {
       { name: "Sapper", color: "#ff8a00", desc: "Shells you over walls" },
       { name: "Lurcher", color: "#ff5c8a", desc: "Grapples and drags you in" },
       { name: "Nullifier", color: "#6f7d8c", desc: "Jams your abilities nearby" },
+      { name: "Sentinel", color: "#b0b8c4", desc: "Emplaced; long reach, never moves" },
+      { name: "Howler", color: "#ffaa00", desc: "Speeds up everything near it" },
+      { name: "Leech", color: "#7fff3f", desc: "Contact drains your cooldowns" },
+      { name: "Overseer", color: "#4b2fa8", desc: "Calls in reinforcements" },
+      { name: "Reclaimer", color: "#c06020", desc: "Rebuilds what you level" },
+      { name: "Burrower", color: "#6b4a2f", desc: "Submerges, surfaces beside you" },
     ];
 
     const panel = document.createElement("div");
@@ -2366,6 +2752,41 @@ export class GameScene extends Phaser.Scene {
               sprite.setTint(hot ? 0xff33cc : 0xffffff);
             },
           });
+        } else if (tank.variant === "sentinel") {
+          // Steel grey, and visibly bolted down: an emplacement, not a patrol.
+          sprite.setTint(0xb0b8c4);
+        } else if (tank.variant === "howler") {
+          // Hot amber, pulsing in time with the rally it is broadcasting.
+          sprite.setTint(0xffaa00);
+          this.createHowlerAura(tank);
+        } else if (tank.variant === "leech") {
+          // Sickly green — the colour of the cooldowns it takes.
+          sprite.setTint(0x7fff3f);
+        } else if (tank.variant === "overseer") {
+          // Deep indigo command unit.
+          sprite.setTint(0x4b2fa8);
+        } else if (tank.variant === "reclaimer") {
+          // Rust orange repair crew.
+          sprite.setTint(0xc06020);
+        } else if (tank.variant === "burrower") {
+          // Earth brown, and near-invisible while it is under the floor; the
+          // cloak flag it shares with the Ghost drives the fade.
+          sprite.setTint(0x6b4a2f);
+          this.syncGhostAppearance(tank, sprite);
+        } else if (tank.variant === "foundry") {
+          // Furnace red, three tiles across.
+          sprite.setScale(3.0);
+          sprite.setTint(0xd2401e);
+        } else if (tank.variant === "choir") {
+          // The twins. Identical on purpose: telling them apart is not the
+          // fight, finishing them together is.
+          sprite.setScale(2.0);
+          sprite.setTint(0xc8a2ff);
+        } else if (tank.variant === "leviathan") {
+          // Deep teal, and gone entirely while it is submerged.
+          sprite.setScale(3.0);
+          sprite.setTint(0x1e7a86);
+          this.syncGhostAppearance(tank, sprite);
         } else if (tank.variant === "jammer") {
           // Dark-blue electronic-warfare unit.
           sprite.setTint(0x00008b);
@@ -2407,6 +2828,7 @@ export class GameScene extends Phaser.Scene {
       this.tankSprites.set(tank, sprite);
       this.placeEntity(sprite, tank);
       this.syncShield(tank, sprite);
+      this.syncMarker(tank, sprite);
 
       if (!tank.isEnemy) {
         const owner = room.state.players.get(tank.ownerId);
@@ -2420,6 +2842,7 @@ export class GameScene extends Phaser.Scene {
       $(tank).onChange(() => {
         this.placeEntity(sprite, tank);
         this.syncShield(tank, sprite);
+        this.syncMarker(tank, sprite);
         // A Mimic flips gold→magenta and unfreezes its facing when it springs.
         this.syncMimicAppearance(tank, sprite);
         // A Ghost fades in and out as it cloaks/uncloaks after firing.
@@ -2437,6 +2860,8 @@ export class GameScene extends Phaser.Scene {
       this.labels.delete(tank);
       this.aegisAuras.get(tank)?.destroy();
       this.aegisAuras.delete(tank);
+      this.markers.get(tank)?.destroy();
+      this.markers.delete(tank);
       this.bastionPlates.get(tank)?.destroy();
       this.bastionPlates.delete(tank);
       this.lastHealth.delete(tank);
@@ -2529,8 +2954,12 @@ export class GameScene extends Phaser.Scene {
     // omit it and keep the original 1.5-tile circle.
     const radius = message.radius ?? 1.5 * TILE_SIZE;
     const small = message.radius !== undefined;
-    const fill = small ? 0xff8a00 : 0xff0000;
-    const line = small ? 0xffaa33 : 0xff2020;
+
+    // A strike the player called down themselves is drawn in their own colour.
+    // Red would read as incoming fire, which is actively misleading when the
+    // circle is the thing they just asked for.
+    const fill = message.friendly ? 0x2a8fd8 : small ? 0xff8a00 : 0xff0000;
+    const line = message.friendly ? 0x76c8ff : small ? 0xffaa33 : 0xff2020;
 
     const circle = this.add.graphics().setDepth(3);
     circle.fillStyle(fill, 0.25).fillCircle(message.x, message.y, radius);
@@ -2737,6 +3166,7 @@ export class GameScene extends Phaser.Scene {
 
     this.syncShieldAura();
     this.syncBastionPlates();
+    this.syncObjectiveTarget();
   }
 
   /**
@@ -2849,16 +3279,69 @@ export class GameScene extends Phaser.Scene {
    * cover both flanks as well as the stern because the plating is bow armour
    * only: standing anywhere but in front of it is enough.
    */
+  /**
+   * Marks the one objective that will answer, on a level that imposes an order.
+   *
+   * Without this the level is unplayable rather than hard: every mast and every
+   * package looks identical, so an order nobody can see reads as the game
+   * refusing shots at random. The marker is the whole mechanic made visible.
+   */
+  private syncObjectiveTarget(): void {
+    const index = this.campaignRoom?.state?.objectiveTargetTile ?? -1;
+
+    if (index < 0) {
+      if (this.objectiveMarker) {
+        this.tweens.killTweensOf(this.objectiveMarker);
+        this.objectiveMarker.destroy();
+        this.objectiveMarker = undefined;
+      }
+      return;
+    }
+
+    const x = (index % GRID_WIDTH) * TILE_SIZE + TILE_SIZE / 2;
+    const y = Math.floor(index / GRID_WIDTH) * TILE_SIZE + TILE_SIZE / 2;
+
+    if (this.objectiveMarker && this.isLive(this.objectiveMarker)) {
+      this.objectiveMarker.setPosition(x, y);
+      return;
+    }
+
+    const marker = this.add.graphics().setDepth(7);
+
+    // Deliberately loud. This is not decoration — on an ordered level it is the
+    // only thing separating the one objective that answers from eleven
+    // identical ones that will not, and a subtle mark here reads as the game
+    // dropping shots at random. Sized well outside the tile so it is legible
+    // with the whole battlefield on screen, which is how the map is actually
+    // played.
+    const gap = TILE_SIZE * 1.4;
+    const arm = TILE_SIZE * 0.8;
+
+    marker.fillStyle(0x7dffcf, 0.14).fillRect(-gap, -gap, gap * 2, gap * 2);
+    // A bracket rather than a ring: the objective tiles are already square
+    // structures, and a circle around one reads as a shield.
+    marker.lineStyle(5, 0x7dffcf, 1);
+    for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]] as Array<[number, number]>) {
+      marker.lineBetween(sx * gap, sy * gap, sx * (gap - arm), sy * gap);
+      marker.lineBetween(sx * gap, sy * gap, sx * gap, sy * (gap - arm));
+    }
+    marker.setPosition(x, y);
+    this.world.add(marker);
+    this.objectiveMarker = marker;
+
+    this.tweens.add({
+      targets: marker,
+      alpha: { from: 1, to: 0.4 },
+      duration: 700,
+      yoyo: true,
+      repeat: -1,
+    });
+  }
+
   private syncBastionPlates(): void {
     for (const [tank, plate] of this.bastionPlates) {
       const sprite = this.tankSprites.get(tank);
       if (!sprite || !this.isLive(sprite) || !this.isLive(plate)) continue;
-
-      // Facing unit vector, and the axis across it.
-      const fx = tank.direction === Direction.Left ? -1 : tank.direction === Direction.Right ? 1 : 0;
-      const fy = tank.direction === Direction.Up ? -1 : tank.direction === Direction.Down ? 1 : 0;
-      const ax = fy;
-      const ay = fx;
 
       const half = tank.width / 2;
       const span = half * 0.85;
@@ -2867,25 +3350,24 @@ export class GameScene extends Phaser.Scene {
 
       plate.clear();
 
-      // Armoured bow — shells bounce off this face and only this one.
-      plate.lineStyle(5, 0x3d4655, 0.95);
-      plate.lineBetween(
-        cx + fx * half - ax * span,
-        cy + fy * half - ay * span,
-        cx + fx * half + ax * span,
-        cy + fy * half + ay * span,
-      );
-
-      // Exposed stern and both flanks — shoot any of these.
-      plate.lineStyle(4, 0xffd23f, 0.95);
-      const faces: Array<[number, number]> = [
-        [-fx, -fy],
-        [ax, ay],
-        [-ax, -ay],
+      // Outward normal of each face, indexed by the cardinal that names it.
+      const normals: ReadonlyArray<readonly [number, number]> = [
+        [0, -1], // Up
+        [1, 0], // Right
+        [0, 1], // Down
+        [-1, 0], // Left
       ];
-      for (const [nx, ny] of faces) {
-        // The span runs across whichever face this is: the axis perpendicular
-        // to its own outward normal.
+
+      // The whole encounter is "which side is open right now", so the three
+      // sealed faces are drawn flat and dark and the open one is drawn bright
+      // and thick. It is deliberately the loudest thing on the boss.
+      for (let side = 0; side < normals.length; side++) {
+        const [nx, ny] = normals[side]!;
+        const open = side === tank.weakSide;
+
+        plate.lineStyle(open ? 7 : 5, open ? 0xffd23f : 0x3d4655, 0.95);
+
+        // The span runs across the face: the axis perpendicular to its normal.
         const sx = ny;
         const sy = nx;
         plate.lineBetween(
@@ -2953,6 +3435,70 @@ export class GameScene extends Phaser.Scene {
     aura.setPosition(tank.x + tank.width / 2, tank.y + tank.height / 2);
     this.world.add(aura);
     this.aegisAuras.set(tank, aura);
+  }
+
+  /**
+   * Draws a Howler's rally aura.
+   *
+   * Deliberately the same shape as the Aegis bubble but in the opposite colour:
+   * both are "everything inside this circle is different", and the player
+   * should read the shape first and the consequence second. Tracked in the same
+   * map, so it is positioned and cleaned up by the code that already does that.
+   */
+  private createHowlerAura(tank: TankView): void {
+    const radius = 6 * TILE_SIZE;
+    const aura = this.add.graphics().setDepth(2);
+    aura.fillStyle(0xffaa00, 0.06).fillCircle(0, 0, radius);
+    aura.lineStyle(2, 0xffaa00, 0.35).strokeCircle(0, 0, radius);
+    aura.setPosition(tank.x + tank.width / 2, tank.y + tank.height / 2);
+    this.world.add(aura);
+    this.aegisAuras.set(tank, aura);
+  }
+
+  /**
+   * Rings a marked target on a purge level.
+   *
+   * The whole level is the player being able to tell one identical hull from
+   * another, so the mark is drawn large, bright and on top of everything —
+   * subtlety here would just be a level that reads as broken.
+   */
+  private syncMarker(tank: TankView, sprite: Phaser.GameObjects.Image): void {
+    if (this.isDead || !this.isLive(sprite)) return;
+
+    const existing = this.markers.get(tank);
+
+    if (!tank.isMarked) {
+      if (existing) {
+        this.tweens.killTweensOf(existing);
+        existing.destroy();
+        this.markers.delete(tank);
+      }
+      return;
+    }
+
+    if (existing) {
+      if (this.isLive(existing)) existing.setPosition(sprite.x, sprite.y);
+      return;
+    }
+
+    const marker = this.add.graphics().setDepth(7);
+    marker.lineStyle(3, 0xff2d55, 0.95).strokeCircle(0, 0, TILE_SIZE * 0.85);
+    // A short cross through the middle, so it reads as a sight rather than a
+    // shield — the two are drawn at similar sizes and must not be confused.
+    marker.lineStyle(2, 0xff2d55, 0.7);
+    marker.lineBetween(-TILE_SIZE * 0.5, 0, TILE_SIZE * 0.5, 0);
+    marker.lineBetween(0, -TILE_SIZE * 0.5, 0, TILE_SIZE * 0.5);
+    marker.setPosition(sprite.x, sprite.y);
+    this.world.add(marker);
+    this.markers.set(tank, marker);
+
+    this.tweens.add({
+      targets: marker,
+      alpha: { from: 1, to: 0.45 },
+      duration: 600,
+      yoyo: true,
+      repeat: -1,
+    });
   }
 
   /** Adds or removes the flashing shield that marks respawn invulnerability. */
