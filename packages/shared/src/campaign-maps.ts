@@ -974,8 +974,11 @@ export function buildArchitectChamber(): number[] {
     fillRect(grid, x, y, x + 1, y + 1, TileType.Brick);
   }
 
-  // Two central steel pillars, clear of the Architect's own footprint at centre.
-  steelPillars(grid, [
+  // No steel anywhere inside. The encounter is already about a room that is
+  // closing in — the walls it builds are the plate — and permanent pillars on
+  // top of that took away the ground the player needs to keep circling in the
+  // exposed phase, in a fight that is now nearly twice as long.
+  coverClusters(grid, [
     [22, 16],
     [36, 16],
   ], 2);
@@ -1161,7 +1164,8 @@ export function buildRelayStation(): number[] {
   placeRelay(grid, cx, cy);
 
   // Baffles: short steel walls offset from each approach, so every lane into
-  // the relay bends at least once.
+  // the relay bends at least once — and so the player has hard cover to hold
+  // the doors from rather than standing in the open beside them.
   steelPillars(grid, [
     [cx - 7, cy - 5],
     [cx + 5, cy - 5],
@@ -1518,9 +1522,12 @@ export function buildDeepWater(): number[] {
 
   fillRect(grid, 1, 1, GRID_WIDTH - 2, GRID_HEIGHT - 2, TileType.Water);
 
-  // Platforms.
+  // Platforms. The three northern ones reach the top wall on purpose: the
+  // enemy release points sit on row 2, and an island that stopped short of them
+  // left every one of them under coolant — which quietly cancelled the level's
+  // entire opposition and left the player alone with the boss.
   const islands: Array<[number, number, number, number]> = [
-    [4, 4, 16, 12], [22, 3, 37, 10], [43, 4, 55, 12],
+    [4, 1, 16, 12], [22, 1, 37, 10], [43, 1, 55, 12],
     [3, 20, 15, 29], [23, 22, 36, 29], [44, 20, 56, 29],
     [24, 13, 35, 19],
   ];
@@ -1533,8 +1540,10 @@ export function buildDeepWater(): number[] {
   fillRect(grid, 37, 24, 43, 25, TileType.Empty);
   fillRect(grid, 29, 11, 30, 12, TileType.Empty);
   fillRect(grid, 29, 20, 30, 21, TileType.Empty);
-  fillRect(grid, 8, 13, 9, 19, TileType.Empty);
-  fillRect(grid, 50, 13, 51, 19, TileType.Empty);
+  // The two long side bridges are widened at their midpoints, so the flanking
+  // release points on row 16 stand on ground as well.
+  fillRect(grid, 4, 13, 9, 19, TileType.Empty);
+  fillRect(grid, 50, 13, 55, 19, TileType.Empty);
 
   coverClusters(grid, [[10, 6], [47, 6], [10, 23], [47, 23]], 2);
 

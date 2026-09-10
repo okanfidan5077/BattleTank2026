@@ -194,15 +194,43 @@ await sleep(600);
 const before = whereAmI();
 check("the player is on the field", Boolean(before));
 
-// Find open ground a long way off — further than any blink could reach.
+// Open ground a long way off *and in the tank's line of sight* — the jump only
+// reaches somewhere it can see, so a destination picked purely on distance is
+// usually behind a wall and correctly refused.
+const lineIsClear = (fromX, fromY, toX, toY) => {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1) return true;
+  const step = TILE_SIZE / 4;
+  for (let travelled = step; travelled < dist; travelled += step) {
+    const x = fromX + (dx / dist) * travelled;
+    const y = fromY + (dy / dist) * travelled;
+    const tile = tileAt(Math.floor(x / TILE_SIZE), Math.floor(y / TILE_SIZE));
+    if (tile === 1 || tile === 2 || tile === 4) return false;
+  }
+  return true;
+};
+
 let far = null;
-for (let ty = 1; ty < 32 && !far; ty++) {
-  for (let tx = 1; tx < 59; tx++) {
-    if (tileAt(tx, ty) !== 0) continue;
-    const d = Math.hypot(tx * TILE_SIZE - (before?.x ?? 0), ty * TILE_SIZE - (before?.y ?? 0));
-    if (d > 20 * TILE_SIZE) { far = { tx, ty }; break; }
+let farDistance = 0;
+if (before) {
+  const cx = before.x + TILE_SIZE / 2;
+  const cy = before.y + TILE_SIZE / 2;
+  for (let ty = 1; ty < 32; ty++) {
+    for (let tx = 1; tx < 59; tx++) {
+      if (tileAt(tx, ty) !== 0) continue;
+      const px = tx * TILE_SIZE + TILE_SIZE / 2;
+      const py = ty * TILE_SIZE + TILE_SIZE / 2;
+      const d = Math.hypot(px - cx, py - cy);
+      if (d <= farDistance) continue;
+      if (!lineIsClear(cx, cy, px, py)) continue;
+      far = { tx, ty };
+      farDistance = d;
+    }
   }
 }
+console.log(`    furthest point in sight: ${Math.round(farDistance / TILE_SIZE)} tiles`);
 check("found somewhere far to jump to", Boolean(far));
 
 if (far && before) {
@@ -212,7 +240,9 @@ if (far && before) {
   const after = whereAmI();
   const moved = after ? Math.hypot(after.x - before.x, after.y - before.y) : 0;
   console.log(`    jumped ${Math.round(moved / TILE_SIZE)} tiles`);
-  check("the jump crosses the map", moved > 18 * TILE_SIZE, `${Math.round(moved / TILE_SIZE)} tiles`);
+  // Further than the blink's five tiles, which is the point of having both.
+  check("the jump goes far further than a blink", moved > 8 * TILE_SIZE,
+    `${Math.round(moved / TILE_SIZE)} tiles`);
   check("it lands tile-aligned", Boolean(after) && after.x % TILE_SIZE === 0 && after.y % TILE_SIZE === 0,
     `${after?.x},${after?.y}`);
   // Coolant Loop and Phase Governor both discount it, and the walk here banks

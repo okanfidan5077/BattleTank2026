@@ -2463,6 +2463,7 @@ export class GameScene extends Phaser.Scene {
       { name: "Overseer", color: "#4b2fa8", desc: "Calls in reinforcements" },
       { name: "Reclaimer", color: "#c06020", desc: "Rebuilds what you level" },
       { name: "Burrower", color: "#6b4a2f", desc: "Submerges, surfaces beside you" },
+      { name: "Warden aura", color: "#00ffff", desc: "Shields everything inside it" },
     ];
 
     const panel = document.createElement("div");
@@ -2795,6 +2796,10 @@ export class GameScene extends Phaser.Scene {
         } else if (tank.variant === "warden") {
           sprite.setScale(2.0);
           sprite.setTint(0x006400);
+          // It carries a six-tile version of the Aegis aura, which was doing
+          // its work invisibly: rushers inside it were soaking three shells
+          // each and the reason was nowhere on screen.
+          this.createWardenAura(tank);
         } else if (tank.variant === "core") {
           sprite.setScale(3.0);
           sprite.setTint(0xff0066);
@@ -3432,6 +3437,23 @@ export class GameScene extends Phaser.Scene {
     const aura = this.add.graphics().setDepth(2);
     aura.fillStyle(0x00ffff, 0.08).fillCircle(0, 0, radius);
     aura.lineStyle(2, 0x00ffff, 0.4).strokeCircle(0, 0, radius);
+    aura.setPosition(tank.x + tank.width / 2, tank.y + tank.height / 2);
+    this.world.add(aura);
+    this.aegisAuras.set(tank, aura);
+  }
+
+  /**
+   * Draws the Warden's protective aura.
+   *
+   * The same language as the Aegis bubble it is a bigger version of, so a
+   * player who has met one reads the other immediately — and twice the radius,
+   * because that is what it is.
+   */
+  private createWardenAura(tank: TankView): void {
+    const radius = 6 * TILE_SIZE;
+    const aura = this.add.graphics().setDepth(2);
+    aura.fillStyle(0x00ffff, 0.05).fillCircle(0, 0, radius);
+    aura.lineStyle(2, 0x00ffff, 0.3).strokeCircle(0, 0, radius);
     aura.setPosition(tank.x + tank.width / 2, tank.y + tank.height / 2);
     this.world.add(aura);
     this.aegisAuras.set(tank, aura);

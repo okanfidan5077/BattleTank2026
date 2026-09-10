@@ -526,19 +526,21 @@ body {
   left: 16px;
   z-index: 14;
   display: flex;
-  flex-wrap: wrap-reverse;
-  gap: 6px;
-  max-width: min(660px, 52vw);
+  /* Column-reverse so the first ability learned sits at the bottom and each new
+     one stacks above it — the order they are unlocked in, read upward. */
+  flex-direction: column-reverse;
+  align-items: flex-start;
+  gap: 4px;
   pointer-events: none;
 }
 
 .shield-hud {
-  padding: 7px 14px;
+  padding: 4px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: rgb(11 13 16 / 60%);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 1.5px;
   color: var(--muted);
@@ -569,7 +571,7 @@ body {
 /* ------------------------------------------------------------ blink readout */
 
 .teleport-hud {
-  padding: 7px 14px;
+  padding: 4px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: rgb(11 13 16 / 60%);
@@ -598,7 +600,7 @@ body {
 /* ------------------------------------------------------------ blast readout */
 
 .blast-hud {
-  padding: 7px 14px;
+  padding: 4px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: rgb(11 13 16 / 60%);
@@ -632,7 +634,7 @@ body {
 .emp-hud,
 .laser-hud,
 .jump-hud {
-  padding: 7px 14px;
+  padding: 4px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: rgb(11 13 16 / 60%);

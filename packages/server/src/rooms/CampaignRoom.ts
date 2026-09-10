@@ -49,6 +49,8 @@ import {
   AUTOLOADER_FIRE_FACTOR,
   campaignShootCooldownMs,
   DECOY_COOLDOWN_MS,
+  DECOY_LURE_CHANCE,
+  rollDecoyLure,
   DECOY_DURATION_MS,
   DECOY_UNLOCK_LEVEL,
   MOVE_DIRECTION_TO_FACING,
@@ -905,6 +907,41 @@ const CORE_MORTAR_INTERVAL_MS = 5500;
 /** The enemy `variant` string for the Level 5 boss. */
 const SWEEPER = "sweeper";
 
+/**
+ * Boss hulls that kill on contact.
+ *
+ * The heavy ones — anything that is meant to read as a machine you do not want
+ * to be standing in front of. The Artillery is deliberately absent: it is a gun
+ * that backs away, and being run over by it was never part of the fight.
+ * Hydra bodies, the Architect and the Leviathan resolve their own contact
+ * inside their movers, because they have to do it mid-step.
+ */
+const CRUSHING_BOSSES = new Set<string>([
+  "sweeper",
+  "juggernaut",
+  "warden",
+  "bastion",
+  "core",
+  "foundry",
+]);
+
+/**
+ * Shells the relay absorbs before it falls, on a `defend_core` level.
+ *
+ * The arena's eagle dies to a single hit, which is right for a match that ends
+ * when it does. It is wrong for a ninety-second hold: one enemy getting a shot
+ * through a door ended the level instantly, with no warning and nothing the
+ * player could have done about it once the shell was in the air. Four gives the
+ * mistake a cost the player can see coming and fight back from.
+ */
+const RELAY_HITS = 4;
+
+/** How far from every player a fallback release point must be, in tiles. */
+const FALLBACK_SPAWN_MIN_TILES = 10;
+
+/** Placement attempts before a fallback release gives up for this tick. */
+const FALLBACK_SPAWN_ATTEMPTS = 80;
+
 // ------------------------------------------------------------------ foundry
 
 /** The `variant` string for the Act 4 Foundry boss. */
@@ -1226,6 +1263,9 @@ export class CampaignRoom extends Room<CampaignState> {
   /** Marked units destroyed so far (purge_marked levels). */
   private markedKilled = 0;
 
+  /** Shells the relay can still absorb before it falls. */
+  private relayHitsLeft = RELAY_HITS;
+
   /**
    * Grid indices of this level's objective tiles, in the order they must be
    * taken. Empty on a level that does not impose one, which every check reads
@@ -1419,6 +1459,25 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** Routes every enemy toward the player's current position. */
   private readonly hunterField = new FlowField();
+
+  /**
+   * The route to any standing decoy beacon, kept alongside the hunter route.
+   *
+   * Two fields rather than one, because a beacon no longer replaces the player
+   * as *the* target — it competes with them. A single field can only converge
+   * on one set of sources, so splitting the attention needs a second one and a
+   * per-enemy answer to which of them applies.
+   */
+  private readonly decoyField = new FlowField();
+
+  /**
+   * ownerIds of the enemies a standing beacon has actually fooled.
+   *
+   * Rolled once, when the beacon goes down or when a unit is released while one
+   * is standing — not per tick, which would have hulls flickering between two
+   * destinations and going nowhere. Cleared when the last beacon expires.
+   */
+  private readonly luredIds = new Set<string>();
 
   override onCreate(): void {
     this.setState(new CampaignState());
@@ -1659,6 +1718,7 @@ export class CampaignRoom extends Room<CampaignState> {
     this.bombTimerMs = bombSecondsForLevel(this.state.currentLevel) * 1000;
     this.objectiveMet = false;
     this.markedKilled = 0;
+    this.relayHitsLeft = RELAY_HITS;
     this.objectiveOrder = [];
     this.state.objectiveTargetTile = -1;
     this.bossStates.clear();
@@ -1669,6 +1729,7 @@ export class CampaignRoom extends Room<CampaignState> {
     this.reclaimerTimers.clear();
     this.burrowerTimers.clear();
     this.markedIds.clear();
+    this.luredIds.clear();
     this.empHeldUntilMs.clear();
     this.strikes = [];
     this.respawnAtMs.clear();
@@ -1723,7 +1784,7 @@ export class CampaignRoom extends Room<CampaignState> {
     }
 
     this.rollObjectiveOrder();
-    this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+    this.rebuildFields();
     this.refreshObjective();
   }
 
@@ -2152,7 +2213,7 @@ export class CampaignRoom extends Room<CampaignState> {
       }
 
       if (this.crushJuggernautTiles(body.x, body.y, body.width, body.height)) {
-        this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+        this.rebuildFields();
         this.onSweeperBounce(body, true);
       }
       this.crushEnemies(body);
@@ -2427,8 +2488,15 @@ export class CampaignRoom extends Room<CampaignState> {
       fieldFor: (tank) => {
         // A pulsed unit keeps its position and its timers and simply stops.
         if (this.isSuppressed(tank)) return null;
-        if (!this.usesHunterField(tank) || !this.hunterField.isPopulated) return null;
-        return this.hunterField;
+        if (!this.usesHunterField(tank)) return null;
+
+        // A unit that took the bait follows the beacon while one stands; the
+        // rest carry on toward the player exactly as they would have.
+        if (this.luredIds.has(tank.ownerId) && this.hasDecoy() && this.decoyField.isPopulated) {
+          return this.decoyField;
+        }
+
+        return this.hunterField.isPopulated ? this.hunterField : null;
       },
       // A rusher is meant to be a threat the player sees coming and answers,
       // which means it has to actually come. Everything else keeps the noise.
@@ -2542,6 +2610,7 @@ export class CampaignRoom extends Room<CampaignState> {
       // On an ordered level every objective structure but the marked one is
       // sealed; the shell sparks off it exactly as it would off steel.
       hardensTile: (index) => !this.objectiveTileLive(index),
+      protectsTile: (index, bullet) => this.relayAbsorbs(index, bullet),
       shieldsTarget: (target, bullet) =>
         this.isShieldUp(target) ||
         this.ramDeflects(target, bullet) ||
@@ -2560,7 +2629,7 @@ export class CampaignRoom extends Room<CampaignState> {
         outcome.factoriesDestroyed >
       0
     ) {
-      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.rebuildFields();
     }
 
     for (const spark of outcome.steelHits) {
@@ -2602,7 +2671,12 @@ export class CampaignRoom extends Room<CampaignState> {
     }
 
     // Bomb defusal: run down the timer, defuse on contact, and detonate at zero.
-    if (this.currentWinCondition() === CampaignWinCondition.DefuseBombs) {
+    //
+    // The clock stops the moment the last charge is pulled. It used to keep
+    // running while a boss wave was being fought over the wreckage, so clearing
+    // every bomb and then taking too long over the boss detonated bombs that no
+    // longer existed and reset the level.
+    if (this.currentWinCondition() === CampaignWinCondition.DefuseBombs && !this.objectiveMet) {
       this.bombTimerMs -= deltaMs;
       this.defuseBombsUnderPlayer();
       if (this.bombTimerMs <= 0) {
@@ -2803,7 +2877,10 @@ export class CampaignRoom extends Room<CampaignState> {
       }
       case CampaignWinCondition.DefendCore: {
         const seconds = this.secondsToDefend();
-        this.setObjective(`HOLD THE RELAY: ${seconds}s`, seconds);
+        this.setObjective(
+          `HOLD THE RELAY: ${seconds}s - INTEGRITY ${this.relayHitsLeft}/${RELAY_HITS}`,
+          seconds,
+        );
         break;
       }
       case CampaignWinCondition.PurgeMarked: {
@@ -4258,7 +4335,7 @@ export class CampaignRoom extends Room<CampaignState> {
     }
 
     if (opened) {
-      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.rebuildFields();
       this.broadcast(ServerMessage.SteelHit, {
         x: payload.x + payload.width / 2,
         y: aheadY,
@@ -4417,6 +4494,39 @@ export class CampaignRoom extends Room<CampaignState> {
     }
   }
 
+  /**
+   * Decides whether the relay survives this shell, on a `defend_core` level.
+   *
+   * Two rules in one place, because they are both about the same tile:
+   *
+   *  - A player's own shell never damages it. It is the thing they are
+   *    defending, and a stray round from the defender ending the level is a
+   *    loss nobody can read as their own decision.
+   *  - An enemy shell chips it. The mast only falls on the last of
+   *    {@link RELAY_HITS}, so the hold degrades visibly instead of ending on a
+   *    single lucky shot through a door.
+   */
+  private relayAbsorbs(index: number, bullet: Bullet): boolean {
+    if (this.currentWinCondition() !== CampaignWinCondition.DefendCore) return false;
+    if (this.state.grid.at(index) !== TileType.EagleBase) return false;
+
+    if (!bullet.isEnemy) return true;
+
+    this.relayHitsLeft = Math.max(0, this.relayHitsLeft - 1);
+    if (this.relayHitsLeft > 0) {
+      // A hit that held: announce it where the relay stands, so the player can
+      // hear the thing they are guarding being worked on from across the map.
+      this.broadcast(ServerMessage.SteelHit, {
+        x: (index % GRID_WIDTH) * TILE_SIZE + TILE_SIZE / 2,
+        y: Math.floor(index / GRID_WIDTH) * TILE_SIZE + TILE_SIZE / 2,
+      } satisfies SteelHitMessage);
+      this.refreshObjective();
+      return true;
+    }
+
+    return false;
+  }
+
   /** True while any tile of `tile` is still on the grid. */
   private gridHasTile(tile: TileType): boolean {
     for (let i = 0; i < GRID_LENGTH; i++) {
@@ -4571,7 +4681,7 @@ export class CampaignRoom extends Room<CampaignState> {
     }
 
     // Opening up cover changes the routes — re-path the hunters.
-    if (changed) this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+    if (changed) this.rebuildFields();
   }
 
   // -------------------------------------------------------------- sweeper boss
@@ -4751,7 +4861,7 @@ export class CampaignRoom extends Room<CampaignState> {
     if (this.crushJuggernautTiles(boss.x, boss.y, boss.width, boss.height)) {
       // A levelled wall opens new routes — re-path the hunters, and give the
       // camera a very subtle rumble (crushes are frequent, so it must not jolt).
-      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.rebuildFields();
       this.onSweeperBounce(boss, true);
     }
     this.crushEnemies(boss);
@@ -4813,7 +4923,7 @@ export class CampaignRoom extends Room<CampaignState> {
     }
 
     if (this.crushJuggernautTiles(boss.x, boss.y, boss.width, boss.height)) {
-      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.rebuildFields();
       this.onSweeperBounce(boss, true);
     }
     this.crushEnemies(boss);
@@ -5136,7 +5246,7 @@ export class CampaignRoom extends Room<CampaignState> {
     boss.direction = this.angleToDirection(angle);
 
     if (this.crushJuggernautTiles(boss.x, boss.y, boss.width, boss.height)) {
-      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.rebuildFields();
       this.onSweeperBounce(boss, true);
     }
   }
@@ -5294,7 +5404,7 @@ export class CampaignRoom extends Room<CampaignState> {
     if (!this.sweeperHitsWall(boss.x, nextY, boss.width, boss.height)) boss.y = nextY;
 
     if (this.crushJuggernautTiles(boss.x, boss.y, boss.width, boss.height)) {
-      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.rebuildFields();
       this.onSweeperBounce(boss, true);
     }
     this.crushEnemies(boss);
@@ -5859,7 +5969,7 @@ export class CampaignRoom extends Room<CampaignState> {
     for (const index of brick) this.state.grid[index] = TileType.Empty;
 
     // Opening a wall changes the routes the hunters were following.
-    this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+    this.rebuildFields();
     return true;
   }
 
@@ -5917,7 +6027,8 @@ export class CampaignRoom extends Room<CampaignState> {
       remainingMs: this.decoyDuration(ownerId),
     };
 
-    this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+    this.rollDecoyLure();
+    this.rebuildFields();
 
     // The beacon itself is visible to the whole team — it is a thing on the
     // battlefield, not a private readout — but the cooldown is personal.
@@ -5937,8 +6048,9 @@ export class CampaignRoom extends Room<CampaignState> {
         if (abilities.decoy.remainingMs <= 0) {
           abilities.decoy = null;
           abilities.decoyCooldownMs = this.cooled(ownerId, DECOY_COOLDOWN_MS);
+          if (!this.hasDecoy()) this.luredIds.clear();
           // Attention snaps back to the players the moment it goes out.
-          this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+          this.rebuildFields();
           this.sendTo(ownerId, ServerMessage.DecoyChanged, {
             cooldownMs: this.cooled(ownerId, DECOY_COOLDOWN_MS),
           } satisfies DecoyChangedMessage);
@@ -6100,7 +6212,7 @@ export class CampaignRoom extends Room<CampaignState> {
         clearedBrick = true;
       }
     }
-    if (clearedBrick) this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+    if (clearedBrick) this.rebuildFields();
 
     this.broadcast(ServerMessage.BlastChanged, {
       cooldownMs: 0,
@@ -6246,6 +6358,24 @@ export class CampaignRoom extends Room<CampaignState> {
 
     const spot = this.translocateSpot(player, payload.x, payload.y);
     if (!spot) return;
+
+    // It only reaches somewhere the tank can actually see. Without that rule a
+    // map-wide jump answered every level built around crossing ground — walk to
+    // the extraction pad in particular stopped being a level at all, because
+    // the pad was always one click away through the whole maze between.
+    //
+    // Coolant and open ground do not block the line, so it still crosses a
+    // river or a room; walls do, so a route still has to be driven.
+    if (
+      !this.hasClearLine(
+        player.x + player.width / 2,
+        player.y + player.height / 2,
+        spot.x + player.width / 2,
+        spot.y + player.height / 2,
+      )
+    ) {
+      return;
+    }
 
     const fromX = player.x;
     const fromY = player.y;
@@ -6436,7 +6566,7 @@ export class CampaignRoom extends Room<CampaignState> {
     }
 
     if (cutTiles.size > 0) {
-      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.rebuildFields();
     }
 
     abilities.laserCooldownMs = this.cooled(ownerId, LASER_COOLDOWN_MS);
@@ -6593,7 +6723,7 @@ export class CampaignRoom extends Room<CampaignState> {
 
     // Blowing walls open changes the routes the hunters were following.
     if (clearedBrick) {
-      this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+      this.rebuildFields();
     }
 
     abilities.blastCooldownMs = this.cooled(ownerId, BLAST_COOLDOWN_MS);
@@ -6951,28 +7081,35 @@ export class CampaignRoom extends Room<CampaignState> {
    * still has to respect the boss itself rather than parking inside it.
    */
   private resolveSweeperContact(): void {
-    if (!this.bossId) return;
-    const boss = this.findTank(this.bossId);
-    if (!boss) return;
+    // Every heavy hull on the field, not just whichever one `bossId` happens to
+    // name. That singleton was fine while a level fielded one boss; on a wave of
+    // four it meant three of them could drive straight over the player without
+    // touching them, which reads as the boss being broken.
+    for (const boss of this.bossTanks()) {
+      if (!CRUSHING_BOSSES.has(boss.variant)) continue;
+      // A submerged hull is not there to be run over.
+      if (boss.isCloaked) continue;
 
-    // Anyone the hull is inside gets run over, shield or no shield.
-    for (const player of this.playerTanks()) {
-      if (player.isInvulnerable) continue;
+      // Anyone the hull is inside gets run over, shield or no shield.
+      for (const player of this.playerTanks()) {
+        if (player.isInvulnerable) continue;
 
-      if (
-        boxesOverlap(
-          boss.x,
-          boss.y,
-          boss.width,
-          boss.height,
-          player.x,
-          player.y,
-          player.width,
-          player.height,
-        )
-      ) {
-        this.killPlayer(player.ownerId);
+        if (
+          boxesOverlap(
+            boss.x,
+            boss.y,
+            boss.width,
+            boss.height,
+            player.x,
+            player.y,
+            player.width,
+            player.height,
+          )
+        ) {
+          this.killPlayer(player.ownerId);
+        }
       }
+      if (this.state.phase !== CampaignPhase.Playing) return;
     }
   }
 
@@ -7243,6 +7380,7 @@ export class CampaignRoom extends Room<CampaignState> {
     this.sapperLobTimers.delete(tank.ownerId);
     this.lurcherTimers.delete(tank.ownerId);
     this.effigyMirages.delete(tank.ownerId);
+    this.luredIds.delete(tank.ownerId);
     this.sentinelTimers.delete(tank.ownerId);
     this.rallyBaseSpeeds.delete(tank.ownerId);
     this.leechTimers.delete(tank.ownerId);
@@ -7649,7 +7787,7 @@ export class CampaignRoom extends Room<CampaignState> {
       boss.direction = this.angleToDirection(angle);
 
       if (this.crushJuggernautTiles(boss.x, boss.y, boss.width, boss.height)) {
-        this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+        this.rebuildFields();
       }
       this.crushEnemies(boss);
 
@@ -8089,7 +8227,7 @@ export class CampaignRoom extends Room<CampaignState> {
             if (this.tankOnTile(tx, ty)) continue;
 
             this.state.grid[index] = restores;
-            this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+            this.rebuildFields();
             this.refreshObjective();
             placed = true;
           }
@@ -8269,6 +8407,12 @@ export class CampaignRoom extends Room<CampaignState> {
       }),
     );
 
+    // A hull released while a beacon is standing has not seen the player yet,
+    // so it takes the same coin flip everything already on the field took.
+    if (this.hasDecoy() && Math.random() < DECOY_LURE_CHANCE) {
+      this.luredIds.add(this.state.tanks.at(this.state.tanks.length - 1).ownerId);
+    }
+
     this.lastEnemySpawnMs = this.elapsedMs;
   }
 
@@ -8376,6 +8520,44 @@ export class CampaignRoom extends Room<CampaignState> {
       const y = tile.y * TILE_SIZE;
       if (this.isSpawnClear(x, y)) return { x, y };
     }
+
+    // The fixed release points are authored for an open field, and a map is
+    // free to put something else there. Deep Water floods all five of them, so
+    // this returned null on every tick and the level fielded nothing at all
+    // except its boss. Fall back to open ground anywhere well away from the
+    // players rather than quietly cancelling the level's entire opposition.
+    return this.fallbackSpawnPoint();
+  }
+
+  /**
+   * Any clear, tile-aligned ground a long way from every player.
+   *
+   * Deliberately a scan rather than more authored points: the next map to break
+   * the assumption will break it somewhere else.
+   */
+  private fallbackSpawnPoint(): { x: number; y: number } | null {
+    const players = this.playerTanks();
+    const minDistance = FALLBACK_SPAWN_MIN_TILES * TILE_SIZE;
+
+    for (let attempt = 0; attempt < FALLBACK_SPAWN_ATTEMPTS; attempt++) {
+      const tx = 1 + Math.floor(Math.random() * (GRID_WIDTH - 2));
+      const ty = 1 + Math.floor(Math.random() * (GRID_HEIGHT - 2));
+      const x = tx * TILE_SIZE;
+      const y = ty * TILE_SIZE;
+      if (!this.isSpawnClear(x, y)) continue;
+
+      const cx = x + TANK_SIZE / 2;
+      const cy = y + TANK_SIZE / 2;
+      const tooClose = players.some(
+        (player) =>
+          Math.hypot(player.x + player.width / 2 - cx, player.y + player.height / 2 - cy) <
+          minDistance,
+      );
+      if (tooClose) continue;
+
+      return { x, y };
+    }
+
     return null;
   }
 
@@ -8510,7 +8692,7 @@ export class CampaignRoom extends Room<CampaignState> {
   /** Recomputes the hunter field toward the player on a short interval. */
   private refreshHunterField(): void {
     if (this.tick % HUNTER_FIELD_REBUILD_TICKS !== 0) return;
-    this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+    this.rebuildFields();
   }
 
   /**
@@ -8730,20 +8912,6 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** The player's current tile, as a flow-field seed (empty when dead). */
   private playerTargets(): { x: number; y: number }[] {
-    // Standing decoy beacons *are* the targets: every field-following enemy
-    // routes to one instead, which is the entire effect of the ability. With
-    // several out the field converges on whichever is nearest, exactly as it
-    // does with several players.
-    const beacons: { x: number; y: number }[] = [];
-    for (const abilities of this.abilities.values()) {
-      if (!abilities.decoy) continue;
-      beacons.push({
-        x: Math.floor(abilities.decoy.x / TILE_SIZE),
-        y: Math.floor(abilities.decoy.y / TILE_SIZE),
-      });
-    }
-    if (beacons.length > 0) return beacons;
-
     const targets: { x: number; y: number }[] = [];
 
     // On a hold, the relay is a target in its own right. Without this the field
@@ -8771,6 +8939,58 @@ export class CampaignRoom extends Room<CampaignState> {
       });
     }
     return targets;
+  }
+
+  /** Tiles of every standing decoy beacon. */
+  private decoyTargets(): { x: number; y: number }[] {
+    const beacons: { x: number; y: number }[] = [];
+    for (const abilities of this.abilities.values()) {
+      if (!abilities.decoy) continue;
+      beacons.push({
+        x: Math.floor(abilities.decoy.x / TILE_SIZE),
+        y: Math.floor(abilities.decoy.y / TILE_SIZE),
+      });
+    }
+    return beacons;
+  }
+
+  /** True while at least one beacon is standing. */
+  private hasDecoy(): boolean {
+    for (const abilities of this.abilities.values()) if (abilities.decoy) return true;
+    return false;
+  }
+
+  /**
+   * Rebuilds both routes from the current map.
+   *
+   * Always both: a decoy route left stale while the map changed under it would
+   * walk the units it had fooled into a wall, which reads as the ability
+   * breaking rather than as it wearing off.
+   */
+  private rebuildFields(): void {
+    this.hunterField.rebuildToward(this.state.grid, this.playerTargets());
+
+    const beacons = this.decoyTargets();
+    if (beacons.length > 0) this.decoyField.rebuildToward(this.state.grid, beacons);
+  }
+
+  /**
+   * Decides, once, which of the enemies on the field this beacon fools.
+   *
+   * Pulling the entire field made the beacon an "everything stops attacking me"
+   * button, and the upgrade that lengthens it made that last most of a fight.
+   * Half of them take the bait; the other half keep coming, so the beacon buys
+   * breathing room rather than immunity.
+   */
+  private rollDecoyLure(): void {
+    const candidates: string[] = [];
+    for (let i = 0; i < this.state.tanks.length; i++) {
+      const tank = this.state.tanks.at(i);
+      if (this.usesHunterField(tank)) candidates.push(tank.ownerId);
+    }
+
+    this.luredIds.clear();
+    for (const id of rollDecoyLure(candidates)) this.luredIds.add(id);
   }
 
   // -------------------------------------------------------------- input & fire

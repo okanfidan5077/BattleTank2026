@@ -108,8 +108,8 @@ await fight(45000, () => {
 });
 console.log(`    boss hp now ${lastHp}, relocations seen: ${jumps} at hp ${hpAtJump.join(",")}`);
 check("artillery relocated at least once under fire", jumps >= 1, `${jumps} jump(s)`);
-check("relocations track damage taken", jumps >= Math.floor((25 - (lastHp ?? 25)) / 5),
-  `damage=${25 - (lastHp ?? 25)} jumps=${jumps}`);
+check("relocations track damage taken", jumps >= Math.floor((32 - (lastHp ?? 32)) / 5),
+  `damage=${32 - (lastHp ?? 32)} jumps=${jumps}`);
 
 console.log("\nlevel 31 — hydra fragments stay mobile");
 room.send("cheat_win");

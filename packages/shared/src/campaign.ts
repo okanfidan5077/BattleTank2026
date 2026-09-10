@@ -410,8 +410,15 @@ export const CAMPAIGN_REFIT_LEVEL = 18;
 /** Reload multiplier per stack of the Autoloader upgrade. */
 export const AUTOLOADER_FIRE_FACTOR = 0.85;
 
-/** Reload multiplier while any Jammer is on the field. */
-export const JAMMER_COOLDOWN_MULTIPLIER = 2;
+/**
+ * Reload multiplier while any Jammer is on the field.
+ *
+ * Halving the player's rate of fire was too much on a level that also fields a
+ * Bastion you can only hit through a moving seam: the reload was the one thing
+ * making that fight winnable, and taking half of it away turned a puzzle into a
+ * stalemate. A quarter off still reads clearly as suppression.
+ */
+export const JAMMER_COOLDOWN_MULTIPLIER = 1.5;
 
 /**
  * The campaign player's current reload, in ms.
@@ -469,6 +476,41 @@ export const DECOY_DURATION_MS = 6000;
 
 /** Cooldown between beacons, in ms. */
 export const DECOY_COOLDOWN_MS = 20_000;
+
+/**
+ * Share of the enemies on the field a beacon actually fools.
+ *
+ * A beacon used to take *everything* with it, which made it less a distraction
+ * than an off switch — and Loud Beacon, which lengthens it, extended that off
+ * switch over most of a fight. Half is enough to break up a swarm and open a
+ * route, and leaves the other half still coming, so the ability buys room to
+ * work rather than immunity.
+ *
+ * Rolled per enemy, once, when the beacon lands — see
+ * `CampaignRoom.rollDecoyLure`.
+ */
+export const DECOY_LURE_CHANCE = 0.5;
+
+/**
+ * Picks which of `candidates` a beacon fools.
+ *
+ * Pure, and here rather than in the room, so the rule can be tested directly:
+ * the behaviour it produces on a live map is filtered through pathing, spawn
+ * timing and where the player happened to run to, none of which say anything
+ * useful about whether the coin is fair.
+ *
+ * `random` is injectable for exactly that reason.
+ */
+export function rollDecoyLure(
+  candidates: readonly string[],
+  random: () => number = Math.random,
+): Set<string> {
+  const lured = new Set<string>();
+  for (const id of candidates) {
+    if (random() < DECOY_LURE_CHANCE) lured.add(id);
+  }
+  return lured;
+}
 
 // ---------------------------------------------------------------- nullifier
 
@@ -863,8 +905,10 @@ export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
     title: "Dead Channel",
     winCondition: CampaignWinCondition.DefendCore,
     mapGrid: buildRelayStation(),
-    params: { defendSeconds: 90 },
-    spawns: [{ variant: EnemyVariant.Kamikaze, weight: 0.3 }],
+    // Level four, and the kit is one deflector shield. The hold is meant to
+    // teach "stand somewhere useful", not to be a wall.
+    params: { defendSeconds: 75, spawnIntervalFactor: 1.4, maxEnemies: 6 },
+    spawns: [{ variant: EnemyVariant.Kamikaze, weight: 0.2 }],
     introText:
       "There is a battalion relay still transmitting out here — the last piece of our network the Protocol has not silenced. It is running a 90 second handshake. If that mast falls before it completes, nobody ever hears what happened in this sector. Keep them off it.",
     outroText:
@@ -1051,7 +1095,7 @@ export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
     title: "Breakwater",
     winCondition: CampaignWinCondition.DefendCore,
     mapGrid: buildBreakwater(),
-    params: { defendSeconds: 100 },
+    params: { defendSeconds: 85, spawnIntervalFactor: 1.2, maxEnemies: 8 },
     // Two wrecking balls the instant the hold completes — the Protocol's answer
     // to being held off for a hundred seconds is to stop sending patrols.
     bosses: [{ kind: BossKind.Sweeper, count: 2, when: BossTiming.Objective }],
@@ -1370,7 +1414,7 @@ export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
     title: "Last Light",
     winCondition: CampaignWinCondition.DefendCore,
     mapGrid: buildLastLight(),
-    params: { defendSeconds: 110 },
+    params: { defendSeconds: 95, spawnIntervalFactor: 1.15, maxEnemies: 8 },
     spawns: [
       { variant: EnemyVariant.Kamikaze, weight: 0.15 },
       { variant: EnemyVariant.Ghost, weight: 0.15 },

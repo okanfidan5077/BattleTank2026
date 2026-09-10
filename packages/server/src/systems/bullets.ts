@@ -36,6 +36,7 @@ function resolveTileCollision(
     steelHits: { x: number; y: number }[];
   },
   hardens?: (index: number) => boolean,
+  protects?: (index: number, bullet: Bullet) => boolean,
 ): boolean {
   const minTileX = Math.floor(bullet.x / TILE_SIZE);
   const maxTileX = Math.floor((bullet.x + bullet.width - 1) / TILE_SIZE);
@@ -69,9 +70,12 @@ function resolveTileCollision(
           break;
 
         case TileType.EagleBase:
-          // Any shell finishes the eagle — including one of your own.
-          state.grid[index] = TileType.Empty;
-          destroyed.eagle = true;
+          // Any shell finishes the eagle — including one of your own, unless
+          // the room says otherwise (see BulletOptions.protectsTile).
+          if (!protects?.(index, bullet)) {
+            state.grid[index] = TileType.Empty;
+            destroyed.eagle = true;
+          }
           consumed = true;
           break;
 
@@ -242,6 +246,14 @@ export interface BulletOptions {
    * still stops the shell and throws the same sparks steel does.
    */
   hardensTile?: (index: number) => boolean;
+  /**
+   * Returns true if this bullet must not damage the structure at `index`.
+   *
+   * Used to switch friendly fire off for the relay a `defend_core` level is
+   * fought over: the shell is spent, but the thing the player is defending does
+   * not fall to their own stray round.
+   */
+  protectsTile?: (index: number, bullet: Bullet) => boolean;
 }
 
 export function updateBullets(state: GameState, options?: BulletOptions): BulletOutcome {
@@ -302,7 +314,7 @@ export function updateBullets(state: GameState, options?: BulletOptions): Bullet
       continue;
     }
 
-    if (resolveTileCollision(state, bullet, destroyed, options?.hardensTile)) {
+    if (resolveTileCollision(state, bullet, destroyed, options?.hardensTile, options?.protectsTile)) {
       state.bullets.splice(i, 1);
     }
   }

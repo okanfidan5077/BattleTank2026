@@ -27,8 +27,10 @@
     "test:laser": "node scripts/verify-laser.mjs",
     "test:ordered": "node scripts/verify-ordered.mjs",
     "test:feedback": "node scripts/verify-feedback.mjs",
+    "test:feedback2": "node scripts/verify-feedback2.mjs",
+    "test:decoy": "node scripts/verify-decoy.mjs",
     "test:rushers": "node scripts/verify-rushers.mjs",
-    "test:campaign": "node scripts/verify-campaign40.mjs && node scripts/verify-new-systems.mjs && node scripts/verify-laser.mjs && node scripts/verify-ordered.mjs && node scripts/verify-feedback.mjs && node scripts/verify-rushers.mjs && node scripts/verify-fixes.mjs && node scripts/verify-bosses.mjs && node scripts/verify-fire-and-effigy.mjs && node scripts/verify-architect.mjs",
+    "test:campaign": "node scripts/verify-campaign40.mjs && node scripts/verify-new-systems.mjs && node scripts/verify-laser.mjs && node scripts/verify-ordered.mjs && node scripts/verify-feedback.mjs && node scripts/verify-feedback2.mjs && node scripts/verify-decoy.mjs && node scripts/verify-rushers.mjs && node scripts/verify-fixes.mjs && node scripts/verify-bosses.mjs && node scripts/verify-fire-and-effigy.mjs && node scripts/verify-architect.mjs",
     "skip-to": "node scripts/skip-to.mjs"
   },
   "devDependencies": {
