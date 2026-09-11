@@ -209,12 +209,13 @@ export const TELEPORT_MAX_CHARGES = 2;
  * sweeping a map for packages turned into a sequence of hops between them, and
  * the terrain between stopped mattering at all.
  *
- * At thirty-five it is back to being what it was written as: the answer to
- * being boxed in, spent once and then genuinely missed. Coolant Loop can still
- * bring it down to about eighteen seconds at three stacks, which is a real
- * reward for committing an upgrade line to it rather than a default.
+ * Thirty-five overcorrected: a blink that came back that slowly was spent once
+ * per fight and then forgotten. Twenty keeps it an escape rather than a means
+ * of transport — two charges still do not come back fast enough to hop a whole
+ * map — while being available often enough to actually plan around. Coolant
+ * Loop brings it to about ten seconds at three stacks.
  */
-export const TELEPORT_RECHARGE_MS = 35_000;
+export const TELEPORT_RECHARGE_MS = 20_000;
 
 /**
  * The (1-based) level from which the close-in blast is available.
@@ -340,8 +341,9 @@ export const TRANSLOCATE_COOLDOWN_MS = 50_000;
  *
  * A click a tile inside a wall is a near miss on the player's part, not a
  * different intention, so the jump lands beside it rather than refusing. Beyond
- * this it refuses outright and keeps the charge — landing ten tiles from where
- * someone pointed would be worse than not going at all.
+ * this, or when the tank cannot see the spot, it lands at the furthest open
+ * point along the line toward the click instead — still somewhere the player
+ * pointed, and never on the far side of a wall.
  */
 export const TRANSLOCATE_SEARCH_TILES = 2;
 
@@ -477,6 +479,21 @@ export const DECOY_DURATION_MS = 6000;
 /** Cooldown between beacons, in ms. */
 export const DECOY_COOLDOWN_MS = 20_000;
 
+/** Extra beacon lifetime per stack of Loud Beacon, in ms. */
+export const DECOY_UPGRADE_MS = 2000;
+
+/**
+ * The shortest a beacon's cooldown may be after Coolant Loop, in ms.
+ *
+ * The cooldown only starts once a beacon goes out, so a long beacon on a short
+ * cooldown compounds: with two Loud Beacons and three Coolant Loops a beacon
+ * stood for fourteen seconds out of every twenty-four, and the ability had
+ * stopped being a distraction and become the default state of the field.
+ * With this floor, and Loud Beacon halved, the most a fully built beacon can
+ * manage is ten seconds up for every sixteen down.
+ */
+export const DECOY_MIN_COOLDOWN_MS = 16_000;
+
 /**
  * Share of the enemies on the field a beacon actually fools.
  *
@@ -593,7 +610,7 @@ export const CAMPAIGN_UPGRADES: readonly CampaignUpgrade[] = [
   {
     id: "decoyup",
     name: "Loud Beacon",
-    detail: "+4s decoy duration",
+    detail: "+2s decoy duration",
     maxStacks: 2,
     requiresLevel: DECOY_UNLOCK_LEVEL,
   },
@@ -1071,7 +1088,7 @@ export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
     winCondition: CampaignWinCondition.AssassinateBoss,
     mapGrid: buildCoolantBasins(),
     bosses: [{ kind: BossKind.Bastion }],
-    spawns: [{ variant: EnemyVariant.Jammer, weight: 0.3, max: 1 }],
+    spawns: [{ variant: EnemyVariant.Jammer, weight: 0.12, max: 1 }],
     introText:
       "They have brought up a Bastion to hold the coolant basins. Three faces of it are plate my shells will not scratch — but only three. There is always one seam open, and it walks around the hull on a cycle. Find the open face, get to it, and be somewhere else before it seals.",
     outroText:
@@ -1100,7 +1117,7 @@ export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
     // to being held off for a hundred seconds is to stop sending patrols.
     bosses: [{ kind: BossKind.Sweeper, count: 2, when: BossTiming.Objective }],
     spawns: [
-      { variant: EnemyVariant.Jammer, weight: 0.25, max: 1 },
+      { variant: EnemyVariant.Jammer, weight: 0.1, max: 1 },
       { variant: EnemyVariant.Kamikaze, weight: 0.25 },
     ],
     introText:
@@ -1249,7 +1266,7 @@ export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
     params: { zoneSeconds: 75 },
     spawns: [
       { variant: EnemyVariant.Nullifier, weight: 0.2, max: 2 },
-      { variant: EnemyVariant.Jammer, weight: 0.2, max: 1 },
+      { variant: EnemyVariant.Jammer, weight: 0.08, max: 1 },
       { variant: EnemyVariant.Howler, weight: 0.15, max: 2 },
     ],
     introText:
@@ -1324,7 +1341,7 @@ export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
     title: "Fragments",
     winCondition: CampaignWinCondition.AssassinateBoss,
     mapGrid: buildLatticeArena(),
-    bosses: [{ kind: BossKind.Hydra }],
+    bosses: [{ kind: BossKind.Hydra, count: 2 }],
     spawns: [
       { variant: EnemyVariant.Mimic, weight: 0.3 },
       { variant: EnemyVariant.Trapper, weight: 0.2 },
@@ -1474,7 +1491,7 @@ export const CAMPAIGN_LEVELS: readonly CampaignLevel[] = [
       { variant: EnemyVariant.Constructor, weight: 0.12, max: 2 },
       { variant: EnemyVariant.Trapper, weight: 0.12 },
       { variant: EnemyVariant.Aegis, weight: 0.12 },
-      { variant: EnemyVariant.Jammer, weight: 0.1, max: 1 },
+      { variant: EnemyVariant.Jammer, weight: 0.05, max: 1 },
       { variant: EnemyVariant.Mimic, weight: 0.12 },
       { variant: EnemyVariant.Ghost, weight: 0.12 },
       { variant: EnemyVariant.Sapper, weight: 0.12 },

@@ -216,13 +216,18 @@ const blocked = (() => {
 check("found somewhere with a wall in the way", Boolean(blocked));
 
 if (blocked) {
+  // A click past a wall is no longer refused — a refusal read as the button
+  // being broken — but the jump must still stop this side of the wall: the
+  // tank's line from where it stood to where it landed is never broken.
   const parked = whereAmI();
   room.send("translocate", { x: blocked.tx * TILE_SIZE + TILE_SIZE / 2, y: blocked.ty * TILE_SIZE + TILE_SIZE / 2 });
   await sleep(500);
   const after = whereAmI();
   const moved = after && parked ? Math.hypot(after.x - parked.x, after.y - parked.y) : 0;
+  const stayedInSight = Boolean(after && parked) &&
+    lineIsClear(parked.x + TILE_SIZE / 2, parked.y + TILE_SIZE / 2, after.x + TILE_SIZE / 2, after.y + TILE_SIZE / 2);
   console.log(`    aimed past a wall at (${blocked.tx},${blocked.ty}); moved ${Math.round(moved)}px`);
-  check("a jump through a wall is refused", moved < TILE_SIZE, `${Math.round(moved)}px`);
+  check("a jump aimed through a wall stops this side of it", stayedInSight, `${Math.round(moved)}px`);
 } else {
   console.log("    (no wall with open ground behind it in line — skipped)");
 }

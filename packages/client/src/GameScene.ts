@@ -150,6 +150,17 @@ const EAGLE_TILE_INDEX = (GRID_HEIGHT - 1) * GRID_WIDTH + Math.floor(GRID_WIDTH 
 /** Height of the fixed HUD bar, in base-resolution pixels. */
 const HUD_HEIGHT = 52;
 
+/**
+ * Left edges of the four top-bar fields, in base-resolution px.
+ *
+ * Minimums rather than fixed positions: a field wider than its column pushes
+ * the ones after it along — see {@link GameScene.reflowHud}.
+ */
+const HUD_COLUMNS = [24, 300, 660, 1020] as const;
+
+/** Least clear space between two top-bar fields, in px. */
+const HUD_FIELD_GAP = 48;
+
 const BULLET_SIZE = 8;
 
 /**
@@ -797,10 +808,10 @@ export class GameScene extends Phaser.Scene {
         .text(x, 12, "", { fontFamily: "monospace", fontSize: size, color: colour })
         .setDepth(11);
 
-    this.hudTime = field(24, "26px", "#f2c14e");
-    this.hudEnemies = field(300, "26px", "#e0483a");
-    this.hudEagle = field(660, "26px", "#8fa1b3");
-    this.hudPlayer = field(1020, "26px", "#4caf50");
+    this.hudTime = field(HUD_COLUMNS[0], "26px", "#f2c14e");
+    this.hudEnemies = field(HUD_COLUMNS[1], "26px", "#e0483a");
+    this.hudEagle = field(HUD_COLUMNS[2], "26px", "#8fa1b3");
+    this.hudPlayer = field(HUD_COLUMNS[3], "26px", "#4caf50");
 
     this.status = this.add
       .text(BASE_WIDTH - 24, 16, "connecting...", {
@@ -819,6 +830,24 @@ export class GameScene extends Phaser.Scene {
     this.hudCache.set(field, text);
     field.setText(text);
     if (colour) field.setColor(colour);
+  }
+
+  /**
+   * Lays the four top-bar fields out left to right by their measured widths.
+   *
+   * Fixed columns were fine while every readout was a few words. The relay
+   * hold's "HOLD THE RELAY: 90s - INTEGRITY 4/4" is wider than its column, and
+   * ran straight over the lives and hull pips beside it. Each field now starts
+   * at its column or just clear of the one before it, whichever is further.
+   */
+  private reflowHud(): void {
+    const fields = [this.hudTime, this.hudEnemies, this.hudEagle, this.hudPlayer];
+    let nextFree = 0;
+    fields.forEach((field, i) => {
+      const x = Math.max(HUD_COLUMNS[i]!, nextFree);
+      if (field.x !== x) field.setX(x);
+      nextFree = x + (field.text ? field.width + HUD_FIELD_GAP : 0);
+    });
   }
 
   /** Pulls the whole bar from state. Cheap enough to run every frame. */
@@ -2613,6 +2642,7 @@ export class GameScene extends Phaser.Scene {
       `LIVES ${state.lives}${pips}`,
       critical ? "#e0483a" : hurt ? "#f2c14e" : "#4caf50",
     );
+    this.reflowHud();
 
     // A Jammer on the field throttles the player's weapons — flash a warning so
     // the sluggish fire rate reads as an effect, not a bug.

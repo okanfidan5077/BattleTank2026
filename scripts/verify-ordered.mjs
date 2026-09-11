@@ -100,7 +100,9 @@ room.send("teleport");
 await sleep(400);
 check("blink is announced when spent", teleport !== null);
 check("spending one leaves a charge banked", teleport?.charges === 1, `charges=${teleport?.charges}`);
-check("the recharge is the long one", (teleport?.rechargeMs ?? 0) >= 30000,
+// Twenty seconds since the third round of play-testing; Coolant Loop can take
+// up to half of that off, so anything under half the base is a regression.
+check("the recharge is a real cooldown", (teleport?.rechargeMs ?? 0) >= TELEPORT_RECHARGE_MS * 0.5,
   `rechargeMs=${teleport?.rechargeMs}, constant=${TELEPORT_RECHARGE_MS}`);
 
 // Both charges spent, and it must stay spent for a good while.
@@ -159,7 +161,7 @@ const PASSABLE = new Set([0, 6, 7, 9, 10]);
  * only about half the time — so the test failed on its own navigation rather
  * than on anything it was meant to be checking. A real route removes that.
  */
-function routeTo(fromIndex, toIndex) {
+function routeTo(fromIndex, toIndex, avoid = -1) {
   const prev = new Map([[fromIndex, -1]]);
   const queue = [fromIndex];
 
@@ -176,6 +178,9 @@ function routeTo(fromIndex, toIndex) {
 
       const next = ny * GRID_WIDTH + nx;
       if (prev.has(next)) continue;
+      // A package is passable ground, so a route to one package could run over
+      // another — which collects it. Trips that must not do that name the tile.
+      if (next === avoid) continue;
       // The goal itself is always enterable, whatever is sitting on it.
       if (next !== toIndex && !PASSABLE.has(room.state.grid[next])) continue;
 
@@ -229,7 +234,7 @@ async function driveTo(index, budgetMs, opts = {}) {
         Math.round(self.y / TILE_SIZE) * GRID_WIDTH + Math.round(self.x / TILE_SIZE);
 
       if (!path || stuckFor > 600 || !path.includes(here)) {
-        path = routeTo(here, index);
+        path = routeTo(here, index, opts.avoid ?? -1);
         stuckFor = 0;
       }
 
@@ -259,7 +264,9 @@ async function driveTo(index, budgetMs, opts = {}) {
 }
 
 if (decoyIndex !== undefined) {
-  const reached = await driveTo(decoyIndex, 60000);
+  // Around the marked package, not over it: driving across it on the way
+  // collects it, and the checks below would then fail on the bot's route.
+  const reached = await driveTo(decoyIndex, 60000, { avoid: target });
   await sleep(500);
   const stillThere = room.state.grid[decoyIndex] === 10;
   console.log(`    drove to the unmarked package: reached=${reached}, still there=${stillThere}`);

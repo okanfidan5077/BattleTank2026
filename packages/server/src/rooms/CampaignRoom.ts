@@ -52,7 +52,9 @@ import {
   DECOY_LURE_CHANCE,
   rollDecoyLure,
   DECOY_DURATION_MS,
+  DECOY_MIN_COOLDOWN_MS,
   DECOY_UNLOCK_LEVEL,
+  DECOY_UPGRADE_MS,
   MOVE_DIRECTION_TO_FACING,
   NULLIFIER_RADIUS_TILES,
   RAM_COOLDOWN_MS,
@@ -968,8 +970,30 @@ const FOUNDRY_REPAIR_INTERVAL_MS = 1800;
  */
 const FOUNDRY_REPAIR_AMOUNT = 2;
 
-/** Gap between the starved Foundry's radial bursts, in ms. */
-const FOUNDRY_EXPOSED_SHOOT_MS = 2200;
+/** Gap between the starved Foundry's attacks, in ms. */
+const FOUNDRY_EXPOSED_SHOOT_MS = 1700;
+
+/**
+ * How fast the starved Foundry grinds toward the player, in px/s.
+ *
+ * It used to stay bolted to the middle of the floor once its intakes were
+ * down and fire the same four-way burst on a timer, which turned the finish
+ * into parking off its axes and shooting a stationary target. Torn off its
+ * mountings it crawls after the player through cover — slowly enough to
+ * outrun, never slowly enough to ignore.
+ */
+const FOUNDRY_CRAWL_SPEED = TANK_SPEED * (1000 / TICK_MS) * 0.3;
+
+/** Gap between the starved Foundry's salvage builds, in ms. */
+const FOUNDRY_SALVAGE_INTERVAL_MS = 9000;
+
+/**
+ * Multiplier on the starved Foundry's attack gap once it is below half health.
+ *
+ * Its crawl speeds up by the inverse, so the second half of the fight is
+ * noticeably faster than the first rather than the same loop twice.
+ */
+const FOUNDRY_WOUNDED_FACTOR = 0.7;
 
 // -------------------------------------------------------------------- choir
 
@@ -1028,11 +1052,32 @@ const LEVIATHAN_SURFACED_MS = 6000;
 /** How long it stays under and untouchable, in ms. */
 const LEVIATHAN_SUBMERGED_MS = 3200;
 
-/** How far ahead of surfacing the impact point is marked, in ms. */
-const LEVIATHAN_TELL_MS = 1200;
+/**
+ * How far ahead of surfacing the impact point is marked, in ms.
+ *
+ * Long enough to get a hull clear of a three-tile footprint from its middle.
+ */
+const LEVIATHAN_TELL_MS = 1500;
 
-/** How far from the player it comes up, in tiles. */
-const LEVIATHAN_SURFACE_TILES = 3;
+/**
+ * How far from the marked point it will look for room to surface, in tiles.
+ *
+ * It comes up on the mark — centred where the player was standing when the
+ * mark went down. It used to come up on a ring a few tiles out from wherever
+ * the player was at the moment of surfacing, while the mark was drawn on the
+ * player: the warning pointed at one place, the hull arrived beside it, and
+ * the only way to dodge was to guess. The search only matters when the mark
+ * lands on coolant; it never moves the surfacing point further than this.
+ */
+const LEVIATHAN_SURFACE_SEARCH_TILES = 4;
+
+/**
+ * How long it holds still after surfacing before the chase resumes, in ms.
+ *
+ * A player who stepped off the mark in time should not be run down by the
+ * same lunge that just missed them.
+ */
+const LEVIATHAN_RISE_PAUSE_MS = 700;
 
 // ---------------------------------------------------------------------------
 // Act 4 units
@@ -1160,6 +1205,11 @@ interface BossState {
   altTimerMs: number;
   markHp: number;
   flag: boolean;
+  /** Which attack in a rotation fires next — the starved Foundry's. */
+  pattern: number;
+  /** A point the boss has committed to — the Leviathan's marked surfacing spot. */
+  aimX: number;
+  aimY: number;
 }
 
 interface AbilityState {
@@ -1277,7 +1327,24 @@ export class CampaignRoom extends Room<CampaignState> {
   private readonly markedIds = new Set<string>();
 
   /** Marked targets kept on the field at once on a purge level. */
-  private static readonly PURGE_MARKS = 3;
+  private static readonly PURGE_MARKS = 2;
+
+  /**
+   * Gap between one mark going up and the next, in ms.
+   *
+   * Marks used to be handed out the instant a slot opened, so the whole quota
+   * was lit from the first second and a purge of six was over in fifteen: the
+   * player shot the rings nearest them, and fresh ones lit up beside the
+   * wrecks. Pacing them makes the level last about as long as its count says,
+   * and makes every new mark something to go and find.
+   */
+  private static readonly PURGE_MARK_INTERVAL_MS = 6000;
+
+  /** How long into a purge level the first mark goes up, in ms. */
+  private static readonly PURGE_FIRST_MARK_MS = 3000;
+
+  /** ms until the next mark may be handed out on a purge level. */
+  private purgeMarkCooldownMs = 0;
 
   /** ownerId -> ms accumulated toward a Sentinel's next shot. */
   private readonly sentinelTimers = new Map<string, number>();
@@ -1718,6 +1785,7 @@ export class CampaignRoom extends Room<CampaignState> {
     this.bombTimerMs = bombSecondsForLevel(this.state.currentLevel) * 1000;
     this.objectiveMet = false;
     this.markedKilled = 0;
+    this.purgeMarkCooldownMs = CampaignRoom.PURGE_FIRST_MARK_MS;
     this.relayHitsLeft = RELAY_HITS;
     this.objectiveOrder = [];
     this.state.objectiveTargetTile = -1;
@@ -1822,7 +1890,7 @@ export class CampaignRoom extends Room<CampaignState> {
       case BossKind.Artillery: this.spawnArtillery(index, total); break;
       case BossKind.Warden: this.spawnWarden(); break;
       case BossKind.Bastion: this.spawnBastion(); break;
-      case BossKind.Hydra: this.spawnHydra(); break;
+      case BossKind.Hydra: this.spawnHydra(index, total); break;
       case BossKind.Architect: this.spawnArchitect(); break;
       case BossKind.Effigy: this.spawnEffigy(); break;
       case BossKind.Juggernaut: this.spawnJuggernaut(); break;
@@ -2053,15 +2121,21 @@ export class CampaignRoom extends Room<CampaignState> {
     );
   }
 
-  /** Spawns the Level 18 Hydra at its largest tier, centre-north. */
-  private spawnHydra(): void {
+  /**
+   * Spawns a Hydra at its largest tier along the top of the map.
+   *
+   * `index` and `total` spread a pair out, as for every other multi-body wave:
+   * two three-tile hulls dropped on the same entry point would spend the
+   * opening seconds ploughing into each other instead of into the arena.
+   */
+  private spawnHydra(index = 0, total = 1): void {
     const tier = HYDRA_TIERS[0]!;
     const id = `boss-${this.enemySequence++}`;
-    this.bossId = id;
+    if (index === 0) this.bossId = id;
 
     this.state.tanks.push(
       new Tank({
-        x: centredSpawnX(tier.size),
+        x: this.bossEntryX(tier.size, index, total),
         y: 5 * TILE_SIZE,
         width: tier.size,
         height: tier.size,
@@ -2594,8 +2668,9 @@ export class CampaignRoom extends Room<CampaignState> {
     this.moveCore(deltaMs);
 
     // A kamikaze reaching the player, the boss running it over, a mine, or a
-    // mortar landing on the player is lethal.
-    this.resolveKamikaze();
+    // mortar landing on the player is lethal. A kamikaze reaching the relay or
+    // the carrier fails the level outright, which ends the tick.
+    if (this.resolveKamikaze()) return;
     this.resolveSweeperContact();
     this.resolveMines();
     this.expireMines();
@@ -2691,7 +2766,7 @@ export class CampaignRoom extends Room<CampaignState> {
       this.collectIntelUnderPlayer();
     }
 
-    this.refreshPurgeMarks();
+    this.refreshPurgeMarks(deltaMs);
     this.syncObjectiveTarget();
     this.refreshObjective();
     if (this.checkObjectiveFailure()) return;
@@ -2780,7 +2855,17 @@ export class CampaignRoom extends Room<CampaignState> {
   private bossState(ownerId: string): BossState {
     let state = this.bossStates.get(ownerId);
     if (!state) {
-      state = { vx: 0, vy: 0, timerMs: 0, altTimerMs: 0, markHp: 0, flag: false };
+      state = {
+        vx: 0,
+        vy: 0,
+        timerMs: 0,
+        altTimerMs: 0,
+        markHp: 0,
+        flag: false,
+        pattern: 0,
+        aimX: 0,
+        aimY: 0,
+      };
       this.bossStates.set(ownerId, state);
     }
     return state;
@@ -3826,13 +3911,20 @@ export class CampaignRoom extends Room<CampaignState> {
     if (this.effigyDecoyCdMs > 0) return;
     if (dist > EFFIGY_DECOY_TRIGGER_TILES * TILE_SIZE) return;
 
+    // Beside the boss, never on it. Dropped on the boss's own footprint the
+    // two hulls overlapped, and since movement refuses any step that touches
+    // another hull, neither could move again until the mirage faded — the
+    // Effigy sat frozen inside its own decoy for the whole six seconds.
+    const spot = this.mirageSpot(boss);
+    if (!spot) return;
+
     this.effigyDecoyCdMs = EFFIGY_DECOY_COOLDOWN_MS;
 
     const id = `mirage-${this.enemySequence++}`;
     this.state.tanks.push(
       new Tank({
-        x: boss.x,
-        y: boss.y,
+        x: spot.x,
+        y: spot.y,
         width: boss.width,
         height: boss.height,
         ownerId: id,
@@ -3844,6 +3936,56 @@ export class CampaignRoom extends Room<CampaignState> {
       }),
     );
     this.effigyMirages.set(id, EFFIGY_DECOY_DURATION_MS);
+  }
+
+  /**
+   * An open, tile-aligned spot beside `boss` for a mirage, or null.
+   *
+   * Searched in rings outward from the boss, taking the spot in each ring that
+   * is nearest the player — the mirage is meant to be walked into, so it goes
+   * between them rather than behind the boss.
+   */
+  private mirageSpot(boss: Tank): { x: number; y: number } | null {
+    const baseX = Math.round(boss.x / TILE_SIZE) * TILE_SIZE;
+    const baseY = Math.round(boss.y / TILE_SIZE) * TILE_SIZE;
+    const maxX = WORLD_WIDTH - boss.width;
+    const maxY = WORLD_HEIGHT - boss.height;
+    const player = this.nearestPlayerTo(boss);
+
+    for (let ring = 1; ring <= 3; ring++) {
+      let best: { x: number; y: number } | null = null;
+      let bestDistance = Infinity;
+
+      for (let dy = -ring; dy <= ring; dy++) {
+        for (let dx = -ring; dx <= ring; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue;
+
+          const x = baseX + dx * TILE_SIZE;
+          const y = baseY + dy * TILE_SIZE;
+          if (x < 0 || y < 0 || x > maxX || y > maxY) continue;
+          if (isBlocked(this.state, x, y, boss.width, boss.height)) continue;
+          if (this.hullAt(x, y, boss.width, boss.height)) continue;
+
+          const distance = player ? Math.hypot(player.x - x, player.y - y) : 0;
+          if (distance < bestDistance) {
+            best = { x, y };
+            bestDistance = distance;
+          }
+        }
+      }
+      if (best) return best;
+    }
+
+    return null;
+  }
+
+  /** True when any hull at all — the asker's own included — overlaps the box. */
+  private hullAt(x: number, y: number, w: number, h: number): boolean {
+    for (let i = 0; i < this.state.tanks.length; i++) {
+      const tank = this.state.tanks.at(i);
+      if (boxesOverlap(x, y, w, h, tank.x, tank.y, tank.width, tank.height)) return true;
+    }
+    return false;
   }
 
   /** Fades out any mirage that has outlived its duration. */
@@ -4542,9 +4684,15 @@ export class CampaignRoom extends Room<CampaignState> {
    * than clearing it: shooting an unmarked one costs the ammunition and the
    * time and nothing else. Marks are handed out to whatever is currently on the
    * field, which means they move around as the fight goes on.
+   *
+   * One at a time, {@link PURGE_MARK_INTERVAL_MS} apart, and on whichever hull
+   * is furthest from every player — so each new mark is a trip across the
+   * field rather than the tank beside the one just killed.
    */
-  private refreshPurgeMarks(): void {
+  private refreshPurgeMarks(deltaMs: number): void {
     if (this.currentWinCondition() !== CampaignWinCondition.PurgeMarked) return;
+
+    this.purgeMarkCooldownMs = Math.max(0, this.purgeMarkCooldownMs - deltaMs);
 
     // Enough marks alive at once to be findable, but never so many that the
     // level collapses into "shoot everything".
@@ -4558,9 +4706,11 @@ export class CampaignRoom extends Room<CampaignState> {
     for (const ownerId of [...this.markedIds]) {
       if (!this.findTank(ownerId)) this.markedIds.delete(ownerId);
     }
-    if (this.markedIds.size >= wanted) return;
+    if (this.markedIds.size >= wanted || this.purgeMarkCooldownMs > 0) return;
 
-    for (let i = 0; i < this.state.tanks.length && this.markedIds.size < wanted; i++) {
+    let pick: Tank | null = null;
+    let pickDistance = -1;
+    for (let i = 0; i < this.state.tanks.length; i++) {
       const tank = this.state.tanks.at(i);
       if (!tank.isEnemy || tank.isBoss) continue;
       if (this.markedIds.has(tank.ownerId)) continue;
@@ -4568,9 +4718,22 @@ export class CampaignRoom extends Room<CampaignState> {
       // one would give the disguise away for free.
       if (tank.isDisguised) continue;
 
-      this.markedIds.add(tank.ownerId);
-      tank.isMarked = true;
+      const cx = tank.x + tank.width / 2;
+      const cy = tank.y + tank.height / 2;
+      const player = this.nearestPlayer(cx, cy);
+      const distance = player
+        ? Math.hypot(player.x + player.width / 2 - cx, player.y + player.height / 2 - cy)
+        : 0;
+      if (distance > pickDistance) {
+        pick = tank;
+        pickDistance = distance;
+      }
     }
+    if (!pick) return;
+
+    this.markedIds.add(pick.ownerId);
+    pick.isMarked = true;
+    this.purgeMarkCooldownMs = CampaignRoom.PURGE_MARK_INTERVAL_MS;
   }
 
   /** Writes the objective fields, skipping the patch when nothing changed. */
@@ -4616,13 +4779,24 @@ export class CampaignRoom extends Room<CampaignState> {
    * player both explode, the player loses a life, and the blast chews a 3x3 hole
    * in the destructible cover around the impact. Skipped while the player is in
    * respawn grace, matching how shells pass through an invulnerable tank.
+   *
+   * A rusher that reaches the relay on a hold, or the allied carrier, goes off
+   * on that instead and takes it with it. Both used to shrug a rusher off — the
+   * relay only counted shells, and the carrier took one point of contact damage
+   * from it like any other hull — which made the one unit built to be stopped
+   * at all costs the one the player could safely let through.
+   *
+   * Returns true when that failed the level: the world the rest of the tick
+   * was working on has just been rebuilt.
    */
-  private resolveKamikaze(): void {
+  private resolveKamikaze(): boolean {
     const pad = KAMIKAZE_CONTACT_PADDING;
 
     for (let i = this.state.tanks.length - 1; i >= 0; i--) {
       const enemy = this.state.tanks.at(i);
       if (!enemy.isEnemy || enemy.variant !== KAMIKAZE) continue;
+
+      if (this.kamikazeHitsObjective(enemy)) return true;
 
       // A rusher detonates on whoever it actually reached.
       const player = this.nearestPlayerTo(enemy);
@@ -4655,8 +4829,73 @@ export class CampaignRoom extends Room<CampaignState> {
       if (playerIndex >= 0) this.state.tanks.splice(playerIndex, 1);
       this.onTankDestroyed(player);
 
-      return; // the player is gone; no further contact to resolve this tick
+      return false; // the player is gone; no further contact to resolve this tick
     }
+    return false;
+  }
+
+  /**
+   * Sets `rusher` off on the relay or the allied carrier, if it has reached
+   * either. Returns true when that cost the level.
+   */
+  private kamikazeHitsObjective(rusher: Tank): boolean {
+    const pad = KAMIKAZE_CONTACT_PADDING;
+    const rx = rusher.x - pad;
+    const ry = rusher.y - pad;
+    const rw = rusher.width + pad * 2;
+    const rh = rusher.height + pad * 2;
+    const win = this.currentWinCondition();
+
+    if (win === CampaignWinCondition.DefendCore) {
+      let reached = false;
+      for (let index = 0; index < GRID_LENGTH && !reached; index++) {
+        if (this.state.grid.at(index) !== TileType.EagleBase) continue;
+        const tx = (index % GRID_WIDTH) * TILE_SIZE;
+        const ty = Math.floor(index / GRID_WIDTH) * TILE_SIZE;
+        reached = boxesOverlap(rx, ry, rw, rh, tx, ty, TILE_SIZE, TILE_SIZE);
+      }
+      if (!reached) return false;
+
+      this.detonateRusher(rusher);
+      // Level the whole mast, so a game over leaves it visibly gone.
+      for (let index = 0; index < GRID_LENGTH; index++) {
+        if (this.state.grid.at(index) === TileType.EagleBase) this.state.grid[index] = TileType.Empty;
+      }
+      this.relayHitsLeft = 0;
+      this.failLevel("relay destroyed by a rusher");
+      return true;
+    }
+
+    if (
+      (win === CampaignWinCondition.Escort || win === CampaignWinCondition.PushPayload) &&
+      this.convoyId
+    ) {
+      const convoy = this.findTank(this.convoyId);
+      if (!convoy) return false;
+      if (!boxesOverlap(rx, ry, rw, rh, convoy.x, convoy.y, convoy.width, convoy.height)) return false;
+
+      this.detonateRusher(rusher);
+      convoy.currentHealth = 0;
+      const index = this.state.tanks.indexOf(convoy);
+      if (index >= 0) this.state.tanks.splice(index, 1);
+      this.broadcast(ServerMessage.TankDestroyed, {
+        x: convoy.x + convoy.width / 2,
+        y: convoy.y + convoy.height / 2,
+        isEnemy: false,
+        heavy: true,
+      } satisfies TankDestroyedMessage);
+      this.loseConvoy();
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Takes a rusher off the field in its own explosion. */
+  private detonateRusher(rusher: Tank): void {
+    const index = this.state.tanks.indexOf(rusher);
+    if (index >= 0) this.state.tanks.splice(index, 1);
+    this.onTankDestroyed(rusher);
   }
 
   /** Clears Brick and Radar tiles in the 3x3 block around a world point. */
@@ -5584,7 +5823,18 @@ export class CampaignRoom extends Room<CampaignState> {
 
   /** Decoy beacon lifetime after Loud Beacon. */
   private decoyDuration(ownerId: string): number {
-    return DECOY_DURATION_MS + 4000 * this.upgradeCount(ownerId, "decoyup");
+    return DECOY_DURATION_MS + DECOY_UPGRADE_MS * this.upgradeCount(ownerId, "decoyup");
+  }
+
+  /**
+   * Decoy cooldown after Coolant Loop, held to {@link DECOY_MIN_COOLDOWN_MS}.
+   *
+   * The one cooldown floored above what Coolant Loop alone would give: it only
+   * starts once the beacon goes out, so a long beacon on a short cooldown kept
+   * one standing most of the time.
+   */
+  private decoyCooldown(ownerId: string): number {
+    return Math.max(DECOY_MIN_COOLDOWN_MS, this.cooled(ownerId, DECOY_COOLDOWN_MS));
   }
 
   /**
@@ -6047,12 +6297,12 @@ export class CampaignRoom extends Room<CampaignState> {
         abilities.decoy.remainingMs -= deltaMs;
         if (abilities.decoy.remainingMs <= 0) {
           abilities.decoy = null;
-          abilities.decoyCooldownMs = this.cooled(ownerId, DECOY_COOLDOWN_MS);
+          abilities.decoyCooldownMs = this.decoyCooldown(ownerId);
           if (!this.hasDecoy()) this.luredIds.clear();
           // Attention snaps back to the players the moment it goes out.
           this.rebuildFields();
           this.sendTo(ownerId, ServerMessage.DecoyChanged, {
-            cooldownMs: this.cooled(ownerId, DECOY_COOLDOWN_MS),
+            cooldownMs: this.decoyCooldown(ownerId),
           } satisfies DecoyChangedMessage);
         }
         continue;
@@ -6341,8 +6591,8 @@ export class CampaignRoom extends Room<CampaignState> {
    *
    * A click a tile or so inside a wall lands beside it rather than being
    * refused: at this range that is a near miss, not a different intention. A
-   * click deep inside one is refused and keeps the cooldown, because landing
-   * several tiles from where someone pointed is worse than not going.
+   * click the tank cannot see, or cannot fit on, jumps as far along that line
+   * as it can instead — see {@link translocateAlongLine}.
    */
   private translocate(ownerId: string, payload: unknown): void {
     if (!this.translocateUnlocked()) return;
@@ -6356,9 +6606,6 @@ export class CampaignRoom extends Room<CampaignState> {
     if (!player || this.abilitiesSuppressed(player)) return;
     if (!isAimedMessage(payload)) return;
 
-    const spot = this.translocateSpot(player, payload.x, payload.y);
-    if (!spot) return;
-
     // It only reaches somewhere the tank can actually see. Without that rule a
     // map-wide jump answered every level built around crossing ground — walk to
     // the extraction pad in particular stopped being a level at all, because
@@ -6366,7 +6613,15 @@ export class CampaignRoom extends Room<CampaignState> {
     //
     // Coolant and open ground do not block the line, so it still crosses a
     // river or a room; walls do, so a route still has to be driven.
+    //
+    // A click past a wall is not refused, though: the jump goes as far along
+    // that line as the tank can see and lands this side of the wall. Refusing
+    // outright meant most clicks did nothing — on a built-up map nearly any
+    // point worth jumping to has something in front of it — and a click that
+    // silently kept its cooldown read as the button being broken.
+    let spot = this.translocateSpot(player, payload.x, payload.y);
     if (
+      !spot ||
       !this.hasClearLine(
         player.x + player.width / 2,
         player.y + player.height / 2,
@@ -6374,8 +6629,9 @@ export class CampaignRoom extends Room<CampaignState> {
         spot.y + player.height / 2,
       )
     ) {
-      return;
+      spot = this.translocateAlongLine(player, payload.x, payload.y);
     }
+    if (!spot) return;
 
     const fromX = player.x;
     const fromY = player.y;
@@ -6430,6 +6686,44 @@ export class CampaignRoom extends Room<CampaignState> {
           return { x, y };
         }
       }
+    }
+
+    return null;
+  }
+
+  /**
+   * The furthest spot toward `(worldX, worldY)` the tank can see and fit on.
+   *
+   * Walks back from the aim point toward the tank in half-tile steps and takes
+   * the first tile-aligned spot that is open and in sight — so a click behind
+   * a wall lands just this side of it. Null when nothing along the line is at
+   * least a tile away, which leaves the jump unspent.
+   */
+  private translocateAlongLine(
+    player: Tank,
+    worldX: number,
+    worldY: number,
+  ): { x: number; y: number } | null {
+    const fromX = player.x + player.width / 2;
+    const fromY = player.y + player.height / 2;
+    const dx = worldX - fromX;
+    const dy = worldY - fromY;
+    const dist = Math.hypot(dx, dy);
+    if (dist < TILE_SIZE) return null;
+
+    const maxX = WORLD_WIDTH - player.width;
+    const maxY = WORLD_HEIGHT - player.height;
+    const snap = (value: number, limit: number): number =>
+      Math.max(0, Math.min(limit, Math.round(value / TILE_SIZE) * TILE_SIZE));
+
+    for (let travelled = dist; travelled >= TILE_SIZE; travelled -= TILE_SIZE / 2) {
+      const x = snap(fromX + (dx / dist) * travelled - player.width / 2, maxX);
+      const y = snap(fromY + (dy / dist) * travelled - player.height / 2, maxY);
+      if (Math.hypot(x - player.x, y - player.y) < TILE_SIZE) continue;
+      if (isBlocked(this.state, x, y, player.width, player.height)) continue;
+      if (collidesWithTank(this.state, player, x, y)) continue;
+      if (!this.hasClearLine(fromX, fromY, x + player.width / 2, y + player.height / 2)) continue;
+      return { x, y };
     }
 
     return null;
@@ -7506,10 +7800,12 @@ export class CampaignRoom extends Room<CampaignState> {
   /**
    * Runs the Foundry: build while sealed, patch itself, fight once starved.
    *
-   * The repair is the whole encounter. While any intake is running it knits
-   * plating back on faster than a player can chip it off, so the fight cannot
-   * be brute-forced; with the intakes gone the repair stops and the boss has
-   * nothing left but a hull and a gun.
+   * The repair is the whole of the first half. While any intake is running it
+   * knits plating back on faster than a player can chip it off, so the fight
+   * cannot be brute-forced. With the intakes gone the repair stops and the
+   * Foundry tears itself off its mountings: it crawls after the player through
+   * cover, rotates between three attacks, and keeps scavenging the odd hull —
+   * so the finish is a fight on the move rather than a stationary target.
    */
   private tickFoundry(deltaMs: number): void {
     for (const boss of this.bossesOf(FOUNDRY)) {
@@ -7521,27 +7817,7 @@ export class CampaignRoom extends Room<CampaignState> {
         // Production: a tank at a time, and only while there is room for it.
         if (state.timerMs >= FOUNDRY_BUILD_INTERVAL_MS) {
           state.timerMs -= FOUNDRY_BUILD_INTERVAL_MS;
-
-          if (this.countStandardEnemies() < this.maxEnemies()) {
-            const spawn = this.edgeSpawnPoint();
-            if (spawn) {
-              const profile = this.variantProfile(EnemyVariant.Standard);
-              this.state.tanks.push(
-                new Tank({
-                  x: spawn.x,
-                  y: spawn.y,
-                  width: TANK_SIZE,
-                  height: TANK_SIZE,
-                  ownerId: `enemy-${this.enemySequence++}`,
-                  maxHealth: profile.maxHealth,
-                  speed: profile.speed,
-                  direction: Direction.Down,
-                  isEnemy: true,
-                  variant: EnemyVariant.Standard,
-                }),
-              );
-            }
-          }
+          this.foundryBuild();
         }
 
         // Patch. Never past full, and never while starved.
@@ -7553,13 +7829,104 @@ export class CampaignRoom extends Room<CampaignState> {
         continue;
       }
 
-      // Starved: it stops building and starts shooting, in every direction at
-      // once, because it has no turret and never needed one.
-      if (state.timerMs >= FOUNDRY_EXPOSED_SHOOT_MS) {
-        state.timerMs -= FOUNDRY_EXPOSED_SHOOT_MS;
-        if (!this.isSuppressed(boss)) this.fireRadialWave(boss, 1);
+      if (this.isSuppressed(boss)) continue;
+
+      const wounded = boss.currentHealth <= boss.maxHealth / 2;
+      const player = this.nearestPlayerTo(boss);
+      if (player) {
+        this.crawlFoundry(boss, player, deltaMs, wounded);
+        if (this.state.phase !== CampaignPhase.Playing) return;
+      }
+
+      const interval = Math.round(
+        FOUNDRY_EXPOSED_SHOOT_MS * (wounded ? FOUNDRY_WOUNDED_FACTOR : 1),
+      );
+      if (state.timerMs >= interval) {
+        // Never bank a second attack: the intakes falling mid-build, or a
+        // pulse holding it, can leave far more than one interval on the clock.
+        state.timerMs = Math.min(state.timerMs - interval, interval / 2);
+        this.fireFoundryPattern(boss, player, state);
+      }
+
+      // It still builds, from whatever it can scavenge — slower than the line
+      // ran, but enough that a player circling it is never alone with it.
+      state.altTimerMs += deltaMs;
+      if (state.altTimerMs >= FOUNDRY_SALVAGE_INTERVAL_MS) {
+        state.altTimerMs -= FOUNDRY_SALVAGE_INTERVAL_MS;
+        this.foundryBuild();
       }
     }
+  }
+
+  /** One hull off the Foundry's line, if there is room on the field for it. */
+  private foundryBuild(): void {
+    if (this.countStandardEnemies() >= this.maxEnemies()) return;
+    const spawn = this.edgeSpawnPoint();
+    if (!spawn) return;
+
+    const profile = this.variantProfile(EnemyVariant.Standard);
+    this.state.tanks.push(
+      new Tank({
+        x: spawn.x,
+        y: spawn.y,
+        width: TANK_SIZE,
+        height: TANK_SIZE,
+        ownerId: `enemy-${this.enemySequence++}`,
+        maxHealth: profile.maxHealth,
+        speed: profile.speed,
+        direction: Direction.Down,
+        isEnemy: true,
+        variant: EnemyVariant.Standard,
+      }),
+    );
+  }
+
+  /** The starved Foundry's crawl: straight at the player, through cover. */
+  private crawlFoundry(boss: Tank, player: Tank, deltaMs: number, wounded: boolean): void {
+    const cx = boss.x + boss.width / 2;
+    const cy = boss.y + boss.height / 2;
+    const angle = Math.atan2(player.y + player.height / 2 - cy, player.x + player.width / 2 - cx);
+    const speed = FOUNDRY_CRAWL_SPEED / (wounded ? FOUNDRY_WOUNDED_FACTOR : 1);
+    const dt = deltaMs / 1000;
+
+    const nextX = boss.x + Math.cos(angle) * speed * dt;
+    if (!this.sweeperHitsWall(nextX, boss.y, boss.width, boss.height)) boss.x = nextX;
+    const nextY = boss.y + Math.sin(angle) * speed * dt;
+    if (!this.sweeperHitsWall(boss.x, nextY, boss.width, boss.height)) boss.y = nextY;
+    boss.direction = this.angleToDirection(angle);
+
+    if (this.crushJuggernautTiles(boss.x, boss.y, boss.width, boss.height)) {
+      this.rebuildFields();
+    }
+    this.crushEnemies(boss);
+    this.crushPlayersUnder(boss);
+  }
+
+  /**
+   * One of the starved Foundry's three attacks, in rotation.
+   *
+   * A single-file burst down all four axes, then a five-wide wall of fast
+   * shells from whichever face looks at the player, then a triple-width burst
+   * down all four. Standing on an axis is punished by the first and last,
+   * standing off one by the second, so no one square is safe for the whole
+   * fight and the player has to read which one is coming.
+   */
+  private fireFoundryPattern(boss: Tank, player: Tank | undefined, state: BossState): void {
+    const pattern = state.pattern % 3;
+    state.pattern++;
+
+    if (pattern === 1 && player) {
+      const dx = player.x + player.width / 2 - (boss.x + boss.width / 2);
+      const dy = player.y + player.height / 2 - (boss.y + boss.height / 2);
+      const face =
+        Math.abs(dx) >= Math.abs(dy)
+          ? dx >= 0 ? Direction.Right : Direction.Left
+          : dy >= 0 ? Direction.Down : Direction.Up;
+      this.fireRadialWave(boss, 5, face, 1.25);
+      return;
+    }
+
+    this.fireRadialWave(boss, pattern === 2 ? 3 : 1);
   }
 
   // ==========================================================================
@@ -7734,31 +8101,42 @@ export class CampaignRoom extends Room<CampaignState> {
       state.timerMs -= deltaMs;
 
       if (boss.isCloaked) {
-        // Mark the surfacing point one beat before it arrives.
+        // Commit to the surfacing point one beat before it arrives, and mark
+        // it. The mark is exactly where it comes up, so stepping off the mark
+        // is the whole of the dodge.
         if (!state.flag && state.timerMs <= LEVIATHAN_TELL_MS) {
+          const spot = this.leviathanSurfacePoint(boss);
           state.flag = true;
-          const target = this.nearestPlayerTo(boss);
-          if (target) {
-            this.broadcast(ServerMessage.MortarWarning, {
-              x: target.x + target.width / 2,
-              y: target.y + target.height / 2,
-              delay: LEVIATHAN_TELL_MS,
-              radius: LEVIATHAN_SIZE / 2,
-            } satisfies MortarWarningMessage);
-          }
+          state.aimX = spot?.x ?? boss.x;
+          state.aimY = spot?.y ?? boss.y;
+          this.broadcast(ServerMessage.MortarWarning, {
+            x: state.aimX + boss.width / 2,
+            y: state.aimY + boss.height / 2,
+            delay: LEVIATHAN_TELL_MS,
+            // Out to the corners of the hull, not just its inscribed circle.
+            radius: Math.round(LEVIATHAN_SIZE * 0.7),
+          } satisfies MortarWarningMessage);
         }
 
         if (state.timerMs > 0) continue;
 
-        const spot = this.leviathanSurfacePoint(boss);
-        if (spot) {
-          boss.x = spot.x;
-          boss.y = spot.y;
+        if (state.flag) {
+          boss.x = state.aimX;
+          boss.y = state.aimY;
         }
         boss.isCloaked = false;
         state.flag = false;
         state.timerMs = LEVIATHAN_SURFACED_MS;
+        state.altTimerMs = LEVIATHAN_RISE_PAUSE_MS;
         this.onSweeperBounce(boss);
+
+        // Coming up is the attack: whatever is still on the mark is under it.
+        if (this.crushJuggernautTiles(boss.x, boss.y, boss.width, boss.height)) {
+          this.rebuildFields();
+        }
+        this.crushEnemies(boss);
+        this.crushPlayersUnder(boss);
+        if (this.state.phase !== CampaignPhase.Playing) return;
         continue;
       }
 
@@ -7770,6 +8148,13 @@ export class CampaignRoom extends Room<CampaignState> {
       }
 
       if (this.isSuppressed(boss)) continue;
+
+      // A beat to get its bearings after coming up, so a player who has just
+      // stepped off the mark is not run down by the same lunge.
+      if (state.altTimerMs > 0) {
+        state.altTimerMs = Math.max(0, state.altTimerMs - deltaMs);
+        continue;
+      }
 
       // Surfaced: a slow, heavy chase that ploughs through cover.
       const player = this.nearestPlayerTo(boss);
@@ -7804,20 +8189,21 @@ export class CampaignRoom extends Room<CampaignState> {
   }
 
   /**
-   * Where the Leviathan comes back up: open ground near a player.
+   * Where the Leviathan will come back up: centred on the nearest player.
    *
-   * Falls back to holding station rather than surfacing inside terrain — the
-   * arena is mostly coolant and a boss that materialised in it would be stuck
-   * there for the rest of the level.
+   * Searched outward from there only when that exact spot is coolant or wall,
+   * and never further than {@link LEVIATHAN_SURFACE_SEARCH_TILES} — the arena
+   * is mostly coolant, and a boss that materialised in it would be stuck there
+   * for the rest of the level. Null holds it where it went down.
    */
   private leviathanSurfacePoint(boss: Tank): { x: number; y: number } | null {
     const player = this.nearestPlayerTo(boss);
     if (!player) return null;
 
-    const tileX = Math.floor((player.x + player.width / 2) / TILE_SIZE);
-    const tileY = Math.floor((player.y + player.height / 2) / TILE_SIZE);
+    const tileX = Math.round((player.x + player.width / 2 - boss.width / 2) / TILE_SIZE);
+    const tileY = Math.round((player.y + player.height / 2 - boss.height / 2) / TILE_SIZE);
 
-    for (let radius = LEVIATHAN_SURFACE_TILES; radius <= LEVIATHAN_SURFACE_TILES + 5; radius++) {
+    for (let radius = 0; radius <= LEVIATHAN_SURFACE_SEARCH_TILES; radius++) {
       const ring: Array<[number, number]> = [];
       for (let dy = -radius; dy <= radius; dy++) {
         for (let dx = -radius; dx <= radius; dx++) {
@@ -7842,13 +8228,32 @@ export class CampaignRoom extends Room<CampaignState> {
     return null;
   }
 
+  /** Kills every player whose hull `boss` is overlapping. */
+  private crushPlayersUnder(boss: Tank): void {
+    for (const target of this.playerTanks()) {
+      if (target.isInvulnerable) continue;
+      if (
+        boxesOverlap(boss.x, boss.y, boss.width, boss.height, target.x, target.y, target.width, target.height)
+      ) {
+        this.killPlayer(target.ownerId);
+      }
+    }
+  }
+
   /**
    * Fires shells outward along all four cardinals.
    *
    * Shared by the Foundry and anything else that wants a plain omnidirectional
    * burst; the Logic Core keeps its own, because its waves are tuned per phase.
+   * Pass `only` to fire from a single face — an aimed volley rather than a
+   * burst — and `speedFactor` to hurry the shells along.
    */
-  private fireRadialWave(boss: Tank, perDirection: number): void {
+  private fireRadialWave(
+    boss: Tank,
+    perDirection: number,
+    only?: Direction,
+    speedFactor = 1,
+  ): void {
     const cx = boss.x + boss.width / 2;
     const cy = boss.y + boss.height / 2;
     const halfBullet = BULLET_SIZE / 2;
@@ -7862,6 +8267,7 @@ export class CampaignRoom extends Room<CampaignState> {
     ];
 
     for (const { dir, hx, hy, px, py } of directions) {
+      if (only !== undefined && dir !== only) continue;
       for (let n = 0; n < perDirection; n++) {
         const offset = n - (perDirection - 1) / 2;
         this.state.bullets.push(
@@ -7873,7 +8279,7 @@ export class CampaignRoom extends Room<CampaignState> {
             ownerId: boss.ownerId,
             damage: BULLET_DAMAGE,
             direction: dir,
-            speed: ENEMY_PROFILE.bulletSpeed,
+            speed: ENEMY_PROFILE.bulletSpeed * speedFactor,
             isEnemy: true,
             piercesSteel: false,
           }),
@@ -8100,7 +8506,7 @@ export class CampaignRoom extends Room<CampaignState> {
     abilities.shieldCooldownMs = this.cooled(ownerId, SHIELD_COOLDOWN_MS);
     abilities.blastCooldownMs = this.cooled(ownerId, BLAST_COOLDOWN_MS);
     abilities.ramCooldownMs = this.cooled(ownerId, RAM_COOLDOWN_MS);
-    abilities.decoyCooldownMs = this.cooled(ownerId, DECOY_COOLDOWN_MS);
+    abilities.decoyCooldownMs = this.decoyCooldown(ownerId);
     abilities.strikeCooldownMs = this.cooled(ownerId, STRIKE_COOLDOWN_MS);
     abilities.empCooldownMs = this.cooled(ownerId, EMP_COOLDOWN_MS);
     abilities.laserCooldownMs = this.cooled(ownerId, LASER_COOLDOWN_MS);
@@ -8206,34 +8612,38 @@ export class CampaignRoom extends Room<CampaignState> {
       }
       this.reclaimerTimers.set(crew.ownerId, 0);
 
-      // Rebuild on the nearest empty tile that used to carry the structure —
-      // approximated as any empty tile in reach that is not under a hull.
+      // Rebuild the nearest levelled piece of the level's own structures — and
+      // only ever a tile that carried one when the level began. It used to take
+      // any empty tile in reach, which with two crews on the field meant fresh
+      // factories sprouting wherever they happened to drive: the count climbed
+      // faster than the player could bring it down, on open ground that had
+      // never held a factory at all.
+      const original = this.level()?.mapGrid;
+      if (!original) return;
+
       const tileX = Math.floor((crew.x + crew.width / 2) / TILE_SIZE);
       const tileY = Math.floor((crew.y + crew.height / 2) / TILE_SIZE);
 
-      for (let radius = 1; radius <= RECLAIMER_RANGE_TILES; radius++) {
-        let placed = false;
-        for (let dy = -radius; dy <= radius && !placed; dy++) {
-          for (let dx = -radius; dx <= radius && !placed; dx++) {
-            if (Math.max(Math.abs(dx), Math.abs(dy)) !== radius) continue;
+      let site = -1;
+      let siteReach = Infinity;
+      for (let index = 0; index < GRID_LENGTH; index++) {
+        if (original[index] !== restores) continue;
+        if (this.state.grid.at(index) !== TileType.Empty) continue;
 
-            const tx = tileX + dx;
-            const ty = tileY + dy;
-            if (!isInsideGrid(tx, ty)) continue;
-            if (tx < 1 || ty < 1 || tx > GRID_WIDTH - 2 || ty > GRID_HEIGHT - 2) continue;
+        const tx = index % GRID_WIDTH;
+        const ty = Math.floor(index / GRID_WIDTH);
+        const reach = Math.max(Math.abs(tx - tileX), Math.abs(ty - tileY));
+        if (reach > RECLAIMER_RANGE_TILES || reach >= siteReach) continue;
+        if (this.tankOnTile(tx, ty)) continue;
 
-            const index = tileIndex(tx, ty);
-            if (this.state.grid.at(index) !== TileType.Empty) continue;
-            if (this.tankOnTile(tx, ty)) continue;
-
-            this.state.grid[index] = restores;
-            this.rebuildFields();
-            this.refreshObjective();
-            placed = true;
-          }
-        }
-        if (placed) break;
+        site = index;
+        siteReach = reach;
       }
+      if (site < 0) continue;
+
+      this.state.grid[site] = restores;
+      this.rebuildFields();
+      this.refreshObjective();
     }
   }
 
@@ -8472,7 +8882,10 @@ export class CampaignRoom extends Room<CampaignState> {
         out.speed = TANK_SPEED * NULLIFIER_SPEED_FACTOR;
         break;
       case EnemyVariant.Jammer:
-        // Emplaced: it never moves, so the player has to go to it.
+        // Emplaced: it never moves, so the player has to go to it. And one
+        // shell finishes it — reaching it under a throttled gun is the whole
+        // cost, and grinding through a full hull on arrival charged it twice.
+        out.maxHealth = 1;
         out.speed = 0;
         break;
       case EnemyVariant.Sentinel:
@@ -9054,14 +9467,17 @@ export class CampaignRoom extends Room<CampaignState> {
    * True when `target` sits inside the aura of an Aegis unit and should soak a
    * shell for no damage.
    *
-   * Only enemies are protected, and an Aegis is never covered by another Aegis.
-   * Two of them inside each other's radius used to make a mutually invulnerable
-   * pair that could only be broken by killing them in the same instant — which
-   * is not a puzzle, it is a wall. An Aegis is the thing that protects the rank
-   * and file; it takes its own shells.
+   * Only enemies are protected, and nothing that projects a shield is ever
+   * covered by another one — Aegis or Warden, either way round. Two of them
+   * inside each other's radius make a mutually invulnerable pair that can only
+   * be broken by killing both in the same instant, which is not a puzzle, it is
+   * a wall. Aegis-on-Aegis was closed first, but a Warden and its Aegis escort
+   * still sheltered each other. A shield carrier protects the rank and file;
+   * it takes its own shells.
    */
   private isAegisShielded(target: Tank): boolean {
     if (!target.isEnemy) return false;
+    if (target.variant === AEGIS || target.variant === WARDEN) return false;
 
     const tcx = target.x + target.width / 2;
     const tcy = target.y + target.height / 2;
@@ -9072,7 +9488,6 @@ export class CampaignRoom extends Room<CampaignState> {
 
       let radius: number;
       if (shield.variant === AEGIS) {
-        if (target.variant === AEGIS) continue;
         radius = AEGIS_RADIUS;
       } else if (shield.variant === WARDEN) {
         radius = WARDEN_SHIELD_RADIUS;
